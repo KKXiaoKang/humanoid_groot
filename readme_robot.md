@@ -5,6 +5,13 @@
 ```bash
 ./convert_dataset.sh
 ```
+## 可视化转换好的数据
+```bash
+conda activate lerobot_groot
+lerobot-dataset-viz \                                    
+    --repo-id /home/lab/lerobot_groot/lerobot_data/v3_0_dataset/1115_depalletize_left_mix_dagger_keyboard \ 
+    --episode-index 0
+```
 
 ## train
 * 直接训练，batch_size=8，大概占用26G VRAM的大小
