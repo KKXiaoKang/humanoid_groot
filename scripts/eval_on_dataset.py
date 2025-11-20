@@ -114,6 +114,17 @@ def eval_on_dataset(ckpt_path,
     dataset_stats = dataset_for_stats.meta.stats if hasattr(dataset_for_stats.meta, 'stats') else None
     print(f"✅ Dataset statistics loaded: {list(dataset_stats.keys()) if dataset_stats else 'None'}")
     
+    # 检查action统计信息格式，用于手动反归一化
+    if dataset_stats and 'action' in dataset_stats:
+        action_stats = dataset_stats['action']
+        print(f"📊 Action stats keys: {list(action_stats.keys())}")
+        if 'min' in action_stats and 'max' in action_stats:
+            action_min = torch.as_tensor(action_stats['min'], dtype=torch.float32)
+            action_max = torch.as_tensor(action_stats['max'], dtype=torch.float32)
+            print(f"📊 Action normalization range: min={action_min[:5].tolist()}... (shape: {action_min.shape}), max={action_max[:5].tolist()}... (shape: {action_max.shape})")
+        else:
+            print("⚠️  Warning: Action stats missing 'min' or 'max'. Manual denormalization may not work correctly.")
+    
     # Create preprocessor and postprocessor
     print(f"\n🔧 Creating preprocessor and postprocessor...")
     preprocessor, postprocessor = make_groot_pre_post_processors(
@@ -133,7 +144,23 @@ def eval_on_dataset(ckpt_path,
     print(f"\n📂 Loading dataset from {lerobot_dataset_path}")
     print(f"📹 Episode: {episode}")
     
+    # 注意：LeRobotDataset的episodes参数主要用于下载时选择文件
+    # 但在加载后需要手动过滤数据，因为多个episodes可能存储在同一个parquet文件中
     dataset = LeRobotDataset(repo_id=0, root=lerobot_dataset_path, episodes=[episode])
+    
+    # 使用episode的索引范围直接切片，比filter快得多
+    # 这是必要的，因为v3.0格式中多个episodes可能存储在同一个文件中
+    print(f"🔍 Filtering dataset to episode {episode}...")
+    if episode >= len(dataset.meta.episodes):
+        raise ValueError(f"Episode {episode} out of range. Available episodes: 0-{len(dataset.meta.episodes)-1}")
+    
+    ep_meta = dataset.meta.episodes[episode]
+    ep_start = ep_meta["dataset_from_index"]
+    ep_end = ep_meta["dataset_to_index"]
+    
+    # 使用切片而不是filter，这样快得多
+    dataset.hf_dataset = dataset.hf_dataset.select(range(ep_start, ep_end))
+    print(f"✅ Filtered dataset. Total frames in episode {episode}: {len(dataset.hf_dataset)} (indices {ep_start}-{ep_end-1})")
     
     # 打印相机配置信息
     if CONFIG_AVAILABLE:
@@ -297,14 +324,50 @@ def eval_on_dataset(ckpt_path,
         with torch.inference_mode():
             pred_actions = policy.predict_action_chunk(processed_observation)
         
-        # 使用后处理器处理输出
         # pred_actions shape: (batch_size, chunk_size, action_dim)
-        # PolicyAction 就是 torch.Tensor 的类型别名，直接传递即可
-        processed_action = postprocessor(pred_actions)
-        # 后处理器会返回 (B, action_dim) 形状的张量（已选择最后一个时间步并反归一化）
-        pred_action_single = processed_action[0].cpu().numpy()  # (action_dim,)
-        # 对于chunk可视化，我们需要使用原始的pred_actions（未经过后处理器）
-        pred_chunk = pred_actions[0].cpu().numpy()  # (chunk_size, action_dim)
+        # 注意：pred_actions是归一化后的值，范围在[-1, 1]
+        # 需要手动反归一化到真实单位，以便与ground truth进行比较
+        
+        # 准备反归一化参数
+        if dataset_stats and 'action' in dataset_stats:
+            action_stats = dataset_stats['action']
+            if 'min' in action_stats and 'max' in action_stats:
+                action_min = torch.as_tensor(action_stats['min'], dtype=torch.float32, device=pred_actions.device)
+                action_max = torch.as_tensor(action_stats['max'], dtype=torch.float32, device=pred_actions.device)
+                
+                # 确保维度匹配
+                if action_min.numel() < action_dim:
+                    action_min = torch.nn.functional.pad(action_min.flatten()[:action_dim], (0, max(0, action_dim - action_min.numel())))
+                if action_max.numel() < action_dim:
+                    action_max = torch.nn.functional.pad(action_max.flatten()[:action_dim], (0, max(0, action_dim - action_max.numel())))
+                
+                action_min = action_min[:action_dim]
+                action_max = action_max[:action_dim]
+                
+                # 反归一化公式：x = (y + 1) / 2 * (max - min) + min
+                # 其中y是归一化值[-1, 1]，x是原始值[min, max]
+                denom = action_max - action_min
+                mask = denom != 0
+                safe_denom = torch.where(mask, denom, torch.ones_like(denom))
+                
+                # 反归一化整个chunk
+                pred_actions_unnorm = (pred_actions + 1.0) * 0.5 * safe_denom + action_min
+                pred_actions_unnorm = torch.where(mask, pred_actions_unnorm, action_min)
+                
+                # 选择最后一个时间步作为单步预测
+                pred_action_single = pred_actions_unnorm[0, -1, :].cpu().numpy()  # (action_dim,)
+                # 整个chunk用于可视化
+                pred_chunk = pred_actions_unnorm[0].cpu().numpy()  # (chunk_size, action_dim)
+            else:
+                # 如果没有统计信息，使用原始值（可能已经是反归一化的）
+                pred_action_single = pred_actions[0, -1, :].cpu().numpy()  # (action_dim,)
+                pred_chunk = pred_actions[0].cpu().numpy()  # (chunk_size, action_dim)
+                print("⚠️  Warning: No action min/max stats found. Using raw predictions (may be normalized).")
+        else:
+            # 如果没有统计信息，使用原始值
+            pred_action_single = pred_actions[0, -1, :].cpu().numpy()  # (action_dim,)
+            pred_chunk = pred_actions[0].cpu().numpy()  # (chunk_size, action_dim)
+            print("⚠️  Warning: No dataset stats found. Using raw predictions (may be normalized).")
         
         inference_time = time.time() - tic
         
@@ -337,7 +400,7 @@ def eval_on_dataset(ckpt_path,
                         image_data=img.to("cpu"),
                         step_id=data_step
                     )
-                    break  # 只显示第一个找到的相机图像
+                    # break  # 只显示第一个找到的相机图像
             
             # 可视化预测的chunk
             for dim in range(action_dim):
@@ -395,20 +458,30 @@ def eval_on_dataset(ckpt_path,
     print("="*80)
     
     # Action名称定义 - 根据action维度自动选择
-    if action_dim == 16:
+    # 优先使用config中的action_names（如果可用且维度匹配）
+    if CONFIG_AVAILABLE and action_names and len(action_names) == action_dim:
+        eval_action_names = action_names
+    elif action_dim == 16:
         # depalletize任务：16维动作 (14 arm joints + 2 claw positions)
-        # 使用config中的action_names（如果可用）
-        if CONFIG_AVAILABLE and action_names and len(action_names) >= 16:
-            eval_action_names = action_names
-        else:
-            eval_action_names = [f"Arm_joint_{i}" for i in range(14)] + ["Claw_left", "Claw_right"]
-    else:
-        # com控制任务：使用默认的action名称
+        eval_action_names = [f"Arm_joint_{i+1}" for i in range(14)] + ["Left_claw", "Right_claw"]
+    elif action_dim == 18:
+        # 18维动作：Left_arm(7) + Right_arm(7) + Left_claw(1) + Right_claw(1) + Cmd_pose_z(1) + Cmd_pose_pitch(1)
+        # 根据config.py的ACTION_COMPONENT_DEFINITIONS格式
+        eval_action_names = (
+            [f"arm_joint_{i+1}" for i in range(7)] +  # Left_arm: arm_joint_1-7
+            [f"arm_joint_{i+8}" for i in range(7)] +  # Right_arm: arm_joint_8-14
+            ["left_claw_position", "right_claw_position", "cmd_pose_z", "cmd_pose_pitch"]
+        )
+    elif action_dim == 24:
+        # com控制任务：24维 = 9 COM + 14 Arm + 1 Gait
         eval_action_names = (
             ["COM_dx", "COM_dy", "COM_dz", "COM_dR11", "COM_dR21", "COM_dR31", "COM_dR12", "COM_dR22", "COM_dR32"] +
-            [f"Arm_joint_{i}" for i in range(14)] +
+            [f"Arm_joint_{i+1}" for i in range(14)] +
             ["Gait_mode"]
         )
+    else:
+        # 其他维度：使用通用命名
+        eval_action_names = [f"Action_dim_{i}" for i in range(action_dim)]
     
     print(f"\n{'Dimension':<20} {'MSE':<15} {'MAE':<15}")
     print("-" * 80)
@@ -438,8 +511,29 @@ def eval_on_dataset(ckpt_path,
         claw_mse = np.mean([np.mean(mse_per_action_dim[dim]) for dim in range(14, 16)])
         claw_mae = np.mean([np.mean(mae_per_action_dim[dim]) for dim in range(14, 16)])
         print(f'{"Claw (avg)":<20} {claw_mse:<15.8f} {claw_mae:<15.8f}')
-    else:
-        # com控制任务：标准分组统计
+    elif action_dim == 18:
+        # 18维动作：Left_arm(7) + Right_arm(7) + Left_claw(1) + Right_claw(1) + Cmd_pose_z(1) + Cmd_pose_pitch(1)
+        left_arm_mse = np.mean([np.mean(mse_per_action_dim[dim]) for dim in range(7)])
+        left_arm_mae = np.mean([np.mean(mae_per_action_dim[dim]) for dim in range(7)])
+        print(f'{"Left_arm (avg)":<20} {left_arm_mse:<15.8f} {left_arm_mae:<15.8f}')
+        
+        right_arm_mse = np.mean([np.mean(mse_per_action_dim[dim]) for dim in range(7, 14)])
+        right_arm_mae = np.mean([np.mean(mae_per_action_dim[dim]) for dim in range(7, 14)])
+        print(f'{"Right_arm (avg)":<20} {right_arm_mse:<15.8f} {right_arm_mae:<15.8f}')
+        
+        arm_mse = np.mean([np.mean(mse_per_action_dim[dim]) for dim in range(14)])
+        arm_mae = np.mean([np.mean(mae_per_action_dim[dim]) for dim in range(14)])
+        print(f'{"Arm (avg)":<20} {arm_mse:<15.8f} {arm_mae:<15.8f}')
+        
+        claw_mse = np.mean([np.mean(mse_per_action_dim[dim]) for dim in range(14, 16)])
+        claw_mae = np.mean([np.mean(mae_per_action_dim[dim]) for dim in range(14, 16)])
+        print(f'{"Claw (avg)":<20} {claw_mse:<15.8f} {claw_mae:<15.8f}')
+        
+        cmd_pose_mse = np.mean([np.mean(mse_per_action_dim[dim]) for dim in range(16, 18)])
+        cmd_pose_mae = np.mean([np.mean(mae_per_action_dim[dim]) for dim in range(16, 18)])
+        print(f'{"Cmd_pose (avg)":<20} {cmd_pose_mse:<15.8f} {cmd_pose_mae:<15.8f}')
+    elif action_dim == 24:
+        # com控制任务：24维 = 9 COM + 14 Arm + 1 Gait
         com_mse = np.mean([np.mean(mse_per_action_dim[dim]) for dim in range(9)])
         com_mae = np.mean([np.mean(mae_per_action_dim[dim]) for dim in range(9)])
         print(f'{"COM (avg)":<20} {com_mse:<15.8f} {com_mae:<15.8f}')
@@ -448,10 +542,38 @@ def eval_on_dataset(ckpt_path,
         arm_mae = np.mean([np.mean(mae_per_action_dim[dim]) for dim in range(9, 23)])
         print(f'{"Arm (avg)":<20} {arm_mse:<15.8f} {arm_mae:<15.8f}')
         
-        if action_dim > 23:
-            gait_mse = np.mean(mse_per_action_dim[23])
-            gait_mae = np.mean(mae_per_action_dim[23])
-            print(f'{"Gait":<20} {gait_mse:<15.8f} {gait_mae:<15.8f}')
+        gait_mse = np.mean(mse_per_action_dim[23])
+        gait_mae = np.mean(mae_per_action_dim[23])
+        print(f'{"Gait":<20} {gait_mse:<15.8f} {gait_mae:<15.8f}')
+    else:
+        # 其他维度：尝试根据config推断，或使用通用分组
+        if CONFIG_AVAILABLE and action_names and len(action_names) == action_dim:
+            # 根据action_names推断分组
+            # 查找常见的分组模式
+            if any("arm" in name.lower() for name in action_names):
+                # 尝试找到arm相关的维度
+                arm_dims = [i for i, name in enumerate(action_names) if "arm" in name.lower()]
+                if arm_dims:
+                    arm_mse = np.mean([np.mean(mse_per_action_dim[dim]) for dim in arm_dims])
+                    arm_mae = np.mean([np.mean(mae_per_action_dim[dim]) for dim in arm_dims])
+                    print(f'{"Arm (avg)":<20} {arm_mse:<15.8f} {arm_mae:<15.8f}')
+            
+            if any("claw" in name.lower() for name in action_names):
+                claw_dims = [i for i, name in enumerate(action_names) if "claw" in name.lower()]
+                if claw_dims:
+                    claw_mse = np.mean([np.mean(mse_per_action_dim[dim]) for dim in claw_dims])
+                    claw_mae = np.mean([np.mean(mae_per_action_dim[dim]) for dim in claw_dims])
+                    print(f'{"Claw (avg)":<20} {claw_mse:<15.8f} {claw_mae:<15.8f}')
+            
+            if any("cmd_pose" in name.lower() or "com" in name.lower() for name in action_names):
+                cmd_dims = [i for i, name in enumerate(action_names) if "cmd_pose" in name.lower() or "com" in name.lower()]
+                if cmd_dims:
+                    cmd_mse = np.mean([np.mean(mse_per_action_dim[dim]) for dim in cmd_dims])
+                    cmd_mae = np.mean([np.mean(mae_per_action_dim[dim]) for dim in cmd_dims])
+                    print(f'{"Cmd/COM (avg)":<20} {cmd_mse:<15.8f} {cmd_mae:<15.8f}')
+        else:
+            # 无法推断，跳过分组统计
+            print("⚠️  Cannot infer action groups for this action dimension. Skipping grouped statistics.")
     
     print("="*80)
 
