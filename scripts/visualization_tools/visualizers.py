@@ -6,10 +6,10 @@ import torch
 
 def to_hwc_uint8_numpy(chw_float32_torch: torch.Tensor) -> np.ndarray:
     if isinstance(chw_float32_torch, np.ndarray):
-        print(np.shape(chw_float32_torch))
+        # print(np.shape(chw_float32_torch))  # Debug: removed
         chw_float32_torch = torch.from_numpy(chw_float32_torch)
 
-    print(chw_float32_torch.ndim)
+    # print(chw_float32_torch.ndim)  # Debug: removed (was printing "3" for 3D images)
     assert chw_float32_torch.dtype == torch.float32
     assert chw_float32_torch.ndim == 3
     c, h, w = chw_float32_torch.shape
