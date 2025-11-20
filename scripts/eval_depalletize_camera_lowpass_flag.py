@@ -74,7 +74,7 @@ TARGET_CONTROL_FREQUENCY = 100.0
 TARGET_CONTROL_DT = 1.0 / TARGET_CONTROL_FREQUENCY
 CHUNK_TRANSITION_DURATION_S = 0.2  # seconds of low-pass smoothing at chunk boundary
 LOWPASS_ALPHA = 0.85  # closer to 1 => smoother (slower) transitions
-ENABLE_CHUNK_TRANSITION_LOWPASS = False  # Enable/disable low-pass filtering at chunk boundaries (default: False, only linear interpolation within chunks)
+ENABLE_CHUNK_TRANSITION_LOWPASS = True  # Enable/disable low-pass filtering at chunk boundaries (default: False, only linear interpolation within chunks)
 
 
 def resample_action_chunk(action_chunk: np.ndarray,
