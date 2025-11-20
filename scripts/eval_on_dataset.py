@@ -278,6 +278,11 @@ def eval_on_dataset(ckpt_path,
     predictions = []
     ground_truths = []
     
+    # 性能统计
+    inference_times = []  # 记录每个frame的推理时间（秒）
+    total_preprocessing_time = 0.0  # 预处理总时间
+    total_postprocessing_time = 0.0  # 后处理总时间
+    
     # 使用tqdm显示进度（如果启用）
     iterator = tqdm(enumerate(dataloader), total=dataset.num_frames, desc="Processing") if show_progress else enumerate(dataloader)
     
@@ -317,18 +322,24 @@ def eval_on_dataset(ckpt_path,
         gt_action = batch['action'][0].cpu().numpy()  # (action_dim,)
         
         # 使用预处理器处理输入
+        preprocess_tic = time.time()
         processed_observation = preprocessor(observation)
+        preprocessing_time = time.time() - preprocess_tic
+        total_preprocessing_time += preprocessing_time
         
         # 模型推理
-        tic = time.time()
+        inference_tic = time.time()
         with torch.inference_mode():
             pred_actions = policy.predict_action_chunk(processed_observation)
+        inference_time = time.time() - inference_tic
+        inference_times.append(inference_time)
         
         # pred_actions shape: (batch_size, chunk_size, action_dim)
         # 注意：pred_actions是归一化后的值，范围在[-1, 1]
         # 需要手动反归一化到真实单位，以便与ground truth进行比较
         
         # 准备反归一化参数
+        postprocess_tic = time.time()
         if dataset_stats and 'action' in dataset_stats:
             action_stats = dataset_stats['action']
             if 'min' in action_stats and 'max' in action_stats:
@@ -369,7 +380,8 @@ def eval_on_dataset(ckpt_path,
             pred_chunk = pred_actions[0].cpu().numpy()  # (chunk_size, action_dim)
             print("⚠️  Warning: No dataset stats found. Using raw predictions (may be normalized).")
         
-        inference_time = time.time() - tic
+        postprocessing_time = time.time() - postprocess_tic
+        total_postprocessing_time += postprocessing_time
         
         # 保存预测和真实值
         predictions.append(pred_action_single)
@@ -574,6 +586,64 @@ def eval_on_dataset(ckpt_path,
         else:
             # 无法推断，跳过分组统计
             print("⚠️  Cannot infer action groups for this action dimension. Skipping grouped statistics.")
+    
+    print("="*80)
+    
+    # ========= 打印性能统计 =========
+    print("\n" + "="*80)
+    print("⚡ Performance Statistics")
+    print("="*80)
+    
+    if inference_times:
+        total_inference_time = sum(inference_times)
+        avg_inference_time = np.mean(inference_times)
+        min_inference_time = np.min(inference_times)
+        max_inference_time = np.max(inference_times)
+        std_inference_time = np.std(inference_times)
+        
+        # 计算推理频率（Hz）
+        avg_fps = 1.0 / avg_inference_time if avg_inference_time > 0 else 0
+        max_fps = 1.0 / min_inference_time if min_inference_time > 0 else 0
+        min_fps = 1.0 / max_inference_time if max_inference_time > 0 else 0
+        
+        print(f"\n📊 Inference Performance:")
+        print(f"   Total frames processed: {len(inference_times)}")
+        print(f"   Total inference time: {total_inference_time:.4f} s")
+        print(f"   Average inference time: {avg_inference_time*1000:.2f} ms")
+        print(f"   Min inference time: {min_inference_time*1000:.2f} ms")
+        print(f"   Max inference time: {max_inference_time*1000:.2f} ms")
+        print(f"   Std inference time: {std_inference_time*1000:.2f} ms")
+        print(f"\n🚀 Inference Frequency (Hz):")
+        print(f"   Average FPS: {avg_fps:.2f} Hz")
+        print(f"   Max FPS: {max_fps:.2f} Hz")
+        print(f"   Min FPS: {min_fps:.2f} Hz")
+        
+        # 预处理和后处理性能
+        avg_preprocessing_time = total_preprocessing_time / len(inference_times) if inference_times else 0
+        avg_postprocessing_time = total_postprocessing_time / len(inference_times) if inference_times else 0
+        
+        print(f"\n📊 Processing Pipeline Performance:")
+        print(f"   Average preprocessing time: {avg_preprocessing_time*1000:.2f} ms")
+        print(f"   Average postprocessing time: {avg_postprocessing_time*1000:.2f} ms")
+        print(f"   Average total pipeline time: {(avg_inference_time + avg_preprocessing_time + avg_postprocessing_time)*1000:.2f} ms")
+        
+        # 计算总吞吐量
+        total_pipeline_time = total_inference_time + total_preprocessing_time + total_postprocessing_time
+        overall_fps = len(inference_times) / total_pipeline_time if total_pipeline_time > 0 else 0
+        print(f"\n🎯 Overall Performance:")
+        print(f"   Total pipeline time: {total_pipeline_time:.4f} s")
+        print(f"   Overall throughput: {overall_fps:.2f} Hz (including preprocessing/postprocessing)")
+        
+        # 性能瓶颈分析
+        print(f"\n🔍 Performance Bottleneck Analysis:")
+        if avg_inference_time > avg_preprocessing_time and avg_inference_time > avg_postprocessing_time:
+            print(f"   ⚠️  Inference is the bottleneck ({avg_inference_time*1000:.2f} ms)")
+        elif avg_preprocessing_time > avg_inference_time and avg_preprocessing_time > avg_postprocessing_time:
+            print(f"   ⚠️  Preprocessing is the bottleneck ({avg_preprocessing_time*1000:.2f} ms)")
+        elif avg_postprocessing_time > avg_inference_time and avg_postprocessing_time > avg_preprocessing_time:
+            print(f"   ⚠️  Postprocessing is the bottleneck ({avg_postprocessing_time*1000:.2f} ms)")
+        else:
+            print(f"   ✅ Processing times are balanced")
     
     print("="*80)
 
