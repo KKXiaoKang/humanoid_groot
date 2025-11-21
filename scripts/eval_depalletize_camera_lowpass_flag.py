@@ -50,7 +50,7 @@ from typing import Optional
 import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "robot_envs")))
 from robot_envs.kuavo_depalletize_env import GrabBoxMpcEnv
-from configs.config import topic_info, TASK_DATA_MODE, get_camera_observation_key, ACTION_COMPONENTS
+from configs.config import topic_info, TASK_DATA_MODE, get_camera_observation_key, get_camera_names, CAMERA_COMPONENTS, ACTION_COMPONENTS
 
 # 使用GrootPolicy模型
 from lerobot.policies.groot.modeling_groot import GrootPolicy
@@ -429,17 +429,23 @@ def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chun
             state = torch.from_numpy(obs_data["state"]).float()
             # print(f" ==== state ==== {state.shape} ==== ")
             
-            # 根据topic_info动态处理所有相机图像
+            # 根据CAMERA_COMPONENTS动态处理相机图像
             # 填充网络的obs
             observation = {}
             
-            # 动态处理所有相机观测 - 使用新的key格式
-            for camera_name in topic_info.keys():
-                if 'image' in camera_name and camera_name in obs_data:
+            # 根据CAMERA_COMPONENTS明确指定需要处理的相机
+            camera_names = get_camera_names(CAMERA_COMPONENTS)
+            for camera_name in camera_names:
+                # 检查相机数据是否在obs_data中
+                if camera_name in obs_data:
                     camera_images = torch.from_numpy(np.moveaxis(obs_data[camera_name], 3, 1)).float() / 255
                     # 使用新的key格式: observation.images.cam_*
                     obs_key = get_camera_observation_key(camera_name, use_image_features=False)
                     observation[obs_key] = camera_images.to('cuda:0')
+                else:
+                    # 只在第一次出现时打印警告
+                    if step_counter == 0:
+                        rospy.logwarn(f"⚠️  Camera '{camera_name}' from CAMERA_COMPONENTS not found in obs_data. Available cameras: {[k for k in obs_data.keys() if 'image' in k.lower()]}")
 
             # observation['observation.environment_state'] = environment_state
             observation['observation.state'] = state.to('cuda:0')
@@ -609,8 +615,11 @@ if __name__ == '__main__':
     init_gui_windows(enable_gui=args.enable_gui, camera_config=camera_config)
     
     # 打印相机配置信息
+    camera_names = get_camera_names(CAMERA_COMPONENTS)
     print(f"\n📷 Camera Configuration (TASK_DATA_MODE: {TASK_DATA_MODE}):")
-    print(f"   Detected {len(camera_config)} cameras: {list(camera_config.keys())}")
+    print(f"   CAMERA_COMPONENTS: {CAMERA_COMPONENTS}")
+    print(f"   Camera names: {camera_names}")
+    print(f"   Detected {len(camera_config)} cameras in topic_info: {list(camera_config.keys())}")
     
     print("\n" + "="*80)
     print("🎯 Depalletize Task Evaluation (GrootPolicy)")

@@ -3,8 +3,8 @@
 # 数据集格式转换脚本：从 v2.1 转换为 v3.0
 # 这个脚本会将您的数据集从旧格式转换为新格式（原地转换）
 
-DATASET_ROOT="/home/lab/lerobot_groot/lerobot_data/1115_depalletize_left_mix_dagger_keyboard"
-DATASET_REPO_ID="1115_depalletize_left_mix_dagger_keyboard"
+DATASET_ROOT="/home/lab/lerobot_groot/lerobot_data/1120_depalletize_box_three_orb"
+DATASET_REPO_ID="1120_depalletize_box_three_orb"
 
 echo "开始转换数据集格式：v2.1 -> v3.0"
 echo "数据集路径: ${DATASET_ROOT}"

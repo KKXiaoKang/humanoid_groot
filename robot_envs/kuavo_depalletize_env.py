@@ -20,7 +20,7 @@ import cv2
 from tqdm import tqdm
 
 # from config import process_Image
-from configs.config import topic_info, TASK_DATA_MODE, STATE_COMPONENTS, ACTION_COMPONENTS
+from configs.config import topic_info, TASK_DATA_MODE, STATE_COMPONENTS, ACTION_COMPONENTS, CAMERA_COMPONENTS, get_camera_names
 
 class TargetPublisher:
     """
@@ -100,13 +100,11 @@ class ObsBuffer:
                 }
             }
         else:
-            # 从topic_info中读取相机配置，根据TASK_DATA_MODE动态设置
-            # VR模式: 4相机 (image, chest_image, left_shoulder_image, right_shoulder_image)
-            # Strategy模式: 3相机 (image, left_shoulder_image, right_shoulder_image)
+            # 从topic_info中读取相机配置，根据CAMERA_COMPONENTS动态设置
             self.img_topic_map = {}
             
-            # 定义所有可能的相机名称
-            camera_names = ['image', 'chest_image', 'left_shoulder_image', 'right_shoulder_image']
+            # 根据CAMERA_COMPONENTS获取相机名称列表
+            camera_names = get_camera_names(CAMERA_COMPONENTS)
             
             for camera_name in camera_names:
                 if camera_name in topic_info:
@@ -119,7 +117,7 @@ class ObsBuffer:
                         'size_wh': (640, 480)
                     }
             
-            print(f"📷 Camera configuration based on TASK_DATA_MODE ({TASK_DATA_MODE}):")
+            print(f"📷 Camera configuration based on CAMERA_COMPONENTS ({CAMERA_COMPONENTS}):")
             print(f"   Detected {len(self.img_topic_map)} cameras: {list(self.img_topic_map.keys())}")
 
         # obs
