@@ -99,8 +99,8 @@ if ("Cmd_pose_z" in ACTION_COMPONENTS or "Cmd_pose_pitch" in ACTION_COMPONENTS):
 """
 # 默认相机组件配置（根据数据集实际情况调整）
 # 如果数据集中没有cam_chest，则只配置: ["cam_head", "cam_left", "cam_right"]
-# CAMERA_COMPONENTS = ["cam_head", "cam_left", "cam_right"]  # 默认3相机配置（无chest）
-CAMERA_COMPONENTS = ["cam_head", "cam_chest", "cam_left", "cam_right"]  # 完整4相机配置
+CAMERA_COMPONENTS = ["cam_head", "cam_left", "cam_right"]  # 默认3相机配置（无chest）
+# CAMERA_COMPONENTS = ["cam_head", "cam_chest", "cam_left", "cam_right"]  # 完整4相机配置
 
 def euler_to_rotation_matrix_first_two_cols(roll, pitch, yaw):
     """
@@ -180,9 +180,10 @@ def get_camera_names(camera_components=None):
     
     # 打印配置信息
     if len(camera_names) > 0:
-        print(f"📷 Camera configuration: {camera_components} -> {len(camera_names)} cameras [{', '.join(camera_names)}]")
+        pass
+        # print(f"📷 Camera configuration: {camera_components} -> {len(camera_names)} cameras [{', '.join(camera_names)}]")
     else:
-        print(f"⚠️  Warning: No valid camera components selected. Using default single camera configuration.")
+        # print(f"⚠️  Warning: No valid camera components selected. Using default single camera configuration.")
         # 如果没有任何有效组件，返回默认的单相机配置
         camera_names = [CAMERA_COMPONENT_DEFINITIONS["cam_head"]]
     

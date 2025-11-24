@@ -3,6 +3,8 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import cv2
 import numpy as np
+import rosbag
+from sensor_msgs.msg import JointState
 
 # Initialize GUI windows if requested
 def init_gui_windows(enable_gui=False, camera_config=None):
@@ -322,6 +324,153 @@ def publish_joint_positions(action_chunk,
     except Exception as e:
         rospy.logerr(f"Error publishing joint positions: {str(e)}")
 
+def load_and_replay_init_trajectory(bag_path: str, env, control_arm: bool = True, control_claw: bool = True):
+    """
+    从rosbag文件中加载初始轨迹并回放
+    
+    Args:
+        bag_path: rosbag文件路径
+        env: GrabBoxMpcEnv环境实例
+        control_arm: 是否控制手臂
+        control_claw: 是否控制夹爪
+    """
+    if not os.path.exists(bag_path):
+        rospy.logerr(f"Bag file not found: {bag_path}")
+        return False
+    
+    rospy.loginfo(f"Loading initial trajectory from bag: {bag_path}")
+    
+    # 期望的关节名称顺序（与publish_target_arm_claw中的顺序一致）
+    expected_joint_names = [
+        "zarm_l1_joint", "zarm_l2_joint", "zarm_l3_joint", "zarm_l4_joint", 
+        "zarm_l5_joint", "zarm_l6_joint", "zarm_l7_joint",
+        "zarm_r1_joint", "zarm_r2_joint", "zarm_r3_joint", "zarm_r4_joint", 
+        "zarm_r5_joint", "zarm_r6_joint", "zarm_r7_joint",
+    ]
+    
+    # 读取bag文件中的JointState消息
+    joint_states = []
+    try:
+        with rosbag.Bag(bag_path, 'r') as bag:
+            topic_name = '/mm_kuavo_arm_traj'
+            
+            # 检查话题是否存在
+            bag_info = bag.get_type_and_topic_info()
+            if topic_name not in bag_info[1]:
+                rospy.logwarn(f"Topic {topic_name} not found in bag file. Available topics: {list(bag_info[1].keys())}")
+                return False
+            
+            # 读取所有JointState消息
+            # 注意：由于已经通过topic_name过滤，所有消息都应该是JointState类型
+            # 但isinstance检查可能不工作（rosbag可能返回包装类型），所以直接使用消息
+            message_count = 0
+            for topic, msg, t in bag.read_messages(topics=[topic_name]):
+                message_count += 1
+                # 直接使用消息，不进行类型检查（因为已经通过topic过滤）
+                joint_states.append({
+                    'timestamp': t.to_sec(),
+                    'msg': msg
+                })
+            
+            rospy.loginfo(f"Read {message_count} messages from topic {topic_name}")
+            
+            # 按时间戳排序
+            joint_states.sort(key=lambda x: x['timestamp'])
+            
+            if len(joint_states) == 0:
+                rospy.logwarn(f"No JointState messages found in topic {topic_name}")
+                return False
+            
+            rospy.loginfo(f"Loaded {len(joint_states)} joint states from bag file")
+            
+    except Exception as e:
+        rospy.logerr(f"Error loading bag file: {e}")
+        return False
+    
+    # 获取当前夹爪状态（用于填充16维action）
+    current_claw_state = np.array([0.0, 0.0])  # 默认值
+    try:
+        obs_data, _, _, robot_obs, _ = env.get_obs()
+        if 'claw_state' in robot_obs and len(robot_obs['claw_state']) > 0:
+            # 获取最新的夹爪状态
+            claw_data = robot_obs['claw_state']
+            if claw_data.ndim == 2:
+                # 如果是2D数组，取最后一行
+                current_claw_state = np.array(claw_data[-1], dtype=np.float32)
+            elif claw_data.ndim == 1:
+                # 如果是1D数组，直接使用
+                current_claw_state = np.array(claw_data, dtype=np.float32)
+            
+            # 确保是2维
+            if current_claw_state.shape[0] != 2:
+                rospy.logwarn(f"Claw state has unexpected shape: {current_claw_state.shape}, using default")
+                current_claw_state = np.array([0.0, 0.0])
+            else:
+                rospy.loginfo(f"Current claw state: {current_claw_state}")
+    except Exception as e:
+        rospy.logwarn(f"Could not get current claw state: {e}, using default [0.0, 0.0]")
+        current_claw_state = np.array([0.0, 0.0])
+    
+    # 回放轨迹（按照rosbag中的时间戳间隔）
+    rospy.loginfo("Starting trajectory replay...")
+    replay_start_time = time.time()
+    bag_start_timestamp = joint_states[0]['timestamp']  # bag中的第一个时间戳
+    
+    for i, joint_data in enumerate(joint_states):
+        msg = joint_data['msg']
+        bag_timestamp = joint_data['timestamp']
+        
+        # 提取关节位置
+        # JointState的position是角度（度），需要转换为弧度
+        if len(msg.position) < 14:
+            rospy.logwarn(f"JointState message {i} has insufficient positions: {len(msg.position)} < 14")
+            continue
+        
+        # 直接使用position数组的前14个元素（跳过名称检查）
+        # bag文件中的关节顺序是: arm_joint_1 ~ arm_joint_14
+        # 对应: 左手7个关节 + 右手7个关节
+        # 直接使用前14个位置，假设顺序正确
+        arm_action = np.deg2rad(np.array(msg.position[:14]))
+        
+        # 组合成16维action: [14个手臂关节, 2个夹爪位置]
+        action = np.concatenate([arm_action, current_claw_state])
+        
+        # 计算应该等待的时间（按照bag中的时间戳间隔）
+        if i == 0:
+            # 第一个动作立即执行
+            expected_elapsed = 0.0
+        else:
+            # 计算从bag开始到当前消息应该经过的时间
+            bag_elapsed = bag_timestamp - bag_start_timestamp
+            # 计算实际经过的时间
+            actual_elapsed = time.time() - replay_start_time
+            # 需要等待的时间
+            expected_elapsed = bag_elapsed - actual_elapsed
+        
+        # 如果时间还没到，等待
+        if expected_elapsed > 0:
+            time.sleep(expected_elapsed)
+        
+        # 执行动作（不使用env.exec_actions，因为它会按照100Hz频率控制，我们直接发布）
+        # 直接使用env的target_publisher发布，不经过env.exec_actions的频率控制
+        env.target_publisher.publish_target_arm_claw(
+            arm_action=arm_action,
+            claw_action=current_claw_state,
+            control_arm=control_arm,
+            control_claw=control_claw
+        )
+        
+        # 打印进度
+        if (i + 1) % 10 == 0 or i == len(joint_states) - 1:
+            elapsed = time.time() - replay_start_time
+            bag_total_time = joint_states[-1]['timestamp'] - bag_start_timestamp
+            rospy.loginfo(f"Replayed {i + 1}/{len(joint_states)} steps (elapsed: {elapsed:.2f}s, bag time: {bag_total_time:.2f}s)")
+    
+    total_time = time.time() - replay_start_time
+    bag_total_time = joint_states[-1]['timestamp'] - bag_start_timestamp
+    rospy.loginfo(f"Trajectory replay completed! Real time: {total_time:.2f}s, Bag time: {bag_total_time:.2f}s, {len(joint_states)} steps")
+    
+    return True
 
 def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chunk_size=50, lerobot_dataset_path=None, enable_gui=False):
     """
@@ -423,7 +572,26 @@ def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chun
     time.sleep(1.0)
     resampled_action_queue: deque[np.ndarray] = deque()
     last_executed_action: Optional[np.ndarray] = None
-
+    
+    # 加载并回放初始轨迹
+    init_traj_bag_path = '/home/lab/kuavo-manip/robot_depalletize_init_traj.bag'
+    if os.path.exists(init_traj_bag_path):
+        rospy.loginfo("Loading and replaying initial trajectory from bag file...")
+        load_and_replay_init_trajectory(
+            bag_path=init_traj_bag_path,
+            env=env,
+            control_arm=control_arm,
+            control_claw=control_claw
+        )
+        rospy.loginfo("Initial trajectory replay completed. Starting model inference...")
+        time.sleep(1.0)
+    else:
+        rospy.logwarn(f"Initial trajectory bag file not found: {init_traj_bag_path}")
+        rospy.logwarn("Skipping initial trajectory replay. Starting model inference directly...")
+    
+    input(f"轨迹回放 结束, 按回车继续 ==== 轨迹回放成功 ==== \n")
+    time.sleep(1.0)
+    
     while True:
         try:
             state = torch.from_numpy(obs_data["state"]).float()
