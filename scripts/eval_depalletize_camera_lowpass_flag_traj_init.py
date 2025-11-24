@@ -472,7 +472,7 @@ def load_and_replay_init_trajectory(bag_path: str, env, control_arm: bool = True
     
     return True
 
-def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chunk_size=50, lerobot_dataset_path=None, enable_gui=False):
+def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chunk_size=50, lerobot_dataset_path=None, enable_gui=False, rotate_head_camera=False, state_zero=False):
     """
     在这里和实机/仿真交互，做网络推理（depalletize任务）
     
@@ -484,6 +484,8 @@ def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chun
         action_chunk_size: 动作块大小
         lerobot_dataset_path: 数据集路径（用于加载统计信息，可选）
         enable_gui: 是否启用GUI窗口显示相机图像
+        rotate_head_camera: 是否旋转头部相机图像180度
+        state_zero: 是否将状态输入置零（用于验证模型对状态的依赖性）
     """
 
     # ---------- 1. load GrootPolicy from checkpoint ---------------
@@ -501,6 +503,10 @@ def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chun
             dataset_for_stats = LeRobotDataset(repo_id=0, root=lerobot_dataset_path)
             dataset_stats = dataset_for_stats.meta.stats if hasattr(dataset_for_stats.meta, 'stats') else None
             print(f"✅ Dataset statistics loaded: {list(dataset_stats.keys()) if dataset_stats else 'None'}")
+            if dataset_stats is None:
+                print("⚠️ Warning: Dataset has no statistics. Action denormalization may not work correctly.")
+            elif 'action' not in dataset_stats:
+                print("⚠️ Warning: Dataset statistics do not contain 'action' key. Action denormalization may not work correctly.")
         except Exception as e:
             print(f"⚠️ Warning: Could not load dataset statistics: {e}")
             print("   This may cause normalization issues during inference")
@@ -510,8 +516,13 @@ def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chun
             dataset_for_stats = LeRobotDataset(repo_id=0, root='/home/lab/lerobot_groot/lerobot_data/new_demo/1118_sim_depalletize')
             dataset_stats = dataset_for_stats.meta.stats if hasattr(dataset_for_stats.meta, 'stats') else None
             print(f"✅ Dataset statistics loaded from default path: {list(dataset_stats.keys()) if dataset_stats else 'None'}")
+            if dataset_stats is None:
+                print("⚠️ Warning: Default dataset has no statistics. Action denormalization may not work correctly.")
+            elif 'action' not in dataset_stats:
+                print("⚠️ Warning: Default dataset statistics do not contain 'action' key. Action denormalization may not work correctly.")
         except Exception as e:
             print(f"⚠️ Warning: Could not load default dataset statistics: {e}")
+            print("   This may cause normalization issues during inference")
     
     # Create preprocessor and postprocessor
     print(f"\n🔧 Creating preprocessor and postprocessor...")
@@ -537,6 +548,10 @@ def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chun
     # 根据ACTION_COMPONENTS判断是否包含cmd_pose
     has_cmd_pose = ("Cmd_pose_z" in ACTION_COMPONENTS or "Cmd_pose_pitch" in ACTION_COMPONENTS)
     print(f"🎯 Cmd_pose control: {'Enabled' if has_cmd_pose else 'Disabled'} (based on ACTION_COMPONENTS)")
+    if rotate_head_camera:
+        print(f"🔄 Head camera rotation enabled: images from 'image' camera will be rotated 180 degrees")
+    if state_zero:
+        print(f"⚠️  STATE ZERO MODE: All state inputs will be set to zero (for dependency testing)")
     print("="*80 + "\n")
     
     policy.eval()
@@ -606,7 +621,26 @@ def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chun
             for camera_name in camera_names:
                 # 检查相机数据是否在obs_data中
                 if camera_name in obs_data:
-                    camera_images = torch.from_numpy(np.moveaxis(obs_data[camera_name], 3, 1)).float() / 255
+                    # 获取相机图像，obs_data中的图像格式是 (T, H, W, C)，其中T是时间步数
+                    camera_img_np = obs_data[camera_name]
+                    
+                    # 检查图像维度，应该是 (T, H, W, C) 格式
+                    if camera_img_np.ndim != 4:
+                        rospy.logwarn(f"⚠️  Unexpected camera image shape: {camera_img_np.shape}, expected (T, H, W, C)")
+                        continue
+                    
+                    # 如果启用头部相机旋转且当前是头部相机（image），则对每一帧旋转180度
+                    if rotate_head_camera and camera_name == "image":
+                        # 旋转180度：使用np.rot90，k=2表示旋转180度，axes=(1,2)表示在H和W维度上旋转
+                        # camera_img_np shape: (T, H, W, C)
+                        # 对每一帧进行旋转，axes=(1,2)表示在H和W维度上旋转（保持T和C维度不变）
+                        # 注意：np.rot90可能产生负步长的视图，需要copy()来创建连续数组，以便PyTorch可以处理
+                        camera_img_np = np.rot90(camera_img_np, k=2, axes=(1, 2)).copy()
+                    
+                    # 转换为 (T, C, H, W) 格式并归一化
+                    # 使用np.moveaxis将 (T, H, W, C) 转换为 (T, C, H, W)
+                    # 注意：np.moveaxis也可能产生负步长，使用copy()确保数组连续
+                    camera_images = torch.from_numpy(np.moveaxis(camera_img_np, 3, 1).copy()).float() / 255
                     # 使用新的key格式: observation.images.cam_*
                     obs_key = get_camera_observation_key(camera_name, use_image_features=False)
                     observation[obs_key] = camera_images.to('cuda:0')
@@ -616,7 +650,12 @@ def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chun
                         rospy.logwarn(f"⚠️  Camera '{camera_name}' from CAMERA_COMPONENTS not found in obs_data. Available cameras: {[k for k in obs_data.keys() if 'image' in k.lower()]}")
 
             # observation['observation.environment_state'] = environment_state
-            observation['observation.state'] = state.to('cuda:0')
+            # 如果启用state_zero模式，将状态输入置零（用于验证模型对状态的依赖性）
+            if state_zero:
+                # 保持相同的形状和设备，但将所有状态值设为0
+                observation['observation.state'] = torch.zeros_like(state).to('cuda:0')
+            else:
+                observation['observation.state'] = state.to('cuda:0')
 
             if not resampled_action_queue:
                 # 使用GrootPolicy的predict_action_chunk
@@ -775,6 +814,10 @@ if __name__ == '__main__':
     parser.add_argument('--lerobot_dataset_path', type=str, default=None, help='Path to the LeRobot dataset for loading statistics (optional)')
     parser.add_argument('--enable_gui', action='store_true',
                         help='Enable GUI windows for camera display (default: disabled)')
+    parser.add_argument('--rotate-head-camera', action='store_true',
+                        help='If set, rotate head camera images (image) by 180 degrees.')
+    parser.add_argument('--state-zero', action='store_true',
+                        help='If set, set all state inputs to zero (for testing model dependency on state)')
     
     args = parser.parse_args()
     
@@ -799,6 +842,10 @@ if __name__ == '__main__':
     print(f"📊 Action chunk size: {args.action_chunk_size}")
     print(f"📦 Action dimension: Supports 16 or 18 (14 arm joints + 2 claw positions [+ 2 cmd_pose])")
     print(f"🖼️  Enable GUI: {args.enable_gui}")
+    if args.rotate_head_camera:
+        print(f"🔄 Rotate head camera: Enabled (images from 'image' camera will be rotated 180 degrees)")
+    if args.state_zero:
+        print(f"⚠️  State zero mode: Enabled (all state inputs will be set to zero)")
     if args.lerobot_dataset_path:
         print(f"📁 Dataset path (for stats): {args.lerobot_dataset_path}")
     print("="*80 + "\n")
@@ -808,7 +855,9 @@ if __name__ == '__main__':
         eval(args.ckpt_path, model_type=args.model_type, control_arm=True, control_claw=True, 
              action_chunk_size=args.action_chunk_size, 
              lerobot_dataset_path=args.lerobot_dataset_path,
-             enable_gui=args.enable_gui)
+             enable_gui=args.enable_gui,
+             rotate_head_camera=args.rotate_head_camera,
+             state_zero=args.state_zero)
     elif args.replay:
         print("Replaying the model")
         lerobot_dataset_path = '/home/lab/kuavo-manip/lerobot_data/vel_wrend_box_613'
