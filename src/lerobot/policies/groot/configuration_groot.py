@@ -29,8 +29,8 @@ class GrootConfig(PreTrainedConfig):
 
     # Basic policy settings
     n_obs_steps: int = 1
-    chunk_size: int = 50
-    n_action_steps: int = 50
+    chunk_size: int = 32
+    n_action_steps: int = 32
 
     # Dimension settings (must match pretrained GR00T model expectations)
     # Maximum state dimension. Shorter states will be zero-padded.

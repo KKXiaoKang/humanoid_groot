@@ -14,21 +14,21 @@
 # ============================================================================
 
 # 设置输出目录
-OUTPUT_DIR="./outputs/11_19_groot_depalletize"
+OUTPUT_DIR="./outputs/11_26_groot_depalletize_3orb_green_grey_mix"
 JOB_NAME="groot_depalletize"
 
 # 数据集配置
 # 注意: root 应该直接指向数据集目录（包含 meta/ 和 data/ 的目录）
 # 使用 v3.0 格式数据集，包含 task 字段
-DATASET_ROOT="/home/lab/lerobot_groot/lerobot_data/v3_0_dataset/1125_groot_train_data_with_task"
-DATASET_REPO_ID="1125_groot_train_data_with_task"
+DATASET_ROOT="/root/lerobot/lerobot_data/v3_0/1125_groot_train_data_with_task_filtered"
+DATASET_REPO_ID="1125_groot_train_data_with_task_filtered"
 
 # 环境变量设置
 # 禁用tokenizers并行警告（在使用多进程数据加载时会出现）
 export TOKENIZERS_PARALLELISM=false
 
 # 训练参数 (可根据GPU内存调整)
-BATCH_SIZE=16          # 如果GPU内存不足，可以减小到2或1
+BATCH_SIZE=8          # 如果GPU内存不足，可以减小到2或1
 NUM_STEPS=40000       # 训练步数
 SAVE_FREQ=8000        # 每2000步保存一次checkpoint
 LOG_FREQ=100          # 每100步打印一次日志
@@ -68,7 +68,7 @@ lerobot-train \
   --policy.base_model_path="nvidia/GR00T-N1.5-3B" \
   --policy.push_to_hub=false \
   --policy.tune_llm=false \
-  --policy.tune_visual=false \
+  --policy.tune_visual=true \
   --policy.tune_projector=true \
   --policy.tune_diffusion_model=true \
   --policy.use_bf16=true \
@@ -76,8 +76,8 @@ lerobot-train \
   --policy.max_action_dim=32 \
   --policy.optimizer_lr=1e-4 \
   --policy.warmup_ratio=0.05 \
-  --policy.chunk_size=50 \
-  --policy.n_action_steps=50 \
+  --policy.chunk_size=32 \
+  --policy.n_action_steps=32 \
   \
   --dataset.repo_id=${DATASET_REPO_ID} \
   --dataset.root=${DATASET_ROOT} \
