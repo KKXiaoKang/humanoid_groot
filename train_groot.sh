@@ -51,10 +51,16 @@ NUM_WORKERS=8         # 数据加载器工作进程数
 #   - 全量微调需要更多 GPU 内存，建议减小 batch_size 到 4-8
 # ============================================================================
 
+# 是否从checkpoint继续训练
+# 设置为 true 时，会从 ${OUTPUT_DIR}/checkpoints/last 加载最新的checkpoint并继续训练
+# 设置为 false 时，从头开始训练（如果checkpoint已存在会报错，防止意外覆盖）
+RESUME=false
+
 # 运行训练
 lerobot-train \
   --output_dir=${OUTPUT_DIR} \
   --job_name=${JOB_NAME} \
+  --resume=${RESUME} \
   --save_checkpoint=true \
   --batch_size=${BATCH_SIZE} \
   --steps=${NUM_STEPS} \

@@ -17,6 +17,10 @@ lerobot-dataset-viz \
 * 直接训练，batch_size=8，大概占用26G VRAM的大小
 ```bash
 ./train_groot.sh
+
+# 继续训练（从 8000 步继续，训练到 40000 步）
+# 修改脚本中的 RESUME=true
+RESUME=true bash train_groot.sh
 ```
 
 ## 推理eval
