@@ -472,7 +472,7 @@ def load_and_replay_init_trajectory(bag_path: str, env, control_arm: bool = True
     
     return True
 
-def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chunk_size=50, lerobot_dataset_path=None, enable_gui=False, rotate_head_camera=False, state_zero=False):
+def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chunk_size=50, lerobot_dataset_path=None, enable_gui=False, rotate_head_camera=False, state_zero=False, task_description=None):
     """
     在这里和实机/仿真交互，做网络推理（depalletize任务）
     
@@ -486,6 +486,7 @@ def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chun
         enable_gui: 是否启用GUI窗口显示相机图像
         rotate_head_camera: 是否旋转头部相机图像180度
         state_zero: 是否将状态输入置零（用于验证模型对状态的依赖性）
+        task_description: 任务描述字符串（language instruction），如果为None则从数据集加载或使用默认值
     """
 
     # ---------- 1. load GrootPolicy from checkpoint ---------------
@@ -495,9 +496,10 @@ def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chun
     policy.config.device = device
     policy.config.n_action_steps = action_chunk_size
     
-    # Load dataset statistics for normalization
-    print(f"\n📂 Loading dataset for statistics...")
+    # Load dataset statistics for normalization and task information
+    print(f"\n📂 Loading dataset for statistics and task information...")
     dataset_stats = None
+    available_tasks = None
     if lerobot_dataset_path:
         try:
             dataset_for_stats = LeRobotDataset(repo_id=0, root=lerobot_dataset_path)
@@ -507,6 +509,11 @@ def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chun
                 print("⚠️ Warning: Dataset has no statistics. Action denormalization may not work correctly.")
             elif 'action' not in dataset_stats:
                 print("⚠️ Warning: Dataset statistics do not contain 'action' key. Action denormalization may not work correctly.")
+            
+            # 加载可用的任务列表
+            if hasattr(dataset_for_stats.meta, 'tasks') and dataset_for_stats.meta.tasks is not None:
+                available_tasks = list(dataset_for_stats.meta.tasks.index)
+                print(f"✅ Available tasks in dataset: {available_tasks}")
         except Exception as e:
             print(f"⚠️ Warning: Could not load dataset statistics: {e}")
             print("   This may cause normalization issues during inference")
@@ -520,9 +527,32 @@ def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chun
                 print("⚠️ Warning: Default dataset has no statistics. Action denormalization may not work correctly.")
             elif 'action' not in dataset_stats:
                 print("⚠️ Warning: Default dataset statistics do not contain 'action' key. Action denormalization may not work correctly.")
+            
+            # 加载可用的任务列表
+            if hasattr(dataset_for_stats.meta, 'tasks') and dataset_for_stats.meta.tasks is not None:
+                available_tasks = list(dataset_for_stats.meta.tasks.index)
+                print(f"✅ Available tasks in default dataset: {available_tasks}")
         except Exception as e:
             print(f"⚠️ Warning: Could not load default dataset statistics: {e}")
             print("   This may cause normalization issues during inference")
+    
+    # 确定要使用的任务描述
+    if task_description is None:
+        if available_tasks and len(available_tasks) > 0:
+            # 使用数据集中第一个任务作为默认值
+            task_description = available_tasks[0]
+            print(f"📝 Using first task from dataset as default: '{task_description}'")
+        else:
+            # 使用通用默认值
+            task_description = "Depalletize the box"
+            print(f"📝 No task found in dataset, using default: '{task_description}'")
+    else:
+        print(f"📝 Using provided task description: '{task_description}'")
+    
+    # 如果提供了任务描述但不在可用任务列表中，给出警告
+    if available_tasks and task_description not in available_tasks:
+        print(f"⚠️ Warning: Task '{task_description}' not found in dataset tasks: {available_tasks}")
+        print(f"   Using provided task description anyway...")
     
     # Create preprocessor and postprocessor
     print(f"\n🔧 Creating preprocessor and postprocessor...")
@@ -552,6 +582,7 @@ def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chun
         print(f"🔄 Head camera rotation enabled: images from 'image' camera will be rotated 180 degrees")
     if state_zero:
         print(f"⚠️  STATE ZERO MODE: All state inputs will be set to zero (for dependency testing)")
+    print(f"📝 Task description: '{task_description}'")
     print("="*80 + "\n")
     
     policy.eval()
@@ -656,6 +687,10 @@ def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chun
                 observation['observation.state'] = torch.zeros_like(state).to('cuda:0')
             else:
                 observation['observation.state'] = state.to('cuda:0')
+            
+            # 添加 task 字段（language instruction）
+            # processor 会从 complementary_data 中的 "task" 字段读取并转换为 language
+            observation['task'] = task_description
 
             if not resampled_action_queue:
                 # 使用GrootPolicy的predict_action_chunk
@@ -818,6 +853,8 @@ if __name__ == '__main__':
                         help='If set, rotate head camera images (image) by 180 degrees.')
     parser.add_argument('--state-zero', action='store_true',
                         help='If set, set all state inputs to zero (for testing model dependency on state)')
+    parser.add_argument('--task-description', type=str, default=None,
+                        help='Task description (language instruction) for the model. If not provided, will use the first task from dataset or a default value.')
     
     args = parser.parse_args()
     
@@ -848,6 +885,8 @@ if __name__ == '__main__':
         print(f"⚠️  State zero mode: Enabled (all state inputs will be set to zero)")
     if args.lerobot_dataset_path:
         print(f"📁 Dataset path (for stats): {args.lerobot_dataset_path}")
+    if args.task_description:
+        print(f"📝 Task description: '{args.task_description}'")
     print("="*80 + "\n")
 
     if args.eval:
@@ -857,7 +896,8 @@ if __name__ == '__main__':
              lerobot_dataset_path=args.lerobot_dataset_path,
              enable_gui=args.enable_gui,
              rotate_head_camera=args.rotate_head_camera,
-             state_zero=args.state_zero)
+             state_zero=args.state_zero,
+             task_description=args.task_description)
     elif args.replay:
         print("Replaying the model")
         lerobot_dataset_path = '/home/lab/kuavo-manip/lerobot_data/vel_wrend_box_613'
