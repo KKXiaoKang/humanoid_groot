@@ -14,22 +14,63 @@
 # ============================================================================
 
 # 设置输出目录
-OUTPUT_DIR="./outputs/11_26_groot_depalletize_3orb_green_grey_mix"
+OUTPUT_DIR="./outputs/11_27_groot_full_tune_depalletize_3orb_green_grey_mix"
 JOB_NAME="groot_depalletize"
 
 # 数据集配置
 # 注意: root 应该直接指向数据集目录（包含 meta/ 和 data/ 的目录）
 # 使用 v3.0 格式数据集，包含 task 字段
-DATASET_ROOT="/root/lerobot/lerobot_data/v3_0/1125_groot_train_data_with_task_filtered"
+DATASET_ROOT="/home/zhicheng/KangKK/humanoid_groot/lerobot_data/1125_groot_train_data_with_task_filtered"
 DATASET_REPO_ID="1125_groot_train_data_with_task_filtered"
+
+# GPU选择配置
+# 方式1: 通过命令行参数指定 (推荐，会覆盖下面的默认值)
+#   用法: bash train_groot.sh --gpu 0,1,2
+#   或:    bash train_groot.sh -g 0
+# 方式2: 在脚本中直接设置下面的 GPU_IDS_DEFAULT 变量作为默认值
+#   例如: GPU_IDS_DEFAULT="0" 使用第0张卡
+#        GPU_IDS_DEFAULT="0,1" 使用第0和第1张卡
+#        GPU_IDS_DEFAULT="0,1,2,3" 使用前4张卡
+# 如果不设置，将使用所有可用的GPU
+
+# 默认GPU设置（如果不想通过命令行指定，可以在这里设置）
+GPU_IDS_DEFAULT=""
+
+# 解析命令行参数
+GPU_IDS="$GPU_IDS_DEFAULT"
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --gpu|-g)
+            GPU_IDS="$2"
+            shift 2
+            ;;
+        *)
+            # 忽略其他参数（这些参数会被lerobot-train处理）
+            shift
+            ;;
+    esac
+done
 
 # 环境变量设置
 # 禁用tokenizers并行警告（在使用多进程数据加载时会出现）
 export TOKENIZERS_PARALLELISM=false
 
+# 设置CUDA可见设备
+if [ -n "$GPU_IDS" ]; then
+    export CUDA_VISIBLE_DEVICES=$GPU_IDS
+    echo "=========================================="
+    echo "指定使用GPU: $GPU_IDS"
+    echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+    echo "=========================================="
+else
+    echo "=========================================="
+    echo "使用所有可用GPU"
+    echo "=========================================="
+fi
+
 # 训练参数 (可根据GPU内存调整)
-BATCH_SIZE=8          # 如果GPU内存不足，可以减小到2或1
-NUM_STEPS=40000       # 训练步数
+BATCH_SIZE=20          # 如果GPU内存不足，可以减小到2或1
+NUM_STEPS=80000       # 训练步数
 SAVE_FREQ=8000        # 每2000步保存一次checkpoint
 LOG_FREQ=100          # 每100步打印一次日志
 EVAL_FREQ=0           # 设置为0禁用评估（因为没有环境配置）
@@ -73,7 +114,7 @@ lerobot-train \
   --policy.type=groot \
   --policy.base_model_path="nvidia/GR00T-N1.5-3B" \
   --policy.push_to_hub=false \
-  --policy.tune_llm=false \
+  --policy.tune_llm=true \
   --policy.tune_visual=true \
   --policy.tune_projector=true \
   --policy.tune_diffusion_model=true \
