@@ -1,5 +1,109 @@
 # Groot robot fine-turn
-
+## 模型架构分析
+* ![model_pipeline](./docs/IMG/image_pipeline.png)
+### backbone原始定义 - vision encoder
+SigLIP Vision Model (SiglipVisionModel)
+- 来源：transformers.models.siglip.modeling_siglip.SiglipVisionModel
+- 配置：SiglipVisionConfig
+- 注意力实现：默认使用 flash_attention_2
+```python
+            if config.vision_config.model_type == "siglip_vision_model":
+                config.vision_config._attn_implementation = "flash_attention_2"
+                self.vision_model = SiglipVisionModel(config.vision_config)
+            else:
+                raise NotImplementedError(f"{config.vision_config.model_type} is not implemented.")
+```
+* `/home/lab/.cache/huggingface/lerobot/lerobot/eagle2hg-processor-groot-n1p5/config.json`
+```json
+    "vision_config": {
+        "_attn_implementation_autoset": true,
+        "attention_dropout": 0,
+        "hidden_act": "gelu_pytorch_tanh",
+        "hidden_size": 1152,
+        "image_size": 224,
+        "intermediate_size": 4304,
+        "layer_norm_eps": 0.000001,
+        "model_type": "siglip_vision_model",
+        "num_attention_heads": 16,
+        "num_channels": 3,
+        "num_hidden_layers": 27,
+        "patch_size": 14,
+        "torch_dtype": "bfloat16"
+    }
+```
+### backbone原始定义 - LLM
+* 配置文件存放于`/home/lab/.cache/huggingface/lerobot/lerobot/eagle2hg-processor-groot-n1p5/config.json`
+* 明确说明了使用`qwen3-1.7B`作为LLM，同时fine-turn使用fp16精度
+```json
+    "text_config": {
+        "_attn_implementation_autoset": true,
+        "_name_or_path": "Qwen/Qwen3-1.7B",
+        "architectures": [
+            "Qwen3ForCausalLM"
+        ],
+        "attention_bias": false,
+        "attention_dropout": 0,
+        "bos_token_id": 151643,
+        "eos_token_id": 151645,
+        "head_dim": 128,
+        "hidden_act": "silu",
+        "hidden_size": 2048,
+        "initializer_range": 0.02,
+        "intermediate_size": 6144,
+        "max_position_embeddings": 40960,
+        "max_window_layers": 28,
+        "model_type": "qwen3",
+        "num_attention_heads": 16,
+        "num_hidden_layers": 28,
+        "num_key_value_heads": 8,
+        "rms_norm_eps": 0.000001,
+        "rope_scaling": null,
+        "rope_theta": 1000000,
+        "sliding_window": null,
+        "tie_word_embeddings": true,
+        "torch_dtype": "bfloat16",
+        "use_cache": false,
+        "use_sliding_window": false,
+        "vocab_size": 151680
+    },
+```
+### Groot - action head 定义
+* `/home/lab/.cache/huggingface/hub/models--nvidia--GR00T-N1.5-3B/snapshots/869830fc749c35f34771aa5209f923ac57e4564e/config.json`定义存放在Groot-N1.5-3B的原始路径下
+#### 关于action head的定义
+```json
+  "action_head_cfg": {
+    "action_dim": 32,
+    "action_horizon": 16,
+    "add_pos_embed": true,
+    "backbone_embedding_dim": 2048,
+    "diffusion_model_cfg": {
+      "attention_head_dim": 48,
+      "cross_attention_dim": 2048,
+      "dropout": 0.2,
+      "final_dropout": true,
+      "interleave_self_attention": true,
+      "norm_type": "ada_norm",
+      "num_attention_heads": 32,
+      "num_layers": 16,
+      "output_dim": 1024,
+      "positional_embeddings": null
+    },
+```
+#### 关于Groot使用backbone的定义
+* 重点关注`select_layer`的标签，意味着Groot在使用的backbone_cfg.select_layer：控制保留多少层（12层），实际参数量在0.91B 而不是1.7B
+```json
+  "backbone_cfg": {
+    "eagle_path": "NVEagle/eagle_er-qwen3_1_7B-Siglip2_400M_stage1_5_128gpu_er_v7_1mlp_nops",
+    "load_bf16": false,
+    "project_to_dim": null,
+    "reproject_vision": false,
+    "select_layer": 12,
+    "tune_llm": false,
+    "tune_visual": true,
+    "use_flash_attention": true
+  },
+```
+---
 ## Dataset prepare
 * 将数据从v2.1的格式转换为v3.0格式
 ```bash
