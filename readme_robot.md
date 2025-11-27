@@ -1,4 +1,22 @@
 # Groot robot fine-turn
+## env prepare
+```bash
+# 先安装lerobot其他库
+# ubuntu22.04可以直接（pip install flash-attn==2.8.1），但是20.04要抓
+pip install lerobot[groot]
+pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.6cxx11abiTRUE-cp310-cp310-linux_x86_64.whl
+
+# 必装
+pip install transformers
+pip install peft
+
+# 推理环境安装
+pip3 install rospkg
+pip3 install scipy 
+cd /home/lab/kuavo-ros-control-rewACT/src/kuavo_humanoid_sdk && ./install.sh
+pip3 install websockets 
+pip3 install deprecated
+```
 ## 模型架构分析
 * ![model_pipeline](./docs/IMG/image_pipeline.png)
 ### backbone原始定义 - vision encoder
