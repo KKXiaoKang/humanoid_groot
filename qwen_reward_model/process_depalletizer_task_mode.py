@@ -21,6 +21,7 @@ import re
 import numpy as np
 import rospy
 from sensor_msgs.msg import Image
+from std_srvs.srv import Empty, EmptyResponse
 # 延迟导入cv_bridge以避免NumPy版本兼容性问题
 CV_BRIDGE_AVAILABLE = False
 CvBridge = None
@@ -512,6 +513,10 @@ class ROSImageSubscriber:
         if not rospy.get_node_uri():
             rospy.init_node('task_classifier_node', anonymous=True)
         
+        # 创建服务，用于重置状态
+        self.reset_service = rospy.Service('~reset', Empty, self.handle_reset_service)
+        print(f"✅ Reset service available at: {rospy.get_name()}/reset")
+        
         # 创建订阅者
         self.subscriber = rospy.Subscriber(
             topic,
@@ -540,6 +545,26 @@ class ROSImageSubscriber:
     def set_classifier(self, classifier: TaskClassifier):
         """设置任务分类器"""
         self.classifier = classifier
+    
+    def handle_reset_service(self, req):
+        """Handles requests to reset the classifier's state."""
+        rospy.loginfo("Received request to reset task classifier state.")
+        self.reset_state()
+        return EmptyResponse()
+
+    def reset_state(self):
+        """Clears the image buffer and resets classification state."""
+        # Clear the image buffer
+        with self.image_buffer.lock:
+            self.image_buffer.buffer.clear()
+        
+        # Reset the last classification result shown on GUI
+        self.current_task_result = None
+        
+        # Allow for immediate re-classification once buffer is ready
+        self.last_classification_time = 0
+        
+        rospy.loginfo("✅ Classifier state has been reset. Buffer is now empty.")
     
     def _convert_ros_image_to_numpy(self, msg: Image) -> np.ndarray:
         """
