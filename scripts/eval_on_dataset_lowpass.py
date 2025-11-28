@@ -212,7 +212,8 @@ def eval_on_dataset(ckpt_path,
                     show_progress=True,
                     image_zero=False,
                     state_zero=False,
-                    infer_per_frame: int = 1):
+                    infer_per_frame: int = 1,
+                    task_description: str | None = None):
     """
     在数据集上评估模型
     
@@ -226,6 +227,7 @@ def eval_on_dataset(ckpt_path,
         image_zero: 是否将图像输入置零（用于验证模型对图像的依赖性）
         state_zero: 是否将状态输入置零（用于验证模型对状态的依赖性）
         infer_per_frame: 每隔多少个frame重新推理一次（>=1）。
+        task_description: 任务描述字符串（language instruction），如果提供则覆盖数据集中的task，否则使用数据集原本的task。
     """
     # ----------- 一些参数 ----------------
     mse_per_action_dim = OrderedDict() # 记录每个动作维度的MSE
@@ -293,6 +295,10 @@ def eval_on_dataset(ckpt_path,
     
     print(f"📊 Action chunk size: {n_actions}")
     print(f"🔄 Inference frequency: Every {infer_per_frame} frame(s) (infer_per_frame={infer_per_frame})")
+    if task_description is not None:
+        print(f"📝 Task description (overridden): '{task_description}'")
+    else:
+        print(f"📝 Task description: Will use task from dataset")
     if image_zero:
         print(f"⚠️  IMAGE ZERO MODE: All image inputs will be set to zero (for dependency testing)")
     if state_zero:
@@ -547,6 +553,29 @@ def eval_on_dataset(ckpt_path,
                 if 'image' in key:
                     # 保持相同的形状和设备，但将所有像素值设为0
                     observation[key] = torch.zeros_like(observation[key])
+        
+        # 添加 task 字段（language instruction）
+        # 如果提供了 task_description，则使用它覆盖数据集中的 task；否则使用数据集原本的 task
+        if task_description is not None:
+            observation['task'] = task_description
+        elif 'task' in batch:
+            # 从 batch 中获取 task（LeRobotDataset 会在 __getitem__ 中添加 task 字段）
+            batch_task = batch['task']
+            # 处理 batch_task 可能是列表或字符串的情况
+            if isinstance(batch_task, (list, tuple)) and len(batch_task) > 0:
+                observation['task'] = batch_task[0]
+            elif isinstance(batch_task, str):
+                observation['task'] = batch_task
+            else:
+                # 如果类型不匹配，尝试转换为字符串
+                observation['task'] = str(batch_task) if batch_task is not None else ""
+        else:
+            # 如果 batch 中没有 task，尝试从数据集元数据中获取（使用第一个任务作为默认值）
+            if hasattr(dataset, 'meta') and hasattr(dataset.meta, 'tasks') and len(dataset.meta.tasks) > 0:
+                observation['task'] = dataset.meta.tasks.index[0]
+            else:
+                # 如果都没有，使用空字符串
+                observation['task'] = ""
         
         # 获取ground truth action
         gt_action = batch['action'][0].cpu().numpy()  # (action_dim,)
@@ -909,6 +938,8 @@ if __name__ == "__main__":
                        help='Set all state inputs to zero (for testing model dependency on state)')
     parser.add_argument('--infer-per-frame', type=int, default=1,
                        help='Run policy inference every N frames (default: 1 = every frame)')
+    parser.add_argument('--task-description', type=str, default=None,
+                       help='Task description (language instruction) to override the task from dataset. If not provided, will use the task from dataset.')
 
     args = parser.parse_args()
     
@@ -923,6 +954,10 @@ if __name__ == "__main__":
     print(f"Image Zero Mode: {args.image_zero}")
     print(f"State Zero Mode: {args.state_zero}")
     print(f"Infer Every N Frames: {args.infer_per_frame}")
+    if args.task_description:
+        print(f"Task Description (overridden): '{args.task_description}'")
+    else:
+        print(f"Task Description: Will use task from dataset")
     print("="*80)
     
     eval_on_dataset(
@@ -934,5 +969,6 @@ if __name__ == "__main__":
         show_progress=not args.no_progress,
         image_zero=args.image_zero,
         state_zero=args.state_zero,
-        infer_per_frame=args.infer_per_frame
+        infer_per_frame=args.infer_per_frame,
+        task_description=args.task_description
     )
