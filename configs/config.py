@@ -46,11 +46,11 @@ TASK_DATA_MODE = "strategy"
     注意: 如果ACTION_COMPONENTS包含Cmd_pose_z或Cmd_pose_pitch，则STATE_COMPONENTS必须包含Com_z_pitch
 """
 if TASK_DATA_MODE == "strategy":
-    STATE_COMPONENTS = ["J_q", "Claw_pos", "Com_z_pitch"]
-    # STATE_COMPONENTS = ["J_q", "Claw_pos"]  # 默认16维配置
+    # STATE_COMPONENTS = ["J_q", "Claw_pos", "Com_z_pitch"]
+    STATE_COMPONENTS = ["J_q", "Claw_pos"]  # 默认16维配置
 elif TASK_DATA_MODE == "VR":
-    STATE_COMPONENTS = ["J_q", "Claw_pos", "Com_z_pitch"]
-    # STATE_COMPONENTS = ["J_q", "Claw_pos"] # VR 使用state16进行学习
+    # STATE_COMPONENTS = ["J_q", "Claw_pos", "Com_z_pitch"]
+    STATE_COMPONENTS = ["J_q", "Claw_pos"] # VR 使用state16进行学习
 
 """
     ACTION_COMPONENTS - 指定动作空间包含的组件
@@ -70,8 +70,8 @@ elif TASK_DATA_MODE == "VR":
 # 默认action组件配置（depalletizer任务通常不需要cmd_pose）
 # ACTION_COMPONENTS = ["Left_arm", "Right_arm", "Left_claw", "Right_claw"]
 ACTION_COMPONENTS = ["Left_arm", "Right_arm", \
-                     # "Left_claw", "Right_claw"]
-                     "Left_claw", "Right_claw", "Cmd_pose_z", "Cmd_pose_pitch"]
+                     "Left_claw", "Right_claw"]
+                     # "Left_claw", "Right_claw", "Cmd_pose_z", "Cmd_pose_pitch"]
 
 # 验证：如果action包含cmd_pose，state必须包含com组件
 if ("Cmd_pose_z" in ACTION_COMPONENTS or "Cmd_pose_pitch" in ACTION_COMPONENTS):
@@ -80,6 +80,27 @@ if ("Cmd_pose_z" in ACTION_COMPONENTS or "Cmd_pose_pitch" in ACTION_COMPONENTS):
         print(f"   Adding Com_z_pitch to STATE_COMPONENTS automatically...")
         STATE_COMPONENTS = list(STATE_COMPONENTS) + ["Com_z_pitch"]
         print(f"   Updated STATE_COMPONENTS: {STATE_COMPONENTS}")
+
+"""
+    CAMERA_COMPONENTS - 指定相机配置包含的组件
+    可选组件:
+    - "cam_head": 头部相机 (image)
+    - "cam_chest": 胸部相机 (chest_image)
+    - "cam_left": 左肩相机 (left_shoulder_image)
+    - "cam_right": 右肩相机 (right_shoulder_image)
+    
+    示例配置:
+    - ["cam_head", "cam_left", "cam_right"]: 3相机配置（无chest相机）
+    - ["cam_head", "cam_chest", "cam_left", "cam_right"]: 4相机配置（完整配置）
+    - ["cam_head"]: 单相机配置
+    - ["cam_head", "cam_chest"]: 2相机配置
+    
+    注意: 根据数据集实际包含的相机来配置，如果数据集中没有某个相机，则不要包含在CAMERA_COMPONENTS中
+"""
+# 默认相机组件配置（根据数据集实际情况调整）
+# 如果数据集中没有cam_chest，则只配置: ["cam_head", "cam_left", "cam_right"]
+CAMERA_COMPONENTS = ["cam_head", "cam_left", "cam_right"]  # 默认3相机配置（无chest）
+# CAMERA_COMPONENTS = ["cam_head", "cam_chest", "cam_left", "cam_right"]  # 完整4相机配置
 
 def euler_to_rotation_matrix_first_two_cols(roll, pitch, yaw):
     """
@@ -108,13 +129,65 @@ def euler_to_rotation_matrix_first_two_cols(roll, pitch, yaw):
 
 ## ------------------------ camera key mapping -------------------------- ##
 
-# 相机名称到新key格式的映射
+# 相机组件到相机名称的映射
+CAMERA_COMPONENT_DEFINITIONS = {
+    "cam_head": "image",
+    "cam_chest": "chest_image",
+    "cam_left": "left_shoulder_image",
+    "cam_right": "right_shoulder_image",
+}
+
+# 相机名称到新key格式的映射（向后兼容）
 CAMERA_KEY_MAPPING = {
     "image": "cam_head",
     "chest_image": "cam_chest",
     "left_shoulder_image": "cam_left",
     "right_shoulder_image": "cam_right",
 }
+
+def get_camera_names(camera_components=None):
+    """
+    根据camera_components返回对应的相机名称列表
+    
+    Args:
+        camera_components: 相机组件列表，如果为None则使用全局CAMERA_COMPONENTS配置
+                         可选值: ["cam_head", "cam_chest", "cam_left", "cam_right"] 的组合
+        
+    Returns:
+        list: 相机名称列表 (例如: ["image", "left_shoulder_image", "right_shoulder_image"])
+        
+    相机配置说明:
+    - 根据CAMERA_COMPONENTS动态组合:
+      - ["cam_head", "cam_left", "cam_right"]: 3相机 (image, left_shoulder_image, right_shoulder_image)
+      - ["cam_head", "cam_chest", "cam_left", "cam_right"]: 4相机 (完整配置)
+      - ["cam_head"]: 单相机 (image)
+    """
+    # 如果没有指定camera_components，使用全局配置
+    if camera_components is None:
+        camera_components = CAMERA_COMPONENTS
+    
+    # 确保camera_components是列表
+    if isinstance(camera_components, str):
+        camera_components = [camera_components]
+    
+    # 根据配置组合相机名称
+    camera_names = []
+    for component in camera_components:
+        if component in CAMERA_COMPONENT_DEFINITIONS:
+            camera_names.append(CAMERA_COMPONENT_DEFINITIONS[component])
+        else:
+            print(f"⚠️  Warning: Unknown camera component '{component}'. Available components: {list(CAMERA_COMPONENT_DEFINITIONS.keys())}")
+    
+    # 打印配置信息
+    if len(camera_names) > 0:
+        pass
+        # print(f"📷 Camera configuration: {camera_components} -> {len(camera_names)} cameras [{', '.join(camera_names)}]")
+    else:
+        # print(f"⚠️  Warning: No valid camera components selected. Using default single camera configuration.")
+        # 如果没有任何有效组件，返回默认的单相机配置
+        camera_names = [CAMERA_COMPONENT_DEFINITIONS["cam_head"]]
+    
+    return camera_names
 
 def get_camera_observation_key(camera_name: str, use_image_features: bool = False) -> str:
     """
@@ -612,13 +685,14 @@ def process_cmd_pose(msg, data_dict, name, ts=None):
     data_dict[name]['data'].append(data)
     data_dict[name]['ts'].append(ts)
 
-def get_topic_info(action_mode="delta", task_data_mode="strategy"):
+def get_topic_info(action_mode="delta", task_data_mode="strategy", camera_components=None):
     """
-    根据action_mode返回对应的topic配置
+    根据action_mode和camera_components返回对应的topic配置
     
     Args:
         action_mode: "absolute", "delta", "relative"
         task_data_mode: "VR" or "strategy"
+        camera_components: 相机组件列表，如果为None则使用全局CAMERA_COMPONENTS配置
         
     Returns:
         dict: topic配置字典
@@ -629,40 +703,38 @@ def get_topic_info(action_mode="delta", task_data_mode="strategy"):
     print(f" =================== Action components: {ACTION_COMPONENTS} ================= ")
     print(f" =================== State components: {STATE_COMPONENTS} ================= ")
     
+    # 根据CAMERA_COMPONENTS获取相机名称列表
+    camera_names = get_camera_names(camera_components)
+    
+    # 相机名称到topic的映射
+    camera_topic_mapping = {
+        "image": "/camera/color/image_raw",
+        "chest_image": "/chest_cam/color/image_raw",
+        "left_shoulder_image": "/left_cam/color/image_raw",
+        "right_shoulder_image": "/right_cam/color/image_raw",
+    }
+    
     # 统一转换为大写进行比较，支持大小写不敏感
     task_data_mode_upper = task_data_mode.upper()
     
+    # 基础topic配置（相机部分根据CAMERA_COMPONENTS动态生成）
+    base_topic_config = {}
+    
+    # 根据CAMERA_COMPONENTS动态添加相机配置
+    for camera_name in camera_names:
+        if camera_name in camera_topic_mapping:
+            base_topic_config[camera_name] = {
+                "topic": camera_topic_mapping[camera_name],
+                "msg_process_fn": process_Image,
+                "shape": None,
+            }
+    
     if task_data_mode_upper == "VR":
-        print(" =================== Set camera topic to /camera/color/image_raw \
-               /chest_cam/color/image_raw \ /left_cam/color/image_raw /right_cam/color/image_raw ==================")
+        print(f" =================== Set camera topic based on CAMERA_COMPONENTS: {CAMERA_COMPONENTS} ==================")
         return {
                     # ----------------------------------------- image ----------------------------------------------------- #
-                    "image": {
-                        "topic": "/camera/color/image_raw",
-                        "msg_process_fn": process_Image,
-                        "shape": None,
-                    },
-
-                    # new image obs
-                    "chest_image": {
-                        "topic": "/chest_cam/color/image_raw",  # /chest_cam/color/image_raw
-                        "msg_process_fn": process_Image,
-                        "shape": None,
-                    },
-
-                    # left shoulder camera
-                    "left_shoulder_image": {
-                        "topic": "/left_cam/color/image_raw",  # /left_cam/color/image_raw
-                        "msg_process_fn": process_Image,
-                        "shape": None,
-                    },
-
-                    # right shoulder camera
-                    "right_shoulder_image": {
-                        "topic": "/right_cam/color/image_raw",
-                        "msg_process_fn": process_Image,
-                        "shape": None,
-                    },
+                    # 根据CAMERA_COMPONENTS动态生成的相机配置
+                    **base_topic_config,
 
                     # ----------------------------------------- obs ----------------------------------------------------- #
                     # 手臂关节状态
@@ -725,37 +797,11 @@ def get_topic_info(action_mode="delta", task_data_mode="strategy"):
                     }
         }
     elif task_data_mode_upper == "STRATEGY":
-        print(" =================== Set camera topic to /camera/color/image_raw \
-               /chest_cam/color/image_raw /left_cam/color/image_raw /right_cam/color/image_raw ==================")
+        print(f" =================== Set camera topic based on CAMERA_COMPONENTS: {CAMERA_COMPONENTS} ==================")
         return {
                     # ----------------------------------------- image ----------------------------------------------------- #
-                    # 统一使用4相机配置，即使strategy模式也包含chest_image（可能为空数据）
-                    "image": {
-                        "topic": "/camera/color/image_raw",
-                        "msg_process_fn": process_Image,
-                        "shape": None,
-                    },
-
-                    # chest camera (strategy模式可能没有数据，但保留占位符以保持4相机配置)
-                    "chest_image": {
-                        "topic": "/chest_cam/color/image_raw",
-                        "msg_process_fn": process_Image,
-                        "shape": None,
-                    },
-
-                    # left shoulder camera
-                    "left_shoulder_image": {
-                        "topic": "/left_cam/color/image_raw",  # /left_cam/color/image_raw
-                        "msg_process_fn": process_Image,
-                        "shape": None,
-                    },
-
-                    # right shoulder camera
-                    "right_shoulder_image": {
-                        "topic": "/right_cam/color/image_raw",
-                        "msg_process_fn": process_Image,
-                        "shape": None,
-                    },
+                    # 根据CAMERA_COMPONENTS动态生成的相机配置
+                    **base_topic_config,
 
                     # ----------------------------------------- obs ----------------------------------------------------- #
                     # 手臂关节状态

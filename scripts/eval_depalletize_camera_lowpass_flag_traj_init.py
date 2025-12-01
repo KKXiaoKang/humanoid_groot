@@ -3,6 +3,8 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import cv2
 import numpy as np
+import rosbag
+from sensor_msgs.msg import JointState
 
 # Initialize GUI windows if requested
 def init_gui_windows(enable_gui=False, camera_config=None):
@@ -322,8 +324,155 @@ def publish_joint_positions(action_chunk,
     except Exception as e:
         rospy.logerr(f"Error publishing joint positions: {str(e)}")
 
+def load_and_replay_init_trajectory(bag_path: str, env, control_arm: bool = True, control_claw: bool = True):
+    """
+    从rosbag文件中加载初始轨迹并回放
+    
+    Args:
+        bag_path: rosbag文件路径
+        env: GrabBoxMpcEnv环境实例
+        control_arm: 是否控制手臂
+        control_claw: 是否控制夹爪
+    """
+    if not os.path.exists(bag_path):
+        rospy.logerr(f"Bag file not found: {bag_path}")
+        return False
+    
+    rospy.loginfo(f"Loading initial trajectory from bag: {bag_path}")
+    
+    # 期望的关节名称顺序（与publish_target_arm_claw中的顺序一致）
+    expected_joint_names = [
+        "zarm_l1_joint", "zarm_l2_joint", "zarm_l3_joint", "zarm_l4_joint", 
+        "zarm_l5_joint", "zarm_l6_joint", "zarm_l7_joint",
+        "zarm_r1_joint", "zarm_r2_joint", "zarm_r3_joint", "zarm_r4_joint", 
+        "zarm_r5_joint", "zarm_r6_joint", "zarm_r7_joint",
+    ]
+    
+    # 读取bag文件中的JointState消息
+    joint_states = []
+    try:
+        with rosbag.Bag(bag_path, 'r') as bag:
+            topic_name = '/mm_kuavo_arm_traj'
+            
+            # 检查话题是否存在
+            bag_info = bag.get_type_and_topic_info()
+            if topic_name not in bag_info[1]:
+                rospy.logwarn(f"Topic {topic_name} not found in bag file. Available topics: {list(bag_info[1].keys())}")
+                return False
+            
+            # 读取所有JointState消息
+            # 注意：由于已经通过topic_name过滤，所有消息都应该是JointState类型
+            # 但isinstance检查可能不工作（rosbag可能返回包装类型），所以直接使用消息
+            message_count = 0
+            for topic, msg, t in bag.read_messages(topics=[topic_name]):
+                message_count += 1
+                # 直接使用消息，不进行类型检查（因为已经通过topic过滤）
+                joint_states.append({
+                    'timestamp': t.to_sec(),
+                    'msg': msg
+                })
+            
+            rospy.loginfo(f"Read {message_count} messages from topic {topic_name}")
+            
+            # 按时间戳排序
+            joint_states.sort(key=lambda x: x['timestamp'])
+            
+            if len(joint_states) == 0:
+                rospy.logwarn(f"No JointState messages found in topic {topic_name}")
+                return False
+            
+            rospy.loginfo(f"Loaded {len(joint_states)} joint states from bag file")
+            
+    except Exception as e:
+        rospy.logerr(f"Error loading bag file: {e}")
+        return False
+    
+    # 获取当前夹爪状态（用于填充16维action）
+    current_claw_state = np.array([0.0, 0.0])  # 默认值
+    try:
+        obs_data, _, _, robot_obs, _ = env.get_obs()
+        if 'claw_state' in robot_obs and len(robot_obs['claw_state']) > 0:
+            # 获取最新的夹爪状态
+            claw_data = robot_obs['claw_state']
+            if claw_data.ndim == 2:
+                # 如果是2D数组，取最后一行
+                current_claw_state = np.array(claw_data[-1], dtype=np.float32)
+            elif claw_data.ndim == 1:
+                # 如果是1D数组，直接使用
+                current_claw_state = np.array(claw_data, dtype=np.float32)
+            
+            # 确保是2维
+            if current_claw_state.shape[0] != 2:
+                rospy.logwarn(f"Claw state has unexpected shape: {current_claw_state.shape}, using default")
+                current_claw_state = np.array([0.0, 0.0])
+            else:
+                rospy.loginfo(f"Current claw state: {current_claw_state}")
+    except Exception as e:
+        rospy.logwarn(f"Could not get current claw state: {e}, using default [0.0, 0.0]")
+        current_claw_state = np.array([0.0, 0.0])
+    
+    # 回放轨迹（按照rosbag中的时间戳间隔）
+    rospy.loginfo("Starting trajectory replay...")
+    replay_start_time = time.time()
+    bag_start_timestamp = joint_states[0]['timestamp']  # bag中的第一个时间戳
+    
+    for i, joint_data in enumerate(joint_states):
+        msg = joint_data['msg']
+        bag_timestamp = joint_data['timestamp']
+        
+        # 提取关节位置
+        # JointState的position是角度（度），需要转换为弧度
+        if len(msg.position) < 14:
+            rospy.logwarn(f"JointState message {i} has insufficient positions: {len(msg.position)} < 14")
+            continue
+        
+        # 直接使用position数组的前14个元素（跳过名称检查）
+        # bag文件中的关节顺序是: arm_joint_1 ~ arm_joint_14
+        # 对应: 左手7个关节 + 右手7个关节
+        # 直接使用前14个位置，假设顺序正确
+        arm_action = np.deg2rad(np.array(msg.position[:14]))
+        
+        # 组合成16维action: [14个手臂关节, 2个夹爪位置]
+        action = np.concatenate([arm_action, current_claw_state])
+        
+        # 计算应该等待的时间（按照bag中的时间戳间隔）
+        if i == 0:
+            # 第一个动作立即执行
+            expected_elapsed = 0.0
+        else:
+            # 计算从bag开始到当前消息应该经过的时间
+            bag_elapsed = bag_timestamp - bag_start_timestamp
+            # 计算实际经过的时间
+            actual_elapsed = time.time() - replay_start_time
+            # 需要等待的时间
+            expected_elapsed = bag_elapsed - actual_elapsed
+        
+        # 如果时间还没到，等待
+        if expected_elapsed > 0:
+            time.sleep(expected_elapsed)
+        
+        # 执行动作（不使用env.exec_actions，因为它会按照100Hz频率控制，我们直接发布）
+        # 直接使用env的target_publisher发布，不经过env.exec_actions的频率控制
+        env.target_publisher.publish_target_arm_claw(
+            arm_action=arm_action,
+            claw_action=current_claw_state,
+            control_arm=control_arm,
+            control_claw=control_claw
+        )
+        
+        # 打印进度
+        if (i + 1) % 10 == 0 or i == len(joint_states) - 1:
+            elapsed = time.time() - replay_start_time
+            bag_total_time = joint_states[-1]['timestamp'] - bag_start_timestamp
+            rospy.loginfo(f"Replayed {i + 1}/{len(joint_states)} steps (elapsed: {elapsed:.2f}s, bag time: {bag_total_time:.2f}s)")
+    
+    total_time = time.time() - replay_start_time
+    bag_total_time = joint_states[-1]['timestamp'] - bag_start_timestamp
+    rospy.loginfo(f"Trajectory replay completed! Real time: {total_time:.2f}s, Bag time: {bag_total_time:.2f}s, {len(joint_states)} steps")
+    
+    return True
 
-def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chunk_size=50, lerobot_dataset_path=None, enable_gui=False):
+def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chunk_size=50, lerobot_dataset_path=None, enable_gui=False, rotate_head_camera=False, state_zero=False, task_description=None):
     """
     在这里和实机/仿真交互，做网络推理（depalletize任务）
     
@@ -335,6 +484,9 @@ def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chun
         action_chunk_size: 动作块大小
         lerobot_dataset_path: 数据集路径（用于加载统计信息，可选）
         enable_gui: 是否启用GUI窗口显示相机图像
+        rotate_head_camera: 是否旋转头部相机图像180度
+        state_zero: 是否将状态输入置零（用于验证模型对状态的依赖性）
+        task_description: 任务描述字符串（language instruction），如果为None则从数据集加载或使用默认值
     """
 
     # ---------- 1. load GrootPolicy from checkpoint ---------------
@@ -344,14 +496,24 @@ def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chun
     policy.config.device = device
     policy.config.n_action_steps = action_chunk_size
     
-    # Load dataset statistics for normalization
-    print(f"\n📂 Loading dataset for statistics...")
+    # Load dataset statistics for normalization and task information
+    print(f"\n📂 Loading dataset for statistics and task information...")
     dataset_stats = None
+    available_tasks = None
     if lerobot_dataset_path:
         try:
             dataset_for_stats = LeRobotDataset(repo_id=0, root=lerobot_dataset_path)
             dataset_stats = dataset_for_stats.meta.stats if hasattr(dataset_for_stats.meta, 'stats') else None
             print(f"✅ Dataset statistics loaded: {list(dataset_stats.keys()) if dataset_stats else 'None'}")
+            if dataset_stats is None:
+                print("⚠️ Warning: Dataset has no statistics. Action denormalization may not work correctly.")
+            elif 'action' not in dataset_stats:
+                print("⚠️ Warning: Dataset statistics do not contain 'action' key. Action denormalization may not work correctly.")
+            
+            # 加载可用的任务列表
+            if hasattr(dataset_for_stats.meta, 'tasks') and dataset_for_stats.meta.tasks is not None:
+                available_tasks = list(dataset_for_stats.meta.tasks.index)
+                print(f"✅ Available tasks in dataset: {available_tasks}")
         except Exception as e:
             print(f"⚠️ Warning: Could not load dataset statistics: {e}")
             print("   This may cause normalization issues during inference")
@@ -361,8 +523,36 @@ def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chun
             dataset_for_stats = LeRobotDataset(repo_id=0, root='/home/lab/lerobot_groot/lerobot_data/new_demo/1118_sim_depalletize')
             dataset_stats = dataset_for_stats.meta.stats if hasattr(dataset_for_stats.meta, 'stats') else None
             print(f"✅ Dataset statistics loaded from default path: {list(dataset_stats.keys()) if dataset_stats else 'None'}")
+            if dataset_stats is None:
+                print("⚠️ Warning: Default dataset has no statistics. Action denormalization may not work correctly.")
+            elif 'action' not in dataset_stats:
+                print("⚠️ Warning: Default dataset statistics do not contain 'action' key. Action denormalization may not work correctly.")
+            
+            # 加载可用的任务列表
+            if hasattr(dataset_for_stats.meta, 'tasks') and dataset_for_stats.meta.tasks is not None:
+                available_tasks = list(dataset_for_stats.meta.tasks.index)
+                print(f"✅ Available tasks in default dataset: {available_tasks}")
         except Exception as e:
             print(f"⚠️ Warning: Could not load default dataset statistics: {e}")
+            print("   This may cause normalization issues during inference")
+    
+    # 确定要使用的任务描述
+    if task_description is None:
+        if available_tasks and len(available_tasks) > 0:
+            # 使用数据集中第一个任务作为默认值
+            task_description = available_tasks[0]
+            print(f"📝 Using first task from dataset as default: '{task_description}'")
+        else:
+            # 使用通用默认值
+            task_description = "Depalletize the box"
+            print(f"📝 No task found in dataset, using default: '{task_description}'")
+    else:
+        print(f"📝 Using provided task description: '{task_description}'")
+    
+    # 如果提供了任务描述但不在可用任务列表中，给出警告
+    if available_tasks and task_description not in available_tasks:
+        print(f"⚠️ Warning: Task '{task_description}' not found in dataset tasks: {available_tasks}")
+        print(f"   Using provided task description anyway...")
     
     # Create preprocessor and postprocessor
     print(f"\n🔧 Creating preprocessor and postprocessor...")
@@ -388,6 +578,11 @@ def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chun
     # 根据ACTION_COMPONENTS判断是否包含cmd_pose
     has_cmd_pose = ("Cmd_pose_z" in ACTION_COMPONENTS or "Cmd_pose_pitch" in ACTION_COMPONENTS)
     print(f"🎯 Cmd_pose control: {'Enabled' if has_cmd_pose else 'Disabled'} (based on ACTION_COMPONENTS)")
+    if rotate_head_camera:
+        print(f"🔄 Head camera rotation enabled: images from 'image' camera will be rotated 180 degrees")
+    if state_zero:
+        print(f"⚠️  STATE ZERO MODE: All state inputs will be set to zero (for dependency testing)")
+    print(f"📝 Task description: '{task_description}'")
     print("="*80 + "\n")
     
     policy.eval()
@@ -423,7 +618,26 @@ def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chun
     time.sleep(1.0)
     resampled_action_queue: deque[np.ndarray] = deque()
     last_executed_action: Optional[np.ndarray] = None
-
+    
+    # 加载并回放初始轨迹
+    init_traj_bag_path = '/home/lab/kuavo-manip/robot_depalletize_init_traj.bag'
+    if os.path.exists(init_traj_bag_path):
+        rospy.loginfo("Loading and replaying initial trajectory from bag file...")
+        load_and_replay_init_trajectory(
+            bag_path=init_traj_bag_path,
+            env=env,
+            control_arm=control_arm,
+            control_claw=control_claw
+        )
+        rospy.loginfo("Initial trajectory replay completed. Starting model inference...")
+        time.sleep(1.0)
+    else:
+        rospy.logwarn(f"Initial trajectory bag file not found: {init_traj_bag_path}")
+        rospy.logwarn("Skipping initial trajectory replay. Starting model inference directly...")
+    
+    input(f"轨迹回放 结束, 按回车继续 ==== 轨迹回放成功 ==== \n")
+    time.sleep(1.0)
+    
     while True:
         try:
             state = torch.from_numpy(obs_data["state"]).float()
@@ -438,7 +652,26 @@ def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chun
             for camera_name in camera_names:
                 # 检查相机数据是否在obs_data中
                 if camera_name in obs_data:
-                    camera_images = torch.from_numpy(np.moveaxis(obs_data[camera_name], 3, 1)).float() / 255
+                    # 获取相机图像，obs_data中的图像格式是 (T, H, W, C)，其中T是时间步数
+                    camera_img_np = obs_data[camera_name]
+                    
+                    # 检查图像维度，应该是 (T, H, W, C) 格式
+                    if camera_img_np.ndim != 4:
+                        rospy.logwarn(f"⚠️  Unexpected camera image shape: {camera_img_np.shape}, expected (T, H, W, C)")
+                        continue
+                    
+                    # 如果启用头部相机旋转且当前是头部相机（image），则对每一帧旋转180度
+                    if rotate_head_camera and camera_name == "image":
+                        # 旋转180度：使用np.rot90，k=2表示旋转180度，axes=(1,2)表示在H和W维度上旋转
+                        # camera_img_np shape: (T, H, W, C)
+                        # 对每一帧进行旋转，axes=(1,2)表示在H和W维度上旋转（保持T和C维度不变）
+                        # 注意：np.rot90可能产生负步长的视图，需要copy()来创建连续数组，以便PyTorch可以处理
+                        camera_img_np = np.rot90(camera_img_np, k=2, axes=(1, 2)).copy()
+                    
+                    # 转换为 (T, C, H, W) 格式并归一化
+                    # 使用np.moveaxis将 (T, H, W, C) 转换为 (T, C, H, W)
+                    # 注意：np.moveaxis也可能产生负步长，使用copy()确保数组连续
+                    camera_images = torch.from_numpy(np.moveaxis(camera_img_np, 3, 1).copy()).float() / 255
                     # 使用新的key格式: observation.images.cam_*
                     obs_key = get_camera_observation_key(camera_name, use_image_features=False)
                     observation[obs_key] = camera_images.to('cuda:0')
@@ -448,7 +681,16 @@ def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chun
                         rospy.logwarn(f"⚠️  Camera '{camera_name}' from CAMERA_COMPONENTS not found in obs_data. Available cameras: {[k for k in obs_data.keys() if 'image' in k.lower()]}")
 
             # observation['observation.environment_state'] = environment_state
-            observation['observation.state'] = state.to('cuda:0')
+            # 如果启用state_zero模式，将状态输入置零（用于验证模型对状态的依赖性）
+            if state_zero:
+                # 保持相同的形状和设备，但将所有状态值设为0
+                observation['observation.state'] = torch.zeros_like(state).to('cuda:0')
+            else:
+                observation['observation.state'] = state.to('cuda:0')
+            
+            # 添加 task 字段（language instruction）
+            # processor 会从 complementary_data 中的 "task" 字段读取并转换为 language
+            observation['task'] = task_description
 
             if not resampled_action_queue:
                 # 使用GrootPolicy的predict_action_chunk
@@ -607,6 +849,12 @@ if __name__ == '__main__':
     parser.add_argument('--lerobot_dataset_path', type=str, default=None, help='Path to the LeRobot dataset for loading statistics (optional)')
     parser.add_argument('--enable_gui', action='store_true',
                         help='Enable GUI windows for camera display (default: disabled)')
+    parser.add_argument('--rotate-head-camera', action='store_true',
+                        help='If set, rotate head camera images (image) by 180 degrees.')
+    parser.add_argument('--state-zero', action='store_true',
+                        help='If set, set all state inputs to zero (for testing model dependency on state)')
+    parser.add_argument('--task-description', type=str, default=None,
+                        help='Task description (language instruction) for the model. If not provided, will use the first task from dataset or a default value.')
     
     args = parser.parse_args()
     
@@ -631,8 +879,14 @@ if __name__ == '__main__':
     print(f"📊 Action chunk size: {args.action_chunk_size}")
     print(f"📦 Action dimension: Supports 16 or 18 (14 arm joints + 2 claw positions [+ 2 cmd_pose])")
     print(f"🖼️  Enable GUI: {args.enable_gui}")
+    if args.rotate_head_camera:
+        print(f"🔄 Rotate head camera: Enabled (images from 'image' camera will be rotated 180 degrees)")
+    if args.state_zero:
+        print(f"⚠️  State zero mode: Enabled (all state inputs will be set to zero)")
     if args.lerobot_dataset_path:
         print(f"📁 Dataset path (for stats): {args.lerobot_dataset_path}")
+    if args.task_description:
+        print(f"📝 Task description: '{args.task_description}'")
     print("="*80 + "\n")
 
     if args.eval:
@@ -640,7 +894,10 @@ if __name__ == '__main__':
         eval(args.ckpt_path, model_type=args.model_type, control_arm=True, control_claw=True, 
              action_chunk_size=args.action_chunk_size, 
              lerobot_dataset_path=args.lerobot_dataset_path,
-             enable_gui=args.enable_gui)
+             enable_gui=args.enable_gui,
+             rotate_head_camera=args.rotate_head_camera,
+             state_zero=args.state_zero,
+             task_description=args.task_description)
     elif args.replay:
         print("Replaying the model")
         lerobot_dataset_path = '/home/lab/kuavo-manip/lerobot_data/vel_wrend_box_613'

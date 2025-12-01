@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Evaluate GrootPolicy Model on Dataset
+Evaluate GrootPolicy Model on Dataset with Lowpass Visualization
 
 This script evaluates a GrootPolicy model on a LeRobot dataset and computes error metrics.
+It visualizes chunk interpolation and lowpass filtering between chunks.
 It supports optional MuJoCo visualization.
 
 Usage:
-    python scripts/eval_on_dataset.py \
+    python scripts/eval_on_dataset_losspass.py \
         --ckpt-path <checkpoint_path> \
         --dataset-root <dataset_path> \
         --episode <episode_number> \
@@ -32,7 +33,7 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 # 导入配置模块（如果存在）
 try:
-    from configs.config import topic_info, TASK_DATA_MODE, get_camera_observation_key, get_camera_names, CAMERA_COMPONENTS, action_names
+    from configs.config import topic_info, TASK_DATA_MODE, get_camera_observation_key, get_camera_names, CAMERA_COMPONENTS, action_names, CAMERA_KEY_MAPPING
     CONFIG_AVAILABLE = True
 except ImportError:
     print("⚠️  Warning: configs.config not available. Using defaults.")
@@ -41,10 +42,21 @@ except ImportError:
     TASK_DATA_MODE = "unknown"
     CAMERA_COMPONENTS = []
     action_names = []
+    CAMERA_KEY_MAPPING = {}
     def get_camera_observation_key(camera_name, use_image_features=False):
         return f"observation.images.{camera_name}" if use_image_features else f"observation.images.{camera_name}"
     def get_camera_names(camera_components=None):
         return []
+
+# 插值与低通滤波常量
+MODEL_ACTION_DT = 0.1
+MODEL_ACTION_FREQUENCY = 1.0 / MODEL_ACTION_DT
+TARGET_CONTROL_FREQUENCY = 100.0
+TARGET_CONTROL_DT = 1.0 / TARGET_CONTROL_FREQUENCY
+CHUNK_TRANSITION_DURATION_S = 0.2
+LOWPASS_ALPHA = 0.85
+COLOR_INTERP = [0, 128, 255]
+COLOR_LOWPASS = [255, 140, 0]
 
 # 可选的可视化工具（如果不存在则禁用）
 try:
@@ -56,6 +68,141 @@ except ImportError:
     RerunVisualizer = None
     KeyboardManager = None
 
+# ROS 和机器人 SDK（仅在需要时导入，用于 MuJoCo 可视化）
+try:
+    import rospy
+    from kuavo_humanoid_sdk.kuavo_strategy_pytree.common.robot_sdk import RobotSDK
+    from kuavo_humanoid_sdk.msg.kuavo_msgs.srv import (changeArmCtrlMode, changeArmCtrlModeRequest)
+    ROS_AVAILABLE = True
+except ImportError:
+    ROS_AVAILABLE = False
+    print("⚠️  Warning: ROS dependencies not available. MuJoCo visualization with robot control will be disabled.")
+
+def direct_to_wbc(control_mode):
+    """
+    切换手臂到wbc轨迹控制模式
+    Args:
+        control_mode: 控制模式
+            0: 禁用wbc控制轨迹模式
+            1: wbc轨迹控制模式
+    """
+    if not ROS_AVAILABLE:
+        print("⚠️  Warning: ROS not available, cannot call direct_to_wbc")
+        return
+    
+    rospy.wait_for_service('/enable_wbc_arm_trajectory_control', timeout=5)
+    try:
+        change_mode = rospy.ServiceProxy('/enable_wbc_arm_trajectory_control', changeArmCtrlMode)
+        req = changeArmCtrlModeRequest()
+        req.control_mode = control_mode
+        res = change_mode(req)
+        if res.result:
+            rospy.loginfo("wbc轨迹控制模式已更改为 %d", control_mode)
+        else:
+            rospy.logerr("无法将wbc轨迹控制模式更改为 %d", control_mode)
+    except rospy.ServiceException as e:
+        rospy.logerr("服务调用失败: %s", e)
+
+
+def resample_action_chunk(action_chunk: np.ndarray,
+                          source_dt: float = MODEL_ACTION_DT,
+                          target_dt: float = TARGET_CONTROL_DT) -> np.ndarray:
+    action_chunk = np.asarray(action_chunk)
+    if action_chunk.ndim == 1:
+        action_chunk = action_chunk.reshape(1, -1)
+
+    if action_chunk.shape[0] <= 1 or np.isclose(source_dt, target_dt):
+        return action_chunk
+
+    total_duration = source_dt * (action_chunk.shape[0] - 1)
+    if total_duration <= 0:
+        repeat_factor = max(int(round(source_dt / target_dt)), 1)
+        return np.repeat(action_chunk, repeats=repeat_factor, axis=0)
+
+    num_target_steps = int(round(total_duration / target_dt)) + 1
+    source_times = np.linspace(0.0, total_duration, num=action_chunk.shape[0])
+    target_times = np.linspace(0.0, total_duration, num=num_target_steps)
+
+    interpolated = np.empty((num_target_steps, action_chunk.shape[1]), dtype=action_chunk.dtype)
+    for dim in range(action_chunk.shape[1]):
+        interpolated[:, dim] = np.interp(target_times, source_times, action_chunk[:, dim])
+
+    return interpolated
+
+
+def apply_lowpass_transition(actions: np.ndarray,
+                             previous_action: np.ndarray | None,
+                             alpha: float = LOWPASS_ALPHA,
+                             transition_steps: int | None = None,
+                             smooth_slice: slice | tuple | np.ndarray = slice(None)) -> np.ndarray:
+    if previous_action is None:
+        return actions
+
+    actions = np.asarray(actions)
+    if actions.ndim == 1:
+        actions = actions.reshape(1, -1)
+
+    smoothed = actions.copy()
+    prev = np.asarray(previous_action, dtype=smoothed.dtype)
+    if prev.ndim == 1:
+        prev = prev.reshape(1, -1)
+    prev = prev[0]
+
+    num_steps = smoothed.shape[0]
+    if transition_steps is None or transition_steps > num_steps:
+        transition_steps = num_steps
+    transition_steps = max(1, transition_steps)
+
+    indices = smooth_slice
+    for idx in range(transition_steps):
+        prev_slice = prev[indices]
+        smoothed_slice = smoothed[idx][indices]
+        filtered = alpha * prev_slice + (1.0 - alpha) * smoothed_slice
+        prev[indices] = filtered
+        smoothed[idx][indices] = filtered
+
+    return smoothed
+
+
+def resample_chunk_with_claw_hold(action_chunk: np.ndarray,
+                                  previous_action: np.ndarray | None,
+                                  control_frequency: float,
+                                  source_dt: float = MODEL_ACTION_DT,
+                                  arm_dims: slice = slice(0, 14),
+                                  claw_dims: slice = slice(14, 16)) -> np.ndarray:
+    action_chunk = np.asarray(action_chunk)
+    if action_chunk.ndim == 1:
+        action_chunk = action_chunk.reshape(1, -1)
+
+    if previous_action is not None:
+        chunk_with_bridge = np.vstack([previous_action, action_chunk])
+        resampled = resample_action_chunk(
+            chunk_with_bridge,
+            source_dt=source_dt,
+            target_dt=1.0 / control_frequency
+        )[1:]
+        source_array = chunk_with_bridge
+    else:
+        resampled = resample_action_chunk(
+            action_chunk,
+            source_dt=source_dt,
+            target_dt=1.0 / control_frequency
+        )
+        source_array = action_chunk
+
+    if source_array.shape[0] > 0 and resampled.shape[0] > 0:
+        total_duration = source_dt * max(source_array.shape[0] - 1, 1)
+        if total_duration <= 0:
+            hold_indices = np.zeros(resampled.shape[0], dtype=int)
+        else:
+            target_times = np.linspace(0.0, total_duration, num=resampled.shape[0], endpoint=True)
+            source_times = np.linspace(0.0, total_duration, num=source_array.shape[0], endpoint=True)
+            hold_indices = np.searchsorted(source_times, target_times, side="right") - 1
+            hold_indices = np.clip(hold_indices, 0, source_array.shape[0] - 1)
+        resampled[:, claw_dims] = source_array[hold_indices][:, claw_dims]
+
+    return resampled
+
 
 def eval_on_dataset(ckpt_path,
                     lerobot_dataset_path,
@@ -65,7 +212,8 @@ def eval_on_dataset(ckpt_path,
                     show_progress=True,
                     image_zero=False,
                     state_zero=False,
-                    infer_per_frame: int = 1):
+                    infer_per_frame: int = 1,
+                    task_description: str | None = None):
     """
     在数据集上评估模型
     
@@ -78,6 +226,8 @@ def eval_on_dataset(ckpt_path,
         show_progress: 是否显示进度条
         image_zero: 是否将图像输入置零（用于验证模型对图像的依赖性）
         state_zero: 是否将状态输入置零（用于验证模型对状态的依赖性）
+        infer_per_frame: 每隔多少个frame重新推理一次（>=1）。
+        task_description: 任务描述字符串（language instruction），如果提供则覆盖数据集中的task，否则使用数据集原本的task。
     """
     # ----------- 一些参数 ----------------
     mse_per_action_dim = OrderedDict() # 记录每个动作维度的MSE
@@ -121,7 +271,7 @@ def eval_on_dataset(ckpt_path,
             pred_action_single = pred_actions[0, -1, :].cpu().numpy()
             pred_chunk = pred_actions[0].cpu().numpy()
             return pred_action_single, pred_chunk
-    
+
     # ------------- 初始化visualizer (可选) -------------
     if RERUN_AVAILABLE:
         vizer = RerunVisualizer()
@@ -145,6 +295,10 @@ def eval_on_dataset(ckpt_path,
     
     print(f"📊 Action chunk size: {n_actions}")
     print(f"🔄 Inference frequency: Every {infer_per_frame} frame(s) (infer_per_frame={infer_per_frame})")
+    if task_description is not None:
+        print(f"📝 Task description (overridden): '{task_description}'")
+    else:
+        print(f"📝 Task description: Will use task from dataset")
     if image_zero:
         print(f"⚠️  IMAGE ZERO MODE: All image inputs will be set to zero (for dependency testing)")
     if state_zero:
@@ -157,17 +311,6 @@ def eval_on_dataset(ckpt_path,
     dataset_for_stats = LeRobotDataset(repo_id=0, root=lerobot_dataset_path)
     dataset_stats = dataset_for_stats.meta.stats if hasattr(dataset_for_stats.meta, 'stats') else None
     print(f"✅ Dataset statistics loaded: {list(dataset_stats.keys()) if dataset_stats else 'None'}")
-    
-    # 检查action统计信息格式，用于手动反归一化
-    if dataset_stats and 'action' in dataset_stats:
-        action_stats = dataset_stats['action']
-        print(f"📊 Action stats keys: {list(action_stats.keys())}")
-        if 'min' in action_stats and 'max' in action_stats:
-            action_min = torch.as_tensor(action_stats['min'], dtype=torch.float32)
-            action_max = torch.as_tensor(action_stats['max'], dtype=torch.float32)
-            print(f"📊 Action normalization range: min={action_min[:5].tolist()}... (shape: {action_min.shape}), max={action_max[:5].tolist()}... (shape: {action_max.shape})")
-        else:
-            print("⚠️  Warning: Action stats missing 'min' or 'max'. Manual denormalization may not work correctly.")
     
     # Create preprocessor and postprocessor
     print(f"\n🔧 Creating preprocessor and postprocessor...")
@@ -183,6 +326,15 @@ def eval_on_dataset(ckpt_path,
     
     policy.reset()
     print("✅ Model loaded and ready")
+    
+    previous_resampled_action = None
+    last_inferred_chunk: np.ndarray | None = None
+    last_resampled_chunk: np.ndarray | None = None
+    last_lowpass_chunk: np.ndarray | None = None
+    last_inference_step = -1
+    infer_per_frame = max(1, infer_per_frame)
+
+    control_step_cursor = 0
     
     # ✅ 使用标准的LeRobotDataset加载数据
     print(f"\n📂 Loading dataset from {lerobot_dataset_path}")
@@ -253,20 +405,44 @@ def eval_on_dataset(ckpt_path,
     
     # 初始化环境（如果需要在mujoco中可视化）
     if visualize_in_mujoco:
+        # 首先初始化机器人控制（参考 eval_depalletize_camera.py）
+        if ROS_AVAILABLE:
+            print(f"\n🤖 Initializing robot control...")
+            try:
+                # 初始化 ROS 节点（如果尚未初始化）
+                try:
+                    rospy.init_node('eval_on_dataset_robot_control', anonymous=True)
+                except rospy.exceptions.ROSException:
+                    # ROS 节点已经初始化，继续执行
+                    pass
+                
+                # 初始化机器人 SDK 并设置头部和控制模式
+                robot_sdk = RobotSDK()
+                robot_sdk.control.control_head(0, np.deg2rad(10))
+                robot_sdk.control.set_external_control_arm_mode()  # 切换手臂到外部控制模式
+                print(f"✅ Robot SDK initialized")
+                print(f"   - 机器人头部俯仰调节角度: 10 成功")
+                print(f"   - 切换手臂到外部控制模式成功")
+                
+                # 切换到 WBC 轨迹控制模式
+                direct_to_wbc(1)
+                input(f"direct_to_wbc 结束, 按回车继续 ==== 切换手臂到wbc轨迹控制模式成功 ==== \n")
+                time.sleep(1.0)
+            except Exception as e:
+                print(f"⚠️  Warning: Failed to initialize robot control: {e}")
+                print(f"   Continuing with MuJoCo environment initialization...")
+        else:
+            print(f"⚠️  Warning: ROS not available, skipping robot control initialization")
+        
         print(f"\n🤖 Initializing MuJoCo environment...")
         # 根据action维度判断使用哪个环境
         # 16维动作 = depalletize任务，使用kuavo_depalletize_env
         # 其他维度 = com控制任务，使用kuavo_com_env
         if action_dim == 16:
-            try:
-                from robot_envs.kuavo_depalletize_env import GrabBoxMpcEnv
-                mujoco_env = GrabBoxMpcEnv()
-                print(f"✅ MuJoCo environment initialized (depalletize task)")
-                print(f"   - Action dimension: 16 (14 arm joints + 2 claw positions)")
-            except ImportError:
-                print("⚠️  Warning: robot_envs.kuavo_depalletize_env not available. MuJoCo visualization disabled.")
-                visualize_in_mujoco = False
-                mujoco_env = None
+            from robot_envs.kuavo_depalletize_env import GrabBoxMpcEnv
+            mujoco_env = GrabBoxMpcEnv()
+            print(f"✅ MuJoCo environment initialized (depalletize task)")
+            print(f"   - Action dimension: 16 (14 arm joints + 2 claw positions)")
         else:
             try:
                 from robot_envs.kuavo_com_env import GrabBoxMpcEnv
@@ -326,15 +502,6 @@ def eval_on_dataset(ckpt_path,
     predictions = []
     ground_truths = []
     
-    # 性能统计
-    inference_times = []  # 记录每个frame的推理时间（秒）
-    total_preprocessing_time = 0.0  # 预处理总时间
-    total_postprocessing_time = 0.0  # 后处理总时间
-    
-    # 用于存储上一次的预测结果（用于infer_per_frame > 1的情况）
-    last_pred_action_single = None
-    last_pred_chunk = None
-    
     # 使用tqdm显示进度（如果启用）
     iterator = tqdm(enumerate(dataloader), total=dataset.num_frames, desc="Processing") if show_progress else enumerate(dataloader)
     
@@ -382,10 +549,33 @@ def eval_on_dataset(ckpt_path,
         
         # 如果启用image_zero模式，将所有图像输入置零（用于验证模型对图像的依赖性）
         if image_zero:
-            for key in list(observation.keys()):
-                if 'image' in key.lower():
+            for key in observation.keys():
+                if 'image' in key:
                     # 保持相同的形状和设备，但将所有像素值设为0
                     observation[key] = torch.zeros_like(observation[key])
+        
+        # 添加 task 字段（language instruction）
+        # 如果提供了 task_description，则使用它覆盖数据集中的 task；否则使用数据集原本的 task
+        if task_description is not None:
+            observation['task'] = task_description
+        elif 'task' in batch:
+            # 从 batch 中获取 task（LeRobotDataset 会在 __getitem__ 中添加 task 字段）
+            batch_task = batch['task']
+            # 处理 batch_task 可能是列表或字符串的情况
+            if isinstance(batch_task, (list, tuple)) and len(batch_task) > 0:
+                observation['task'] = batch_task[0]
+            elif isinstance(batch_task, str):
+                observation['task'] = batch_task
+            else:
+                # 如果类型不匹配，尝试转换为字符串
+                observation['task'] = str(batch_task) if batch_task is not None else ""
+        else:
+            # 如果 batch 中没有 task，尝试从数据集元数据中获取（使用第一个任务作为默认值）
+            if hasattr(dataset, 'meta') and hasattr(dataset.meta, 'tasks') and len(dataset.meta.tasks) > 0:
+                observation['task'] = dataset.meta.tasks.index[0]
+            else:
+                # 如果都没有，使用空字符串
+                observation['task'] = ""
         
         # 获取ground truth action
         gt_action = batch['action'][0].cpu().numpy()  # (action_dim,)
@@ -393,69 +583,76 @@ def eval_on_dataset(ckpt_path,
         # 判断是否需要执行推理（根据infer_per_frame参数）
         should_infer = (data_step % infer_per_frame == 0)
         
+        # 模型推理
+        tic = time.time()
         if should_infer:
             # 需要推理：执行完整的推理流程
             # 使用预处理器处理输入
-            preprocess_tic = time.time()
             processed_observation = preprocessor(observation)
-            preprocessing_time = time.time() - preprocess_tic
-            total_preprocessing_time += preprocessing_time
             
             # 模型推理
-            inference_tic = time.time()
             with torch.inference_mode():
                 pred_actions = policy.predict_action_chunk(processed_observation)
-            inference_time = time.time() - inference_tic
-            inference_times.append(inference_time)
             
             # pred_actions shape: (batch_size, chunk_size, action_dim)
             # 注意：pred_actions是归一化后的值，范围在[-1, 1]
-            # 需要手动反归一化到真实单位，以便与ground truth进行比较
+            # 需要手动反归一化到真实单位
             
             # 反归一化预测动作
-            postprocess_tic = time.time()
             pred_action_single, pred_chunk = denormalize_actions(pred_actions, action_dim, dataset_stats)
-            postprocessing_time = time.time() - postprocess_tic
-            total_postprocessing_time += postprocessing_time
             
             # 保存预测结果供后续帧使用
-            last_pred_action_single = pred_action_single.copy()
-            last_pred_chunk = pred_chunk.copy()
+            last_inferred_chunk = pred_chunk.copy()
+            last_inference_step = data_step
         else:
             # 不需要推理：复用上一次的预测结果
-            if last_pred_action_single is not None and last_pred_chunk is not None:
-                pred_action_single = last_pred_action_single.copy()
-                pred_chunk = last_pred_chunk.copy()
+            if last_inferred_chunk is not None:
+                pred_chunk = last_inferred_chunk.copy()
+                pred_action_single = pred_chunk[0]  # 取第一个action
             else:
                 # 如果这是第一帧且infer_per_frame > 1，需要先推理一次
-                # 注意：实际上第一帧（data_step=0）应该满足 0 % infer_per_frame == 0，所以会执行推理
-                # 但为了安全起见，保留这个检查
                 if data_step == 0:
                     print(f"⚠️  Warning: First frame but no previous prediction. Performing inference anyway.")
                     # 执行推理
-                    preprocess_tic = time.time()
                     processed_observation = preprocessor(observation)
-                    preprocessing_time = time.time() - preprocess_tic
-                    total_preprocessing_time += preprocessing_time
-                    
-                    inference_tic = time.time()
                     with torch.inference_mode():
                         pred_actions = policy.predict_action_chunk(processed_observation)
-                    inference_time = time.time() - inference_tic
-                    inference_times.append(inference_time)
-                    
-                    postprocess_tic = time.time()
                     pred_action_single, pred_chunk = denormalize_actions(pred_actions, action_dim, dataset_stats)
-                    postprocessing_time = time.time() - postprocess_tic
-                    total_postprocessing_time += postprocessing_time
-                    
-                    last_pred_action_single = pred_action_single.copy()
-                    last_pred_chunk = pred_chunk.copy()
+                    last_inferred_chunk = pred_chunk.copy()
+                    last_inference_step = data_step
                 else:
                     # 如果还没有预测结果，使用零向量（不应该发生）
                     print(f"⚠️  Warning: No previous prediction available at frame {data_step}. Using zeros.")
                     pred_action_single = np.zeros(action_dim)
                     pred_chunk = np.zeros((n_actions, action_dim))
+    
+        transition_steps = None
+        if previous_resampled_action is not None:
+            transition_steps = max(1, int(round(TARGET_CONTROL_FREQUENCY * CHUNK_TRANSITION_DURATION_S)))
+        if should_infer or last_resampled_chunk is None:
+            resampled_chunk = resample_chunk_with_claw_hold(
+                pred_chunk,
+                previous_action=previous_resampled_action,
+                control_frequency=TARGET_CONTROL_FREQUENCY,
+                source_dt=MODEL_ACTION_DT
+            )
+            lowpass_chunk = apply_lowpass_transition(
+                resampled_chunk,
+                previous_action=previous_resampled_action,
+                alpha=LOWPASS_ALPHA,
+                transition_steps=transition_steps,
+                smooth_slice=slice(0, 14)
+            )
+            last_resampled_chunk = resampled_chunk
+            last_lowpass_chunk = lowpass_chunk
+        else:
+            resampled_chunk = last_resampled_chunk
+            lowpass_chunk = last_lowpass_chunk
+
+        if lowpass_chunk is not None and lowpass_chunk.size > 0:
+            previous_resampled_action = lowpass_chunk[-1].copy()
+    
+        inference_time = time.time() - tic
         
         # 保存预测和真实值
         predictions.append(pred_action_single)
@@ -476,39 +673,60 @@ def eval_on_dataset(ckpt_path,
         
         # 可视化（如果启用）
         if vizer is not None:
-            # 显示图像 - 动态查找第一个可用的相机图像
-            for key in batch.keys():
-                if 'image' in key.lower() and key.startswith('observation'):
-                    img = batch[key][0]  # (C, H, W)
-                    camera_name = key.replace('observation.', '').replace('observation.images.', '')
-                    vizer.show_img(
-                        name=camera_name,
-                        image_data=img.to("cpu"),
-                        step_id=data_step
-                    )
-                    # break  # 只显示第一个找到的相机图像
+            # 显示图像 - 动态查找可用的相机图像
+            if CONFIG_AVAILABLE:
+                camera_names = get_camera_names(CAMERA_COMPONENTS)
+                for camera_name in camera_names:
+                    obs_key = get_camera_observation_key(camera_name, use_image_features=False)
+                    fallback_key = f"observation.images.{camera_name}"
+                    
+                    # 优先使用新格式，如果不存在则使用旧格式
+                    key_to_use = obs_key if obs_key in batch else fallback_key
+                    if key_to_use in batch:
+                        img = batch[key_to_use][0]  # (C, H, W)
+                        # 从obs_key中提取组件名（如 observation.images.cam_head -> cam_head）
+                        # 或者从camera_name映射到组件名
+                        if obs_key in batch:
+                            # 使用新格式：从 observation.images.cam_head 提取 cam_head
+                            display_name = obs_key.replace('observation.images.', '')
+                        else:
+                            # 使用旧格式：从 camera_name 映射到组件名
+                            display_name = CAMERA_KEY_MAPPING.get(camera_name, camera_name)
+                        vizer.show_img(
+                            name=f"images.{display_name}",
+                            image_data=img.to("cpu"),
+                            step_id=data_step
+                        )
+            else:
+                # 如果没有config，回退到原来的方法
+                for key in batch.keys():
+                    if 'image' in key.lower() and key.startswith('observation'):
+                        img = batch[key][0]  # (C, H, W)
+                        camera_name = key.replace('observation.', '').replace('observation.images.', '')
+                        vizer.show_img(
+                            name=camera_name,
+                            image_data=img.to("cpu"),
+                            step_id=data_step
+                        )
             
-            # 可视化MSE（每帧都显示）
+            # 可视化预测的chunk
             for dim in range(action_dim):
+                # 可视化MSE
                 vizer.visualize_chunk(
                     name=f"mse/action_dim_{dim}",
                     chunk_data=mse_per_action_dim[dim][-1],
                     step_id=data_step,
                     width=3.0,
                 )
-            
-            # 只在推理新chunk时可视化预测的chunk（避免重复显示）
-            if should_infer:
-                for dim in range(action_dim):
-                    # 可视化预测chunk
+                
+                if should_infer:
                     vizer.visualize_chunk(
                         name=f"chunk/action_dim_{dim}/pred_seg_{data_step}",
                         chunk_data=pred_chunk[:, dim],
                         step_id=data_step,
                         width=2
                     )
-                    
-                    # 删除上一个chunk的可视化
+
                     if last_data_step != data_step and last_data_step > 0:
                         vizer.del_chunk(
                             name=f"chunk/action_dim_{dim}/pred_seg_{last_data_step}",
@@ -516,11 +734,80 @@ def eval_on_dataset(ckpt_path,
                             step_id=last_data_step,
                             width=0.5
                         )
+            
+            if should_infer and resampled_chunk is not None and resampled_chunk.size > 0:
+                resampled_steps_axis = np.arange(control_step_cursor, control_step_cursor + resampled_chunk.shape[0], dtype=int)
+                start_step = resampled_steps_axis[0]
+                end_step = resampled_steps_axis[-1]
+                start_point = resampled_chunk[0]
+                end_point = resampled_chunk[-1]
+                raw_start_point = pred_chunk[0]
+                for dim in range(action_dim):
+                    if hasattr(vizer, "clear_path"):
+                        vizer.clear_path(f"chunk_interp/action_dim_{dim}/start_point")
+                        vizer.clear_path(f"chunk_interp/action_dim_{dim}/start_point_raw")
+                        vizer.clear_path(f"chunk_interp/action_dim_{dim}/end_point")
+                        vizer.clear_path(f"chunk_lowpass/action_dim_{dim}/start_point")
+                        vizer.clear_path(f"chunk_lowpass/action_dim_{dim}/start_point_raw")
+                        vizer.clear_path(f"chunk_lowpass/action_dim_{dim}/end_point")
+                    vizer.visualize_chunk(
+                        name=f"chunk_interp/action_dim_{dim}/pred_seg_{data_step}",
+                        chunk_data=resampled_chunk[:, dim],
+                        step_id=0,
+                        x_axis=resampled_steps_axis,
+                        width=1.5,
+                        color=COLOR_INTERP
+                    )
+                    vizer.visualize_points(
+                        name=f"chunk_interp/action_dim_{dim}/start_point",
+                        xs=np.array([start_step]),
+                        ys=np.array([start_point[dim]]),
+                        colors=np.array([[0, 255, 0]])
+                    )
+                    vizer.visualize_points(
+                        name=f"chunk_interp/action_dim_{dim}/start_point_raw",
+                        xs=np.array([start_step]),
+                        ys=np.array([raw_start_point[dim]]),
+                        colors=np.array([[0, 128, 0]])
+                    )
+                    vizer.visualize_points(
+                        name=f"chunk_interp/action_dim_{dim}/end_point",
+                        xs=np.array([end_step]),
+                        ys=np.array([end_point[dim]]),
+                        colors=np.array([[255, 0, 0]])
+                    )
+                    vizer.visualize_chunk(
+                        name=f"chunk_lowpass/action_dim_{dim}/pred_seg_{data_step}",
+                        chunk_data=lowpass_chunk[:, dim],
+                        step_id=0,
+                        x_axis=resampled_steps_axis,
+                        width=1.5,
+                        color=COLOR_LOWPASS
+                    )
+                    vizer.visualize_points(
+                        name=f"chunk_lowpass/action_dim_{dim}/start_point",
+                        xs=np.array([start_step]),
+                        ys=np.array([lowpass_chunk[0, dim]]),
+                        colors=np.array([[0, 255, 0]])
+                    )
+                    vizer.visualize_points(
+                        name=f"chunk_lowpass/action_dim_{dim}/start_point_raw",
+                        xs=np.array([start_step]),
+                        ys=np.array([raw_start_point[dim]]),
+                        colors=np.array([[0, 128, 0]])
+                    )
+                    vizer.visualize_points(
+                        name=f"chunk_lowpass/action_dim_{dim}/end_point",
+                        xs=np.array([end_step]),
+                        ys=np.array([lowpass_chunk[-1, dim]]),
+                        colors=np.array([[255, 0, 0]])
+                    )
+                control_step_cursor += resampled_chunk.shape[0]
         
         last_data_step = data_step
         
         # ========== 在mujoco里执行动作 (如果启用) =========
-        if visualize_in_mujoco and mujoco_env is not None:
+        if visualize_in_mujoco:
             action_np = pred_action_single[np.newaxis, :]  # (1, action_dim)
             
             # 根据action维度选择执行方法
@@ -533,12 +820,13 @@ def eval_on_dataset(ckpt_path,
                 )
             else:
                 # com控制任务：使用绝对动作执行（GrootPolicy默认使用绝对动作）
-                mujoco_env.exec_absolute_actions(
-                    actions=action_np,
-                    control_arm=True,
-                    control_base=True,
-                    control_wrench=False
-                )
+                if mujoco_env is not None:
+                    mujoco_env.exec_absolute_actions(
+                        actions=action_np,
+                        control_arm=True,
+                        control_base=True,
+                        control_wrench=False
+                    )
 
     # ========= 打印最终统计结果 =========
     print("\n" + "="*80)
@@ -554,7 +842,6 @@ def eval_on_dataset(ckpt_path,
         eval_action_names = [f"Arm_joint_{i+1}" for i in range(14)] + ["Left_claw", "Right_claw"]
     elif action_dim == 18:
         # 18维动作：Left_arm(7) + Right_arm(7) + Left_claw(1) + Right_claw(1) + Cmd_pose_z(1) + Cmd_pose_pitch(1)
-        # 根据config.py的ACTION_COMPONENT_DEFINITIONS格式
         eval_action_names = (
             [f"arm_joint_{i+1}" for i in range(7)] +  # Left_arm: arm_joint_1-7
             [f"arm_joint_{i+8}" for i in range(7)] +  # Right_arm: arm_joint_8-14
@@ -599,29 +886,8 @@ def eval_on_dataset(ckpt_path,
         claw_mse = np.mean([np.mean(mse_per_action_dim[dim]) for dim in range(14, 16)])
         claw_mae = np.mean([np.mean(mae_per_action_dim[dim]) for dim in range(14, 16)])
         print(f'{"Claw (avg)":<20} {claw_mse:<15.8f} {claw_mae:<15.8f}')
-    elif action_dim == 18:
-        # 18维动作：Left_arm(7) + Right_arm(7) + Left_claw(1) + Right_claw(1) + Cmd_pose_z(1) + Cmd_pose_pitch(1)
-        left_arm_mse = np.mean([np.mean(mse_per_action_dim[dim]) for dim in range(7)])
-        left_arm_mae = np.mean([np.mean(mae_per_action_dim[dim]) for dim in range(7)])
-        print(f'{"Left_arm (avg)":<20} {left_arm_mse:<15.8f} {left_arm_mae:<15.8f}')
-        
-        right_arm_mse = np.mean([np.mean(mse_per_action_dim[dim]) for dim in range(7, 14)])
-        right_arm_mae = np.mean([np.mean(mae_per_action_dim[dim]) for dim in range(7, 14)])
-        print(f'{"Right_arm (avg)":<20} {right_arm_mse:<15.8f} {right_arm_mae:<15.8f}')
-        
-        arm_mse = np.mean([np.mean(mse_per_action_dim[dim]) for dim in range(14)])
-        arm_mae = np.mean([np.mean(mae_per_action_dim[dim]) for dim in range(14)])
-        print(f'{"Arm (avg)":<20} {arm_mse:<15.8f} {arm_mae:<15.8f}')
-        
-        claw_mse = np.mean([np.mean(mse_per_action_dim[dim]) for dim in range(14, 16)])
-        claw_mae = np.mean([np.mean(mae_per_action_dim[dim]) for dim in range(14, 16)])
-        print(f'{"Claw (avg)":<20} {claw_mse:<15.8f} {claw_mae:<15.8f}')
-        
-        cmd_pose_mse = np.mean([np.mean(mse_per_action_dim[dim]) for dim in range(16, 18)])
-        cmd_pose_mae = np.mean([np.mean(mae_per_action_dim[dim]) for dim in range(16, 18)])
-        print(f'{"Cmd_pose (avg)":<20} {cmd_pose_mse:<15.8f} {cmd_pose_mae:<15.8f}')
-    elif action_dim == 24:
-        # com控制任务：24维 = 9 COM + 14 Arm + 1 Gait
+    else:
+        # com控制任务：标准分组统计
         com_mse = np.mean([np.mean(mse_per_action_dim[dim]) for dim in range(9)])
         com_mae = np.mean([np.mean(mae_per_action_dim[dim]) for dim in range(9)])
         print(f'{"COM (avg)":<20} {com_mse:<15.8f} {com_mae:<15.8f}')
@@ -630,100 +896,10 @@ def eval_on_dataset(ckpt_path,
         arm_mae = np.mean([np.mean(mae_per_action_dim[dim]) for dim in range(9, 23)])
         print(f'{"Arm (avg)":<20} {arm_mse:<15.8f} {arm_mae:<15.8f}')
         
-        gait_mse = np.mean(mse_per_action_dim[23])
-        gait_mae = np.mean(mae_per_action_dim[23])
-        print(f'{"Gait":<20} {gait_mse:<15.8f} {gait_mae:<15.8f}')
-    else:
-        # 其他维度：尝试根据config推断，或使用通用分组
-        if CONFIG_AVAILABLE and action_names and len(action_names) == action_dim:
-            # 根据action_names推断分组
-            # 查找常见的分组模式
-            if any("arm" in name.lower() for name in action_names):
-                # 尝试找到arm相关的维度
-                arm_dims = [i for i, name in enumerate(action_names) if "arm" in name.lower()]
-                if arm_dims:
-                    arm_mse = np.mean([np.mean(mse_per_action_dim[dim]) for dim in arm_dims])
-                    arm_mae = np.mean([np.mean(mae_per_action_dim[dim]) for dim in arm_dims])
-                    print(f'{"Arm (avg)":<20} {arm_mse:<15.8f} {arm_mae:<15.8f}')
-            
-            if any("claw" in name.lower() for name in action_names):
-                claw_dims = [i for i, name in enumerate(action_names) if "claw" in name.lower()]
-                if claw_dims:
-                    claw_mse = np.mean([np.mean(mse_per_action_dim[dim]) for dim in claw_dims])
-                    claw_mae = np.mean([np.mean(mae_per_action_dim[dim]) for dim in claw_dims])
-                    print(f'{"Claw (avg)":<20} {claw_mse:<15.8f} {claw_mae:<15.8f}')
-            
-            if any("cmd_pose" in name.lower() or "com" in name.lower() for name in action_names):
-                cmd_dims = [i for i, name in enumerate(action_names) if "cmd_pose" in name.lower() or "com" in name.lower()]
-                if cmd_dims:
-                    cmd_mse = np.mean([np.mean(mse_per_action_dim[dim]) for dim in cmd_dims])
-                    cmd_mae = np.mean([np.mean(mae_per_action_dim[dim]) for dim in cmd_dims])
-                    print(f'{"Cmd/COM (avg)":<20} {cmd_mse:<15.8f} {cmd_mae:<15.8f}')
-        else:
-            # 无法推断，跳过分组统计
-            print("⚠️  Cannot infer action groups for this action dimension. Skipping grouped statistics.")
-    
-    print("="*80)
-    
-    # ========= 打印性能统计 =========
-    print("\n" + "="*80)
-    print("⚡ Performance Statistics")
-    print("="*80)
-    
-    if inference_times:
-        total_inference_time = sum(inference_times)
-        avg_inference_time = np.mean(inference_times)
-        min_inference_time = np.min(inference_times)
-        max_inference_time = np.max(inference_times)
-        std_inference_time = np.std(inference_times)
-        
-        # 计算推理频率（Hz）
-        avg_fps = 1.0 / avg_inference_time if avg_inference_time > 0 else 0
-        max_fps = 1.0 / min_inference_time if min_inference_time > 0 else 0
-        min_fps = 1.0 / max_inference_time if max_inference_time > 0 else 0
-        
-        print(f"\n📊 Inference Performance:")
-        print(f"   Total frames processed: {dataset.num_frames}")
-        print(f"   Total inference calls: {len(inference_times)} (infer_per_frame={infer_per_frame})")
-        print(f"   Inference ratio: {len(inference_times)/dataset.num_frames*100:.1f}% ({len(inference_times)}/{dataset.num_frames})")
-        print(f"   Total inference time: {total_inference_time:.4f} s")
-        print(f"   Average inference time: {avg_inference_time*1000:.2f} ms")
-        print(f"   Min inference time: {min_inference_time*1000:.2f} ms")
-        print(f"   Max inference time: {max_inference_time*1000:.2f} ms")
-        print(f"   Std inference time: {std_inference_time*1000:.2f} ms")
-        print(f"\n🚀 Inference Frequency (Hz):")
-        print(f"   Average FPS: {avg_fps:.2f} Hz")
-        print(f"   Max FPS: {max_fps:.2f} Hz")
-        print(f"   Min FPS: {min_fps:.2f} Hz")
-        if infer_per_frame > 1:
-            print(f"   Effective FPS (with infer_per_frame={infer_per_frame}): {avg_fps/infer_per_frame:.2f} Hz")
-        
-        # 预处理和后处理性能
-        avg_preprocessing_time = total_preprocessing_time / len(inference_times) if inference_times else 0
-        avg_postprocessing_time = total_postprocessing_time / len(inference_times) if inference_times else 0
-        
-        print(f"\n📊 Processing Pipeline Performance:")
-        print(f"   Average preprocessing time: {avg_preprocessing_time*1000:.2f} ms")
-        print(f"   Average postprocessing time: {avg_postprocessing_time*1000:.2f} ms")
-        print(f"   Average total pipeline time: {(avg_inference_time + avg_preprocessing_time + avg_postprocessing_time)*1000:.2f} ms")
-        
-        # 计算总吞吐量
-        total_pipeline_time = total_inference_time + total_preprocessing_time + total_postprocessing_time
-        overall_fps = len(inference_times) / total_pipeline_time if total_pipeline_time > 0 else 0
-        print(f"\n🎯 Overall Performance:")
-        print(f"   Total pipeline time: {total_pipeline_time:.4f} s")
-        print(f"   Overall throughput: {overall_fps:.2f} Hz (including preprocessing/postprocessing)")
-        
-        # 性能瓶颈分析
-        print(f"\n🔍 Performance Bottleneck Analysis:")
-        if avg_inference_time > avg_preprocessing_time and avg_inference_time > avg_postprocessing_time:
-            print(f"   ⚠️  Inference is the bottleneck ({avg_inference_time*1000:.2f} ms)")
-        elif avg_preprocessing_time > avg_inference_time and avg_preprocessing_time > avg_postprocessing_time:
-            print(f"   ⚠️  Preprocessing is the bottleneck ({avg_preprocessing_time*1000:.2f} ms)")
-        elif avg_postprocessing_time > avg_inference_time and avg_postprocessing_time > avg_preprocessing_time:
-            print(f"   ⚠️  Postprocessing is the bottleneck ({avg_postprocessing_time*1000:.2f} ms)")
-        else:
-            print(f"   ✅ Processing times are balanced")
+        if action_dim > 23:
+            gait_mse = np.mean(mse_per_action_dim[23])
+            gait_mae = np.mean(mae_per_action_dim[23])
+            print(f'{"Gait":<20} {gait_mse:<15.8f} {gait_mae:<15.8f}')
     
     print("="*80)
 
@@ -740,8 +916,8 @@ def eval_on_dataset(ckpt_path,
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description='Evaluate GrootPolicy Model on Dataset',
-        epilog='Evaluates a trained GrootPolicy model on a LeRobot dataset.'
+        description='Evaluate GrootPolicy Model on Dataset with Lowpass Visualization',
+        epilog='Evaluates a trained GrootPolicy model on a LeRobot dataset with chunk interpolation and lowpass filtering visualization.'
     )
     parser.add_argument('--ckpt-path', type=str, required=True,
                        help='Path to the model checkpoint directory')
@@ -762,11 +938,13 @@ if __name__ == "__main__":
                        help='Set all state inputs to zero (for testing model dependency on state)')
     parser.add_argument('--infer-per-frame', type=int, default=1,
                        help='Run policy inference every N frames (default: 1 = every frame)')
-    
+    parser.add_argument('--task-description', type=str, default=None,
+                       help='Task description (language instruction) to override the task from dataset. If not provided, will use the task from dataset.')
+
     args = parser.parse_args()
     
     print("\n" + "="*80)
-    print("🎯 GrootPolicy Dataset Evaluation")
+    print("🎯 GrootPolicy Dataset Evaluation with Lowpass Visualization")
     print("="*80)
     print(f"Checkpoint: {args.ckpt_path}")
     print(f"Dataset: {args.dataset_root}")
@@ -776,6 +954,10 @@ if __name__ == "__main__":
     print(f"Image Zero Mode: {args.image_zero}")
     print(f"State Zero Mode: {args.state_zero}")
     print(f"Infer Every N Frames: {args.infer_per_frame}")
+    if args.task_description:
+        print(f"Task Description (overridden): '{args.task_description}'")
+    else:
+        print(f"Task Description: Will use task from dataset")
     print("="*80)
     
     eval_on_dataset(
@@ -787,5 +969,6 @@ if __name__ == "__main__":
         show_progress=not args.no_progress,
         image_zero=args.image_zero,
         state_zero=args.state_zero,
-        infer_per_frame=args.infer_per_frame
+        infer_per_frame=args.infer_per_frame,
+        task_description=args.task_description
     )
