@@ -163,7 +163,7 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
     claw_loss_weight: float = field(default=1.0, metadata={"help": "Claw position loss weight"})
     
     # Learnable uncertainty weights (参考 https://arxiv.org/pdf/1705.07115)
-    use_learnable_loss_weights: bool = field(default=False, metadata={"help": "Enable learnable loss weights based on uncertainty"})
+    use_learnable_loss_weights: bool = field(default=True, metadata={"help": "Enable learnable loss weights based on uncertainty"})
     
     # Pretrained action dimension (for compatibility with pretrained models)
     pretrained_action_dim: int = field(default=None, metadata={"help": "Action dimension of pretrained model (for compatibility)"})
