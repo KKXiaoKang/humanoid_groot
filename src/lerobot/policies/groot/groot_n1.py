@@ -459,4 +459,21 @@ class GR00TN15(PreTrainedModel):
         pretrained_model.action_head.set_trainable_parameters(
             tune_projector=tune_projector, tune_diffusion_model=tune_diffusion_model
         )
+        
+        # Verify that LLM parameters are actually trainable if tune_llm=True
+        if tune_llm:
+            llm_params = list(pretrained_model.backbone.eagle_model.language_model.parameters())
+            trainable_llm_params = [p for p in llm_params if p.requires_grad]
+            if trainable_llm_params:
+                print(f"✅ Verified: {len(trainable_llm_params)}/{len(llm_params)} LLM parameters are trainable")
+            else:
+                print(f"⚠️  Warning: No LLM parameters are trainable despite tune_llm=True!")
+        else:
+            llm_params = list(pretrained_model.backbone.eagle_model.language_model.parameters())
+            frozen_llm_params = [p for p in llm_params if not p.requires_grad]
+            if len(frozen_llm_params) == len(llm_params):
+                print(f"✅ Verified: All {len(llm_params)} LLM parameters are frozen (tune_llm=False)")
+            else:
+                print(f"⚠️  Warning: Some LLM parameters are still trainable despite tune_llm=False!")
+        
         return pretrained_model
