@@ -116,7 +116,24 @@ class GrootPolicy(PreTrainedPolicy):
         # Isaac-GR00T returns a BatchFeature; loss key is typically 'loss'
         loss = outputs.get("loss")
 
-        loss_dict = {"loss": loss.item()}
+        # Extract all metrics from outputs for logging (e.g., arm_loss, claw_loss, sigma_arm, etc.)
+        loss_dict = {}
+        if isinstance(outputs, dict) or hasattr(outputs, "data"):
+            output_data = outputs.data if hasattr(outputs, "data") else outputs
+            for key, value in output_data.items():
+                if isinstance(value, torch.Tensor):
+                    if value.numel() == 1:  # Scalar tensor
+                        loss_dict[key] = value.item()
+                    else:
+                        # Skip non-scalar tensors
+                        continue
+                elif isinstance(value, (int, float)):
+                    loss_dict[key] = value
+                # Skip other types (e.g., None, complex types)
+        
+        # Ensure loss is always in loss_dict
+        if "loss" not in loss_dict:
+            loss_dict["loss"] = loss.item() if isinstance(loss, torch.Tensor) else loss
 
         return loss, loss_dict
 
