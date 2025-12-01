@@ -232,7 +232,28 @@ class GR00TN15(PreTrainedModel):
         self.local_model_path = local_model_path
 
         self.backbone = EagleBackbone(**config.backbone_cfg)
-        action_head_cfg = FlowmatchingActionHeadConfig(**config.action_head_cfg)
+        
+        # If using multi-action heads, override action_dim to match arm_dim + claw_dim
+        action_head_cfg_dict = config.action_head_cfg.copy()
+        # Use FlowmatchingActionHeadConfig default (True) if not specified in config
+        use_multi_action_heads = action_head_cfg_dict.get("use_multi_action_heads", True)
+        
+        # Save pretrained action_dim for compatibility (pretrained model uses 32D)
+        pretrained_action_dim = action_head_cfg_dict.get("action_dim", 32)
+        
+        if use_multi_action_heads:
+            action_arm_dim = action_head_cfg_dict.get("action_arm_dim", 14)
+            action_claw_dim = action_head_cfg_dict.get("action_claw_dim", 2)
+            actual_action_dim = action_arm_dim + action_claw_dim
+            action_head_cfg_dict["action_dim"] = actual_action_dim
+            # Set pretrained_action_dim for compatibility with pretrained encoder
+            action_head_cfg_dict["pretrained_action_dim"] = pretrained_action_dim
+            # Ensure use_multi_action_heads is set in the dict
+            action_head_cfg_dict["use_multi_action_heads"] = True
+            if pretrained_action_dim != actual_action_dim:
+                print(f"🔧 Using pretrained action encoder ({pretrained_action_dim}D) with multi-head output ({actual_action_dim}D)")
+        
+        action_head_cfg = FlowmatchingActionHeadConfig(**action_head_cfg_dict)
         self.action_head = FlowmatchingActionHead(action_head_cfg)
 
         self.action_horizon = config.action_horizon

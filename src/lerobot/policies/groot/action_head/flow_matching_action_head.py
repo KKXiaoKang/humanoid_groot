@@ -164,6 +164,9 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
     
     # Learnable uncertainty weights (参考 https://arxiv.org/pdf/1705.07115)
     use_learnable_loss_weights: bool = field(default=False, metadata={"help": "Enable learnable loss weights based on uncertainty"})
+    
+    # Pretrained action dimension (for compatibility with pretrained models)
+    pretrained_action_dim: int = field(default=None, metadata={"help": "Action dimension of pretrained model (for compatibility)"})
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -174,10 +177,16 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
         if self.use_multi_action_heads:
             expected_action_dim = self.action_arm_dim + self.action_claw_dim
             if self.action_dim is not None and self.action_dim != expected_action_dim:
-                raise ValueError(
-                    f"When using multi-action heads, action_dim ({self.action_dim}) must equal "
-                    f"action_arm_dim ({self.action_arm_dim}) + action_claw_dim ({self.action_claw_dim}) = {expected_action_dim}"
-                )
+                # If pretrained_action_dim is set, allow mismatch (we'll pad/truncate)
+                if self.pretrained_action_dim is None:
+                    raise ValueError(
+                        f"When using multi-action heads, action_dim ({self.action_dim}) must equal "
+                        f"action_arm_dim ({self.action_arm_dim}) + action_claw_dim ({self.action_claw_dim}) = {expected_action_dim}"
+                    )
+                # If pretrained_action_dim is set, use it for action_encoder
+                if self.pretrained_action_dim != expected_action_dim:
+                    print(f"⚠️  Pretrained model uses {self.pretrained_action_dim}D, but data uses {expected_action_dim}D. "
+                          f"Will pad/truncate actions for compatibility.")
 
 
 class FlowmatchingActionHead(nn.Module):
@@ -196,6 +205,12 @@ class FlowmatchingActionHead(nn.Module):
         self.action_dim = config.action_dim
         self.action_horizon = config.action_horizon
         self.num_inference_timesteps = config.num_inference_timesteps
+        
+        # Use pretrained_action_dim for action_encoder if specified (for compatibility with pretrained models)
+        # Otherwise use action_dim
+        encoder_action_dim = config.pretrained_action_dim if config.pretrained_action_dim is not None else config.action_dim
+        self.encoder_action_dim = encoder_action_dim
+        self.actual_action_dim = config.action_dim  # Actual action dimension from data
 
         self.state_encoder = CategorySpecificMLP(
             num_categories=config.max_num_embodiments,
@@ -204,7 +219,7 @@ class FlowmatchingActionHead(nn.Module):
             output_dim=self.input_embedding_dim,
         )
         self.action_encoder = MultiEmbodimentActionEncoder(
-            action_dim=config.action_dim,
+            action_dim=encoder_action_dim,  # Use pretrained dimension for encoder
             hidden_size=self.input_embedding_dim,
             num_embodiments=config.max_num_embodiments,
         )
@@ -359,13 +374,35 @@ class FlowmatchingActionHead(nn.Module):
         state_features = self.state_encoder(action_input.state, embodiment_id)
 
         # Embed noised action trajectory.
-        actions = action_input.action
+        # NOTE: Processor (GrootPackInputsStep) already pads action to max_action_dim (32)
+        # So action_input.action is already (B, T, encoder_action_dim=32)
+        actions = action_input.action  # (B, T, encoder_action_dim)
+        action_mask = action_input.action_mask  # (B, T, encoder_action_dim) - marks valid dimensions
+        
+        # Ensure actions match encoder_action_dim (should already be padded by processor)
+        if actions.shape[-1] != self.encoder_action_dim:
+            if actions.shape[-1] < self.encoder_action_dim:
+                # Pad if needed (shouldn't happen if processor works correctly)
+                pad_size = self.encoder_action_dim - actions.shape[-1]
+                padding = torch.zeros(
+                    (actions.shape[0], actions.shape[1], pad_size),
+                    device=actions.device,
+                    dtype=actions.dtype
+                )
+                actions = torch.cat([actions, padding], dim=-1)
+            else:
+                # Truncate if larger (shouldn't happen)
+                actions = actions[:, :, :self.encoder_action_dim]
+        
         noise = torch.randn(actions.shape, device=actions.device, dtype=actions.dtype)
         t = self.sample_time(actions.shape[0], device=actions.device, dtype=actions.dtype)
         t = t[:, None, None]  # shape (B,1,1) for broadcast
 
         noisy_trajectory = (1 - t) * noise + t * actions
-        velocity = actions - noise
+        
+        # For velocity, extract only the actual action dimensions (first actual_action_dim)
+        # This matches the original data dimension before padding
+        velocity = actions[:, :, :self.actual_action_dim] - noise[:, :, :self.actual_action_dim]
 
         # Convert (continuous) t -> discrete if needed
         t_discretized = (t[:, 0, 0] * self.num_timestep_buckets).long()
@@ -405,16 +442,22 @@ class FlowmatchingActionHead(nn.Module):
             velocity_claw = velocity[:, :, self.config.action_arm_dim:]  # (B, T, action_claw_dim)
             
             # Compute loss for each head
-            action_mask = action_input.action_mask
-            loss_arm = F.mse_loss(pred_arm, velocity_arm, reduction="none") * action_mask.unsqueeze(-1)
-            loss_claw = F.mse_loss(pred_claw, velocity_claw, reduction="none") * action_mask.unsqueeze(-1)
+            # action_mask is (B, T, encoder_action_dim), but we only need the first actual_action_dim
+            # Since velocity is already extracted from first actual_action_dim, we use the corresponding mask
+            action_mask = action_input.action_mask[:, :, :self.actual_action_dim]  # (B, T, actual_action_dim)
+            # Split mask for arm and claw
+            action_mask_arm = action_mask[:, :, :self.config.action_arm_dim]  # (B, T, action_arm_dim)
+            action_mask_claw = action_mask[:, :, self.config.action_arm_dim:]  # (B, T, action_claw_dim)
+            
+            loss_arm = F.mse_loss(pred_arm, velocity_arm, reduction="none") * action_mask_arm
+            loss_claw = F.mse_loss(pred_claw, velocity_claw, reduction="none") * action_mask_claw
             
             # Use learnable weights or fixed weights
             if self.config.use_learnable_loss_weights and self.task_log_sigma is not None:
                 # Loss = Σ [1/(2σ²) * L_i + log(σ)]
                 # 这里使用 log(σ) 作为可学习参数，避免 σ 为负
-                loss_arm_mean = loss_arm.sum() / action_mask.sum()
-                loss_claw_mean = loss_claw.sum() / action_mask.sum()
+                loss_arm_mean = loss_arm.sum() / action_mask_arm.sum()
+                loss_claw_mean = loss_claw.sum() / action_mask_claw.sum()
                 
                 s_arm = self.task_log_sigma["arm"]
                 s_claw = self.task_log_sigma["claw"]
@@ -434,8 +477,8 @@ class FlowmatchingActionHead(nn.Module):
                 }
             else:
                 # Use fixed weights
-                loss_arm_mean = loss_arm.sum() / action_mask.sum()
-                loss_claw_mean = loss_claw.sum() / action_mask.sum()
+                loss_arm_mean = loss_arm.sum() / action_mask_arm.sum()
+                loss_claw_mean = loss_claw.sum() / action_mask_claw.sum()
                 loss = self.config.arm_loss_weight * loss_arm_mean + self.config.claw_loss_weight * loss_claw_mean
                 
                 output_dict = {
@@ -470,10 +513,11 @@ class FlowmatchingActionHead(nn.Module):
         state_features = self.state_encoder(action_input.state, embodiment_id)
 
         # Set initial actions as the sampled noise.
+        # Use encoder_action_dim for internal processing (compatible with pretrained model)
         batch_size = vl_embs.shape[0]
         device = vl_embs.device
         actions = torch.randn(
-            size=(batch_size, self.config.action_horizon, self.config.action_dim),
+            size=(batch_size, self.config.action_horizon, self.encoder_action_dim),
             dtype=vl_embs.dtype,
             device=device,
         )
@@ -519,8 +563,26 @@ class FlowmatchingActionHead(nn.Module):
                 pred_velocity = pred
 
             # Update actions using euler integration.
-            actions = actions + dt * pred_velocity
-        return BatchFeature(data={"action_pred": actions})
+            # If using multi-head, pred_velocity is actual_action_dim, but actions is encoder_action_dim
+            if self.encoder_action_dim != self.actual_action_dim:
+                # Pad pred_velocity to match encoder_action_dim
+                if self.encoder_action_dim > self.actual_action_dim:
+                    pad_size = self.encoder_action_dim - self.actual_action_dim
+                    padding = torch.zeros(
+                        (pred_velocity.shape[0], pred_velocity.shape[1], pad_size),
+                        device=pred_velocity.device,
+                        dtype=pred_velocity.dtype
+                    )
+                    pred_velocity_padded = torch.cat([pred_velocity, padding], dim=-1)
+                else:
+                    pred_velocity_padded = pred_velocity[:, :, :self.encoder_action_dim]
+                actions = actions + dt * pred_velocity_padded
+            else:
+                actions = actions + dt * pred_velocity
+        
+        # Return only the actual action dimensions
+        actions_output = actions[:, :, :self.actual_action_dim]
+        return BatchFeature(data={"action_pred": actions_output})
 
     @property
     def device(self):
