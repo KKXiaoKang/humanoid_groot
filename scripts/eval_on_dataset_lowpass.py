@@ -594,6 +594,9 @@ def eval_on_dataset(ckpt_path,
             with torch.inference_mode():
                 pred_actions = policy.predict_action_chunk(processed_observation)
             
+            # 打印action维度
+            print(f"pred_actions shape: {pred_actions.shape}")
+            
             # pred_actions shape: (batch_size, chunk_size, action_dim)
             # 注意：pred_actions是归一化后的值，范围在[-1, 1]
             # 需要手动反归一化到真实单位
