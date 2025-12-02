@@ -5,6 +5,7 @@ import cv2
 import numpy as np
 import rosbag
 from sensor_msgs.msg import JointState
+import json
 
 # Initialize GUI windows if requested
 def init_gui_windows(enable_gui=False, camera_config=None):
@@ -595,7 +596,8 @@ def load_model_and_env(ckpt_path, model_type, action_chunk_size=50, lerobot_data
 
 def run_inference_loop(policy, preprocessor, env, dataset_stats, task_description, device, 
                        control_arm=True, control_claw=True, action_chunk_size=50, 
-                       enable_gui=False, rotate_head_camera=False, state_zero=False):
+                       enable_gui=False, rotate_head_camera=False, state_zero=False,
+                       is_first_inference=True):
     """
     运行推理循环（可以多次调用，每次调用开始新的推理会话）
     
@@ -612,6 +614,7 @@ def run_inference_loop(policy, preprocessor, env, dataset_stats, task_descriptio
         enable_gui: 是否启用GUI
         rotate_head_camera: 是否旋转头部相机
         state_zero: 是否将状态置零
+        is_first_inference: 是否是第一次推理（第一次会加载bag文件，后续使用json文件重置）
     
     Returns:
         bool: True表示正常退出（按q），False表示被中断（Ctrl+C）
@@ -662,24 +665,27 @@ def run_inference_loop(policy, preprocessor, env, dataset_stats, task_descriptio
     resampled_action_queue: deque[np.ndarray] = deque()
     last_executed_action: Optional[np.ndarray] = None
     
-    # 加载并回放初始轨迹
-    init_traj_bag_path = '/home/lab/kuavo-manip/robot_depalletize_init_traj.bag'
-    if os.path.exists(init_traj_bag_path):
-        rospy.loginfo("Loading and replaying initial trajectory from bag file...")
-        load_and_replay_init_trajectory(
-            bag_path=init_traj_bag_path,
-            env=env,
-            control_arm=control_arm,
-            control_claw=control_claw
-        )
-        rospy.loginfo("Initial trajectory replay completed. Starting model inference...")
+    # 加载并回放初始轨迹（只在第一次推理时加载bag文件）
+    if is_first_inference:
+        init_traj_bag_path = '/home/lab/kuavo-manip/robot_depalletize_init_traj.bag'
+        if os.path.exists(init_traj_bag_path):
+            rospy.loginfo("Loading and replaying initial trajectory from bag file (first inference only)...")
+            load_and_replay_init_trajectory(
+                bag_path=init_traj_bag_path,
+                env=env,
+                control_arm=control_arm,
+                control_claw=control_claw
+            )
+            rospy.loginfo("Initial trajectory replay completed. Starting model inference...")
+            time.sleep(1.0)
+        else:
+            rospy.logwarn(f"Initial trajectory bag file not found: {init_traj_bag_path}")
+            rospy.logwarn("Skipping initial trajectory replay. Starting model inference directly...")
+        
+        input(f"轨迹回放 结束, 按回车继续 ==== 轨迹回放成功 ==== \n")
         time.sleep(1.0)
     else:
-        rospy.logwarn(f"Initial trajectory bag file not found: {init_traj_bag_path}")
-        rospy.logwarn("Skipping initial trajectory replay. Starting model inference directly...")
-    
-    input(f"轨迹回放 结束, 按回车继续 ==== 轨迹回放成功 ==== \n")
-    time.sleep(1.0)
+        rospy.loginfo("Skipping bag file replay (not first inference). Using JSON reset instead.")
     
     print("\n" + "="*80)
     print("🚀 Starting inference loop...")
@@ -891,6 +897,97 @@ def run_inference_loop(policy, preprocessor, env, dataset_stats, task_descriptio
     
     return True  # 正常情况下不会到达这里
 
+def final_reset_arm(json_path, env, control_arm=True, control_claw=True):
+    """
+    使用JSON文件中的手臂轨迹重置手臂位置
+    
+    Args:
+        json_path: JSON文件路径，包含初始手臂轨迹
+        env: GrabBoxMpcEnv环境实例
+        control_arm: 是否控制手臂
+        control_claw: 是否控制夹爪
+    """
+    # 先打开夹爪
+    rospy.loginfo("Opening claws before reset...")
+    # 获取当前状态
+    obs_data, camera_obs, camera_obs_ts, robot_obs, robot_obs_ts = env.get_obs()
+    current_arm_state = obs_data["state"][0][:14]  # 当前手臂位置
+    current_claw_state = np.array([0.0, 0.0])  # 默认值
+    try:
+        if 'claw_state' in robot_obs and len(robot_obs['claw_state']) > 0:
+            claw_data = robot_obs['claw_state']
+            if claw_data.ndim == 2:
+                current_claw_state = np.array(claw_data[-1], dtype=np.float32)
+            elif claw_data.ndim == 1:
+                current_claw_state = np.array(claw_data, dtype=np.float32)
+            if current_claw_state.shape[0] != 2:
+                current_claw_state = np.array([0.0, 0.0])
+    except Exception as e:
+        rospy.logwarn(f"Could not get current claw state: {e}, using default [0.0, 0.0]")
+        current_claw_state = np.array([0.0, 0.0])
+    
+    # 打开夹爪（设置为0），保持手臂位置不变
+    # 注意：夹爪的0值表示打开状态
+    open_claw_value = np.zeros([2])  # [0.0, 0.0] 表示打开夹爪
+    has_cmd_pose = ("Cmd_pose_z" in ACTION_COMPONENTS or "Cmd_pose_pitch" in ACTION_COMPONENTS)
+    if has_cmd_pose:
+        # 18维格式
+        open_claw_action = np.concatenate([current_arm_state, open_claw_value, np.array([0.0, 0.0])])
+    else:
+        # 16维格式
+        open_claw_action = np.concatenate([current_arm_state, open_claw_value])
+    env.exec_actions(actions=open_claw_action, control_arm=False, control_claw=control_claw)
+    time.sleep(1)
+    
+    # 更新current_claw_state为打开后的状态（0），用于后续的手臂重置过程
+    current_claw_state = open_claw_value.copy()
+
+    # 加载JSON文件中的手臂轨迹
+    rospy.loginfo(f"Loading initial arm trajectory from JSON: {json_path}")
+    with open(json_path, 'r') as f:
+        init_traj = json.load(f)
+        arm_actions = init_traj['arm_action']  # List of arm actions
+        dt = init_traj.get('dt', 0.1)  # 获取时间间隔，默认0.1秒
+
+    obs_data, camera_obs, camera_obs_ts, robot_obs, robot_obs_ts = env.get_obs()
+    init_joints = np.array(arm_actions[-1])  # 目标关节位置（14维）
+    current_joints = obs_data["state"][0][:14]  # 当前关节位置（14维）
+
+    # 确保init_joints是14维
+    if len(init_joints) != 14:
+        rospy.logwarn(f"Expected 14 joint positions, got {len(init_joints)}. Using first 14 elements.")
+        init_joints = np.array(init_joints[:14])
+
+    total_time = 5.0  # 总时间（秒）
+    num_points = int(total_time / dt)
+    
+    rospy.loginfo(f"Resetting arm from current position to initial position over {total_time}s ({num_points} steps)...")
+    
+    # 从current_joints到init_joints插值
+    for i in range(1, num_points + 1):
+        # 线性插值
+        alpha = i / num_points
+        interp_joints = current_joints + (init_joints - current_joints) * alpha
+        
+        # 构建完整的动作数组（根据ACTION_COMPONENTS格式）
+        # 根据ACTION_COMPONENTS动态确定动作维度
+        has_cmd_pose = ("Cmd_pose_z" in ACTION_COMPONENTS or "Cmd_pose_pitch" in ACTION_COMPONENTS)
+        
+        if has_cmd_pose:
+            # 18维格式: [14个手臂关节, 2个夹爪位置, 2个cmd_pose]
+            # 保持cmd_pose不变（使用当前值或0）
+            cmd_pose = np.array([0.0, 0.0])  # 默认cmd_pose值
+            action = np.concatenate([interp_joints, current_claw_state, cmd_pose])
+        else:
+            # 16维格式: [14个手臂关节, 2个夹爪位置]
+            action = np.concatenate([interp_joints, current_claw_state])
+        
+        # 使用exec_actions执行动作
+        env.exec_actions(actions=action, control_arm=control_arm, control_claw=control_claw)
+        time.sleep(dt)
+    
+    rospy.loginfo("Arm reset completed!")
+
 
 def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chunk_size=50, lerobot_dataset_path=None, enable_gui=False, rotate_head_camera=False, state_zero=False, task_description=None):
     """
@@ -927,8 +1024,14 @@ def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chun
     while True:
         try:
             inference_count += 1
+            is_first_inference = (inference_count == 1)
+            
             print(f"\n{'='*80}")
             print(f"🔄 Starting inference session #{inference_count}")
+            if is_first_inference:
+                print(f"📦 First inference: will load bag file for initial trajectory")
+            else:
+                print(f"📦 Subsequent inference: will use JSON file for arm reset")
             print(f"{'='*80}\n")
             
             # 重置推理状态
@@ -950,13 +1053,24 @@ def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chun
                 action_chunk_size=action_chunk_size,
                 enable_gui=enable_gui,
                 rotate_head_camera=rotate_head_camera,
-                state_zero=state_zero
+                state_zero=state_zero,
+                is_first_inference=is_first_inference
             )
             
             if normal_exit:
                 # 正常退出（按q），准备下一次推理
                 print(f"\n{'='*80}")
                 print(f"✅ Inference session #{inference_count} stopped by user (q pressed)")
+                cur_dir = os.path.dirname(os.path.abspath(__file__))
+                # 每次退出时都使用JSON文件重置手臂位置
+                # 第一次推理开始时使用bag文件，后续推理开始时跳过bag文件（在run_inference_loop中处理）
+                rospy.loginfo("Resetting arm position using JSON file...")
+                final_reset_arm(
+                    json_path=os.path.join(cur_dir, 'utils/initial_arm_traj.json'), 
+                    env=env,
+                    control_arm=control_arm,
+                    control_claw=control_claw
+                )
                 print(f"💡 Ready for next inference session. Press Enter to start, or Ctrl+C to exit.")
                 print(f"{'='*80}\n")
                 
