@@ -521,6 +521,10 @@ class FlowmatchingActionHead(nn.Module):
             dtype=vl_embs.dtype,
             device=device,
         )
+        # Zero out padded dimensions to match training behavior
+        # In training, padded dimensions (after actual_action_dim) are always 0
+        if self.encoder_action_dim != self.actual_action_dim:
+            actions[:, :, self.actual_action_dim:] = 0.0
 
         num_steps = self.num_inference_timesteps
         dt = 1.0 / num_steps
@@ -577,6 +581,10 @@ class FlowmatchingActionHead(nn.Module):
                 else:
                     pred_velocity_padded = pred_velocity[:, :, :self.encoder_action_dim]
                 actions = actions + dt * pred_velocity_padded
+                # Zero out the padded dimensions to match training behavior
+                # In training, the padded dimensions (after actual_action_dim) are always 0
+                # This ensures action_encoder receives consistent input format
+                actions[:, :, self.actual_action_dim:] = 0.0
             else:
                 actions = actions + dt * pred_velocity
         
