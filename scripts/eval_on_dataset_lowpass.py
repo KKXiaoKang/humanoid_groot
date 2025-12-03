@@ -13,6 +13,7 @@ Usage:
         --episode <episode_number> \
         [--image-zero]  # Optional: set all images to zero to test model dependency on images
         [--state-zero]  # Optional: set all state inputs to zero to test model dependency on state
+        [--cam-head-zero]  # Optional: set cam_head (image) to zero to test model dependency on cam_head
 """
 
 import os, sys
@@ -212,6 +213,7 @@ def eval_on_dataset(ckpt_path,
                     show_progress=True,
                     image_zero=False,
                     state_zero=False,
+                    cam_head_zero=False,
                     infer_per_frame: int = 1,
                     task_description: str | None = None):
     """
@@ -303,6 +305,8 @@ def eval_on_dataset(ckpt_path,
         print(f"⚠️  IMAGE ZERO MODE: All image inputs will be set to zero (for dependency testing)")
     if state_zero:
         print(f"⚠️  STATE ZERO MODE: All state inputs will be set to zero (for dependency testing)")
+    if cam_head_zero:
+        print(f"⚠️  CAM_HEAD ZERO MODE: cam_head (image) will be set to zero (for dependency testing)")
     
     policy.eval().to(device)
     
@@ -553,6 +557,20 @@ def eval_on_dataset(ckpt_path,
                 if 'image' in key:
                     # 保持相同的形状和设备，但将所有像素值设为0
                     observation[key] = torch.zeros_like(observation[key])
+        
+        # 如果启用cam_head_zero模式，将cam_head（image）的图像输入置零（用于验证模型对cam_head的依赖性）
+        if cam_head_zero:
+            # cam_head对应的相机名称是"image"，观测键是"observation.images.cam_head"
+            cam_head_obs_key = "observation.images.cam_head"
+            if cam_head_obs_key in observation:
+                observation[cam_head_obs_key] = torch.zeros_like(observation[cam_head_obs_key])
+            else:
+                # 向后兼容：尝试使用"image"作为键名
+                fallback_key = "observation.images.image"
+                if fallback_key in observation:
+                    observation[fallback_key] = torch.zeros_like(observation[fallback_key])
+                elif data_step == 0:
+                    print(f"⚠️  Warning: cam_head observation key not found. Available keys: {[k for k in observation.keys() if 'image' in k.lower()]}")
         
         # 添加 task 字段（language instruction）
         # 如果提供了 task_description，则使用它覆盖数据集中的 task；否则使用数据集原本的 task
@@ -939,6 +957,8 @@ if __name__ == "__main__":
                        help='Set all image inputs to zero (for testing model dependency on images)')
     parser.add_argument('--state-zero', action='store_true',
                        help='Set all state inputs to zero (for testing model dependency on state)')
+    parser.add_argument('--cam-head-zero', action='store_true',
+                       help='Set cam_head (image) input to zero (for testing model dependency on cam_head)')
     parser.add_argument('--infer-per-frame', type=int, default=1,
                        help='Run policy inference every N frames (default: 1 = every frame)')
     parser.add_argument('--task-description', type=str, default=None,
@@ -956,6 +976,7 @@ if __name__ == "__main__":
     print(f"MuJoCo Visualization: {args.with_mujoco}")
     print(f"Image Zero Mode: {args.image_zero}")
     print(f"State Zero Mode: {args.state_zero}")
+    print(f"Cam Head Zero Mode: {args.cam_head_zero}")
     print(f"Infer Every N Frames: {args.infer_per_frame}")
     if args.task_description:
         print(f"Task Description (overridden): '{args.task_description}'")
@@ -972,6 +993,7 @@ if __name__ == "__main__":
         show_progress=not args.no_progress,
         image_zero=args.image_zero,
         state_zero=args.state_zero,
+        cam_head_zero=args.cam_head_zero,
         infer_per_frame=args.infer_per_frame,
         task_description=args.task_description
     )
