@@ -257,6 +257,9 @@ class GR00TN15(PreTrainedModel):
         self.action_head = FlowmatchingActionHead(action_head_cfg)
 
         self.action_horizon = config.action_horizon
+        # Keep config.action_dim for compatibility (may be 32 for pretrained models)
+        # The actual output dimension is action_head.actual_action_dim (16 for multi-head)
+        # validate_data will use the correct dimension based on context
         self.action_dim = config.action_dim
         self.compute_dtype = config.compute_dtype
 
@@ -315,6 +318,16 @@ class GR00TN15(PreTrainedModel):
             error_msg += f"\n{backbone_outputs[BACKBONE_FEATURE_KEY].shape=}"
             raise ValueError(error_msg)
 
+        # For inference, use actual_action_dim if using multi-head (may differ from config.action_dim)
+        # For training, we don't check action_pred dimensions (only check for loss key)
+        expected_action_dim = self.action_dim
+        if not is_training and ACTION_KEY in action_head_outputs:
+            # During inference, use actual output dimension from action_head
+            # This handles the case where multi-head outputs actual_action_dim (16) 
+            # but config.action_dim is pretrained dimension (32)
+            if hasattr(self.action_head, 'actual_action_dim'):
+                expected_action_dim = self.action_head.actual_action_dim
+
         fail_action_head = (not isinstance(action_head_outputs, BatchFeature)) or not (
             (
                 LOSS_KEY in action_head_outputs and is_training
@@ -322,7 +335,7 @@ class GR00TN15(PreTrainedModel):
             or (
                 ACTION_KEY in action_head_outputs
                 and action_head_outputs[ACTION_KEY].shape[1] == self.action_horizon
-                and action_head_outputs[ACTION_KEY].shape[2] == self.action_dim
+                and action_head_outputs[ACTION_KEY].shape[2] == expected_action_dim
             )
         )
 
@@ -330,9 +343,13 @@ class GR00TN15(PreTrainedModel):
             error_msg = ERROR_MSG
             error_msg += f"\n{isinstance(action_head_outputs, BatchFeature)=}"
             error_msg += f"\n{LOSS_KEY in action_head_outputs=}"
-            error_msg += f"\n{action_head_outputs[ACTION_KEY].shape=}"
+            if ACTION_KEY in action_head_outputs:
+                error_msg += f"\n{action_head_outputs[ACTION_KEY].shape=}"
             error_msg += f"\n{self.action_horizon=}"
-            error_msg += f"\n{self.action_dim=}"
+            error_msg += f"\n{self.action_dim=} (config)"
+            error_msg += f"\n{expected_action_dim=} (expected for validation)"
+            if hasattr(self.action_head, 'actual_action_dim'):
+                error_msg += f"\n{self.action_head.actual_action_dim=} (actual from action_head)"
             raise ValueError(error_msg)
 
     def forward(
