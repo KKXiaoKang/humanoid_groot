@@ -6,6 +6,7 @@ import numpy as np
 import rosbag
 from sensor_msgs.msg import JointState
 import json
+from std_srvs.srv import Trigger, TriggerRequest, SetBool, SetBoolRequest
 
 # Initialize GUI windows if requested
 def init_gui_windows(enable_gui=False, camera_config=None):
@@ -54,7 +55,7 @@ import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "robot_envs")))
 from robot_envs.kuavo_depalletize_env import GrabBoxMpcEnv
 from configs.config import topic_info, TASK_DATA_MODE, get_camera_observation_key, get_camera_names, CAMERA_COMPONENTS, ACTION_COMPONENTS
-
+from configs.config import ROBOT_VERSION
 # 使用GrootPolicy模型
 from lerobot.policies.groot.modeling_groot import GrootPolicy
 from lerobot.policies.groot.processor_groot import make_groot_pre_post_processors
@@ -593,6 +594,22 @@ def load_model_and_env(ckpt_path, model_type, action_chunk_size=50, lerobot_data
     
     return policy, preprocessor, postprocessor, env, dataset_stats, task_description, device
 
+def set_arm_quick_mode(enable: bool) -> bool:
+    """开关手臂快速模式"""
+    rospy.loginfo(f"call set_arm_quick_mode:{enable}")
+    try:
+        rospy.wait_for_service('/enable_lb_arm_quick_mode', timeout=5.0)
+        cli = rospy.ServiceProxy('/enable_lb_arm_quick_mode', SetBool)
+        resp = cli(enable)
+        if resp.success:
+            rospy.loginfo(f"Successfully {'enabled' if enable else 'disabled'} arm quick mode")
+            return True
+        else:
+            rospy.logwarn(f"Failed to {'enable' if enable else 'disable'} arm quick mode")
+            return False
+    except rospy.ServiceException as e:
+        rospy.logerr(f"Service call failed: {e}")
+        return False
 
 def run_inference_loop(policy, preprocessor, env, dataset_stats, task_description, device, 
                        control_arm=True, control_claw=True, action_chunk_size=50, 
@@ -659,8 +676,16 @@ def run_inference_loop(policy, preprocessor, env, dataset_stats, task_descriptio
     # Real-time environment evaluation loop
     robot_sdk.control.set_external_control_arm_mode()
     time.sleep(1)
-    direct_to_wbc(1)
-    input(f"direct_to_wbc 结束, 按回车继续 ==== 切换手臂到wbc轨迹控制模式成功 ==== \n")
+    
+    # 根据机器人版本切换手臂控制模式
+    if ROBOT_VERSION == "4_pro":
+        direct_to_wbc(1)
+        function_key = "direct_to_wbc"
+    elif ROBOT_VERSION == "5_wheel":
+        set_arm_quick_mode(True)
+        function_key = "set_arm_quick_mode"    
+    # 等待使能生效
+    input(f"当前机器人模式为: {ROBOT_VERSION} | 控制模式 {function_key} 结束, 按回车继续 ==== 切换手臂到wbc轨迹控制模式成功 ==== \n")
     time.sleep(1.0)
     resampled_action_queue: deque[np.ndarray] = deque()
     last_executed_action: Optional[np.ndarray] = None

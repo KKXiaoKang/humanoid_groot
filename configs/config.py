@@ -22,6 +22,13 @@ Action Mode说明:
 ACTION_MODE = "absolute"  # "absolute", "delta", "relative"
 
 """
+    机器人版本模式
+    5_wheel: 5代轮臂机器人
+    4_pro: 4代双足机器人
+"""
+ROBOT_VERSION = "4_pro" 
+
+"""
     TASK_DATA_MODE - 指定任务数据集来源
     vr - 使用vr数据集, 里面相机配置为4相机配置
     strategy - 使用strategy数据集, 里面相机配置为3相机配置
@@ -465,8 +472,12 @@ def process_wbc_observation_com_state_euler(msg, data_dict, name, ts=None):
     data_dict[name]['ts'].append(ts)
 
 def process_sensorsData(msg, data_dict, name, ts=None):
-    arm_begin = 12
-    arm_end = 25
+    if ROBOT_VERSION == "5_wheel":
+        arm_begin = 4
+        arm_end = 17
+    elif ROBOT_VERSION == "4_pro":
+        arm_begin = 12
+        arm_end = 25
     if ts is None:
         ts = msg.header.stamp.to_sec()
 
@@ -478,8 +489,12 @@ def process_sensorsData(msg, data_dict, name, ts=None):
     # print(f"sensorsData: {data}, Timestamp: {msg.header.stamp.to_sec()}")
 
 def process_sensorsData_vel(msg, data_dict, name, ts=None):
-    arm_begin = 12
-    arm_end = 25
+    if ROBOT_VERSION == "5_wheel":
+        arm_begin = 4
+        arm_end = 17
+    elif ROBOT_VERSION == "4_pro":
+        arm_begin = 12
+        arm_end = 25
     if ts is None:
         ts = msg.header.stamp.to_sec()
 
