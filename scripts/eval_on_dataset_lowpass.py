@@ -505,6 +505,7 @@ def eval_on_dataset(ckpt_path,
     last_data_step = 0
     predictions = []
     ground_truths = []
+    inference_times = []  # 记录每次推理的时间
     
     # 使用tqdm显示进度（如果启用）
     iterator = tqdm(enumerate(dataloader), total=dataset.num_frames, desc="Processing") if show_progress else enumerate(dataloader)
@@ -608,9 +609,22 @@ def eval_on_dataset(ckpt_path,
             # 使用预处理器处理输入
             processed_observation = preprocessor(observation)
             
+            # 精确测量 predict_action_chunk 的推理时间
+            # 使用 CUDA 同步确保准确测量 GPU 推理时间
+            if device.startswith('cuda'):
+                torch.cuda.synchronize()
+            inference_start = time.perf_counter()
+            
             # 模型推理
             with torch.inference_mode():
                 pred_actions = policy.predict_action_chunk(processed_observation)
+            
+            # 确保 GPU 操作完成后再记录结束时间
+            if device.startswith('cuda'):
+                torch.cuda.synchronize()
+            inference_end = time.perf_counter()
+            inference_time = inference_end - inference_start
+            inference_times.append(inference_time)
             
             # 打印action维度
             print(f"pred_actions shape: {pred_actions.shape}")
@@ -636,8 +650,23 @@ def eval_on_dataset(ckpt_path,
                     print(f"⚠️  Warning: First frame but no previous prediction. Performing inference anyway.")
                     # 执行推理
                     processed_observation = preprocessor(observation)
+                    
+                    # 精确测量 predict_action_chunk 的推理时间
+                    # 使用 CUDA 同步确保准确测量 GPU 推理时间
+                    if device.startswith('cuda'):
+                        torch.cuda.synchronize()
+                    inference_start = time.perf_counter()
+                    
                     with torch.inference_mode():
                         pred_actions = policy.predict_action_chunk(processed_observation)
+                    
+                    # 确保 GPU 操作完成后再记录结束时间
+                    if device.startswith('cuda'):
+                        torch.cuda.synchronize()
+                    inference_end = time.perf_counter()
+                    inference_time = inference_end - inference_start
+                    inference_times.append(inference_time)
+                    
                     pred_action_single, pred_chunk = denormalize_actions(pred_actions, action_dim, dataset_stats)
                     last_inferred_chunk = pred_chunk.copy()
                     last_inference_step = data_step
@@ -893,6 +922,35 @@ def eval_on_dataset(ckpt_path,
     
     print("-" * 80)
     print(f'{"Overall":<20} {overall_mse:<15.8f} {overall_mae:<15.8f}')
+    
+    # ========= 推理时间统计 =========
+    if len(inference_times) > 0:
+        print("\n" + "="*80)
+        print("⏱️  Inference Time Statistics")
+        print("="*80)
+        avg_inference_time = np.mean(inference_times)
+        min_inference_time = np.min(inference_times)
+        max_inference_time = np.max(inference_times)
+        median_inference_time = np.median(inference_times)
+        std_inference_time = np.std(inference_times)
+        
+        print(f"Total inference calls: {len(inference_times)}")
+        print(f"Average inference time: {avg_inference_time*1000:.2f} ms")
+        print(f"Median inference time: {median_inference_time*1000:.2f} ms")
+        print(f"Min inference time: {min_inference_time*1000:.2f} ms")
+        print(f"Max inference time: {max_inference_time*1000:.2f} ms")
+        print(f"Std inference time: {std_inference_time*1000:.2f} ms")
+        
+        # 计算理论最大推理频率（基于平均推理时间）
+        # 这表示如果连续推理，理论上可以达到的最大频率
+        if avg_inference_time > 0:
+            max_frequency = 1.0 / avg_inference_time
+            print(f"Max theoretical inference frequency: {max_frequency:.2f} Hz")
+            print(f"  (Based on average inference time: {avg_inference_time*1000:.2f} ms)")
+        
+        print("="*80)
+    else:
+        print("\n⚠️  Warning: No inference time statistics available (no inference was performed)")
     
     # 分组统计 - 根据action维度选择统计方式
     print("\n📊 Grouped Statistics:")
