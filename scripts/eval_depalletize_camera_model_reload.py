@@ -216,6 +216,19 @@ def resample_chunk_with_claw_hold(action_chunk: np.ndarray,
 
     return resampled
 
+def change_arm_ctrl_mode(control_mode):
+    rospy.wait_for_service('/humanoid_change_arm_ctrl_mode')
+    try:
+        change_mode = rospy.ServiceProxy('/humanoid_change_arm_ctrl_mode', changeArmCtrlMode)
+        req = changeArmCtrlModeRequest()
+        req.control_mode = control_mode
+        res = change_mode(req)
+        if res.result:
+            rospy.loginfo("手臂控制模式已更改为 %d", control_mode)
+        else:
+            rospy.logerr("无法将手臂控制模式更改为 %d", control_mode)
+    except rospy.ServiceException as e:
+        rospy.logerr("服务调用失败: %s", e)
 
 def direct_to_wbc(control_mode):
     """
