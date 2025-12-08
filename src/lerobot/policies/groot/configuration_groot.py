@@ -96,6 +96,18 @@ class GrootConfig(PreTrainedConfig):
     optimizer_weight_decay: float = 1e-5
     warmup_ratio: float = 0.05
     use_bf16: bool = True
+    
+    # Cautious Optimizer settings
+    use_cautious_optimizer: bool = False
+    """Enable Cautious Optimizer for improved training efficiency.
+    
+    Based on "Cautious Optimizers: Improving Training with One Line of Code" (arXiv:2411.16085).
+    Only updates parameters when update direction aligns with gradient direction.
+    Can accelerate convergence by 1.28x-1.47x for Transformer-based models like DiT.
+    Recommended for GROOT's DiT + Flow-Matching architecture.
+    """
+    cautious_eps: float = 1e-8
+    """Epsilon for cautious masking scaling factor. Usually doesn't need adjustment."""
 
     # Dataset parameters
     # Video backend to use for training ('decord' or 'torchvision_av')
@@ -174,6 +186,8 @@ class GrootConfig(PreTrainedConfig):
             betas=self.optimizer_betas,
             eps=self.optimizer_eps,
             weight_decay=self.optimizer_weight_decay,
+            use_cautious_optimizer=self.use_cautious_optimizer,
+            cautious_eps=self.cautious_eps,
         )
 
     def get_scheduler_preset(self) -> CosineDecayWithWarmupSchedulerConfig:
