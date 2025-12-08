@@ -232,10 +232,34 @@ class GR00TN15(PreTrainedModel):
         self.local_model_path = local_model_path
 
         self.backbone = EagleBackbone(**config.backbone_cfg)
-        action_head_cfg = FlowmatchingActionHeadConfig(**config.action_head_cfg)
+        
+        # If using multi-action heads, override action_dim to match arm_dim + claw_dim
+        action_head_cfg_dict = config.action_head_cfg.copy()
+        # Use FlowmatchingActionHeadConfig default (True) if not specified in config
+        use_multi_action_heads = action_head_cfg_dict.get("use_multi_action_heads", True)
+        
+        # Save pretrained action_dim for compatibility (pretrained model uses 32D)
+        pretrained_action_dim = action_head_cfg_dict.get("action_dim", 32)
+        
+        if use_multi_action_heads:
+            action_arm_dim = action_head_cfg_dict.get("action_arm_dim", 14)
+            action_claw_dim = action_head_cfg_dict.get("action_claw_dim", 2)
+            actual_action_dim = action_arm_dim + action_claw_dim
+            action_head_cfg_dict["action_dim"] = actual_action_dim
+            # Set pretrained_action_dim for compatibility with pretrained encoder
+            action_head_cfg_dict["pretrained_action_dim"] = pretrained_action_dim
+            # Ensure use_multi_action_heads is set in the dict
+            action_head_cfg_dict["use_multi_action_heads"] = True
+            if pretrained_action_dim != actual_action_dim:
+                print(f"🔧 Using pretrained action encoder ({pretrained_action_dim}D) with multi-head output ({actual_action_dim}D)")
+        
+        action_head_cfg = FlowmatchingActionHeadConfig(**action_head_cfg_dict)
         self.action_head = FlowmatchingActionHead(action_head_cfg)
 
         self.action_horizon = config.action_horizon
+        # Keep config.action_dim for compatibility (may be 32 for pretrained models)
+        # The actual output dimension is action_head.actual_action_dim (16 for multi-head)
+        # validate_data will use the correct dimension based on context
         self.action_dim = config.action_dim
         self.compute_dtype = config.compute_dtype
 
@@ -294,6 +318,16 @@ class GR00TN15(PreTrainedModel):
             error_msg += f"\n{backbone_outputs[BACKBONE_FEATURE_KEY].shape=}"
             raise ValueError(error_msg)
 
+        # For inference, use actual_action_dim if using multi-head (may differ from config.action_dim)
+        # For training, we don't check action_pred dimensions (only check for loss key)
+        expected_action_dim = self.action_dim
+        if not is_training and ACTION_KEY in action_head_outputs:
+            # During inference, use actual output dimension from action_head
+            # This handles the case where multi-head outputs actual_action_dim (16) 
+            # but config.action_dim is pretrained dimension (32)
+            if hasattr(self.action_head, 'actual_action_dim'):
+                expected_action_dim = self.action_head.actual_action_dim
+
         fail_action_head = (not isinstance(action_head_outputs, BatchFeature)) or not (
             (
                 LOSS_KEY in action_head_outputs and is_training
@@ -301,7 +335,7 @@ class GR00TN15(PreTrainedModel):
             or (
                 ACTION_KEY in action_head_outputs
                 and action_head_outputs[ACTION_KEY].shape[1] == self.action_horizon
-                and action_head_outputs[ACTION_KEY].shape[2] == self.action_dim
+                and action_head_outputs[ACTION_KEY].shape[2] == expected_action_dim
             )
         )
 
@@ -309,9 +343,13 @@ class GR00TN15(PreTrainedModel):
             error_msg = ERROR_MSG
             error_msg += f"\n{isinstance(action_head_outputs, BatchFeature)=}"
             error_msg += f"\n{LOSS_KEY in action_head_outputs=}"
-            error_msg += f"\n{action_head_outputs[ACTION_KEY].shape=}"
+            if ACTION_KEY in action_head_outputs:
+                error_msg += f"\n{action_head_outputs[ACTION_KEY].shape=}"
             error_msg += f"\n{self.action_horizon=}"
-            error_msg += f"\n{self.action_dim=}"
+            error_msg += f"\n{self.action_dim=} (config)"
+            error_msg += f"\n{expected_action_dim=} (expected for validation)"
+            if hasattr(self.action_head, 'actual_action_dim'):
+                error_msg += f"\n{self.action_head.actual_action_dim=} (actual from action_head)"
             raise ValueError(error_msg)
 
     def forward(
@@ -438,4 +476,21 @@ class GR00TN15(PreTrainedModel):
         pretrained_model.action_head.set_trainable_parameters(
             tune_projector=tune_projector, tune_diffusion_model=tune_diffusion_model
         )
+        
+        # Verify that LLM parameters are actually trainable if tune_llm=True
+        if tune_llm:
+            llm_params = list(pretrained_model.backbone.eagle_model.language_model.parameters())
+            trainable_llm_params = [p for p in llm_params if p.requires_grad]
+            if trainable_llm_params:
+                print(f"✅ Verified: {len(trainable_llm_params)}/{len(llm_params)} LLM parameters are trainable")
+            else:
+                print(f"⚠️  Warning: No LLM parameters are trainable despite tune_llm=True!")
+        else:
+            llm_params = list(pretrained_model.backbone.eagle_model.language_model.parameters())
+            frozen_llm_params = [p for p in llm_params if not p.requires_grad]
+            if len(frozen_llm_params) == len(llm_params):
+                print(f"✅ Verified: All {len(llm_params)} LLM parameters are frozen (tune_llm=False)")
+            else:
+                print(f"⚠️  Warning: Some LLM parameters are still trainable despite tune_llm=False!")
+        
         return pretrained_model

@@ -153,10 +153,40 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
     vl_self_attention_cfg: dict = field(default=None)
     num_target_vision_tokens: int = field(default=32, metadata={"help": "Number of target vision tokens."})
 
+    # Multi-head action prediction
+    use_multi_action_heads: bool = field(default=True, metadata={"help": "Whether to use multi-head action prediction"})
+    action_arm_dim: int = field(default=14, metadata={"help": "Arm joint dimensions (0-13) - absolute actions"})
+    action_claw_dim: int = field(default=2, metadata={"help": "Claw position dimensions (14-15) - absolute actions"})
+    
+    # Loss weights for different action heads
+    arm_loss_weight: float = field(default=1.0, metadata={"help": "Arm absolute position loss weight"})
+    claw_loss_weight: float = field(default=1.0, metadata={"help": "Claw position loss weight"})
+    
+    # Learnable uncertainty weights (参考 https://arxiv.org/pdf/1705.07115)
+    use_learnable_loss_weights: bool = field(default=True, metadata={"help": "Enable learnable loss weights based on uncertainty"})
+    
+    # Pretrained action dimension (for compatibility with pretrained models)
+    pretrained_action_dim: int = field(default=None, metadata={"help": "Action dimension of pretrained model (for compatibility)"})
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         for key, value in kwargs.items():
             setattr(self, key, value)
+        
+        # Validate multi-head configuration
+        if self.use_multi_action_heads:
+            expected_action_dim = self.action_arm_dim + self.action_claw_dim
+            if self.action_dim is not None and self.action_dim != expected_action_dim:
+                # If pretrained_action_dim is set, allow mismatch (we'll pad/truncate)
+                if self.pretrained_action_dim is None:
+                    raise ValueError(
+                        f"When using multi-action heads, action_dim ({self.action_dim}) must equal "
+                        f"action_arm_dim ({self.action_arm_dim}) + action_claw_dim ({self.action_claw_dim}) = {expected_action_dim}"
+                    )
+                # If pretrained_action_dim is set, use it for action_encoder
+                if self.pretrained_action_dim != expected_action_dim:
+                    print(f"⚠️  Pretrained model uses {self.pretrained_action_dim}D, but data uses {expected_action_dim}D. "
+                          f"Will pad/truncate actions for compatibility.")
 
 
 class FlowmatchingActionHead(nn.Module):
@@ -175,6 +205,12 @@ class FlowmatchingActionHead(nn.Module):
         self.action_dim = config.action_dim
         self.action_horizon = config.action_horizon
         self.num_inference_timesteps = config.num_inference_timesteps
+        
+        # Use pretrained_action_dim for action_encoder if specified (for compatibility with pretrained models)
+        # Otherwise use action_dim
+        encoder_action_dim = config.pretrained_action_dim if config.pretrained_action_dim is not None else config.action_dim
+        self.encoder_action_dim = encoder_action_dim
+        self.actual_action_dim = config.action_dim  # Actual action dimension from data
 
         self.state_encoder = CategorySpecificMLP(
             num_categories=config.max_num_embodiments,
@@ -183,16 +219,47 @@ class FlowmatchingActionHead(nn.Module):
             output_dim=self.input_embedding_dim,
         )
         self.action_encoder = MultiEmbodimentActionEncoder(
-            action_dim=config.action_dim,
+            action_dim=encoder_action_dim,  # Use pretrained dimension for encoder
             hidden_size=self.input_embedding_dim,
             num_embodiments=config.max_num_embodiments,
         )
-        self.action_decoder = CategorySpecificMLP(
-            num_categories=config.max_num_embodiments,
-            input_dim=self.hidden_size,
-            hidden_dim=self.hidden_size,
-            output_dim=self.action_dim,
-        )
+        
+        # Multi-head action prediction
+        if config.use_multi_action_heads:
+            self.action_arm_decoder = CategorySpecificMLP(
+                num_categories=config.max_num_embodiments,
+                input_dim=self.hidden_size,
+                hidden_dim=self.hidden_size,
+                output_dim=config.action_arm_dim,
+            )
+            self.action_claw_decoder = CategorySpecificMLP(
+                num_categories=config.max_num_embodiments,
+                input_dim=self.hidden_size,
+                hidden_dim=self.hidden_size,
+                output_dim=config.action_claw_dim,
+            )
+            self.action_decoder = None  # Not used in multi-head mode
+            print(f"📊 Multi-head action: arm({config.action_arm_dim}D) + claw({config.action_claw_dim}D) = {config.action_arm_dim + config.action_claw_dim}D")
+        else:
+            self.action_decoder = CategorySpecificMLP(
+                num_categories=config.max_num_embodiments,
+                input_dim=self.hidden_size,
+                hidden_dim=self.hidden_size,
+                output_dim=self.action_dim,
+            )
+            self.action_arm_decoder = None
+            self.action_claw_decoder = None
+        
+        # Learnable loss weights (参考 https://arxiv.org/pdf/1705.07115)
+        if config.use_learnable_loss_weights and config.use_multi_action_heads:
+            self.task_log_sigma = nn.ParameterDict({
+                "arm": nn.Parameter(torch.zeros(())),    # log(σ_arm)
+                "claw": nn.Parameter(torch.zeros(())),  # log(σ_claw)
+            })
+            print(f"🎯 Learnable loss weights enabled: arm, claw")
+            print(f"   Using uncertainty-based weighting from https://arxiv.org/pdf/1705.07115")
+        else:
+            self.task_log_sigma = None
         self.future_tokens = nn.Embedding(config.num_target_vision_tokens, self.input_embedding_dim)
         nn.init.normal_(self.future_tokens.weight, mean=0.0, std=0.02)
 
@@ -218,7 +285,11 @@ class FlowmatchingActionHead(nn.Module):
         if not tune_projector:
             self.state_encoder.requires_grad_(False)
             self.action_encoder.requires_grad_(False)
-            self.action_decoder.requires_grad_(False)
+            if self.config.use_multi_action_heads:
+                self.action_arm_decoder.requires_grad_(False)
+                self.action_claw_decoder.requires_grad_(False)
+            else:
+                self.action_decoder.requires_grad_(False)
             if self.config.add_pos_embed:
                 self.position_embedding.requires_grad_(False)
         if not tune_diffusion_model:
@@ -243,7 +314,11 @@ class FlowmatchingActionHead(nn.Module):
             if not self.tune_projector:
                 self.state_encoder.eval()
                 self.action_encoder.eval()
-                self.action_decoder.eval()
+                if self.config.use_multi_action_heads:
+                    self.action_arm_decoder.eval()
+                    self.action_claw_decoder.eval()
+                else:
+                    self.action_decoder.eval()
                 if self.config.add_pos_embed:
                     self.position_embedding.eval()
             if not self.tune_diffusion_model:
@@ -299,13 +374,35 @@ class FlowmatchingActionHead(nn.Module):
         state_features = self.state_encoder(action_input.state, embodiment_id)
 
         # Embed noised action trajectory.
-        actions = action_input.action
+        # NOTE: Processor (GrootPackInputsStep) already pads action to max_action_dim (32)
+        # So action_input.action is already (B, T, encoder_action_dim=32)
+        actions = action_input.action  # (B, T, encoder_action_dim)
+        action_mask = action_input.action_mask  # (B, T, encoder_action_dim) - marks valid dimensions
+        
+        # Ensure actions match encoder_action_dim (should already be padded by processor)
+        if actions.shape[-1] != self.encoder_action_dim:
+            if actions.shape[-1] < self.encoder_action_dim:
+                # Pad if needed (shouldn't happen if processor works correctly)
+                pad_size = self.encoder_action_dim - actions.shape[-1]
+                padding = torch.zeros(
+                    (actions.shape[0], actions.shape[1], pad_size),
+                    device=actions.device,
+                    dtype=actions.dtype
+                )
+                actions = torch.cat([actions, padding], dim=-1)
+            else:
+                # Truncate if larger (shouldn't happen)
+                actions = actions[:, :, :self.encoder_action_dim]
+        
         noise = torch.randn(actions.shape, device=actions.device, dtype=actions.dtype)
         t = self.sample_time(actions.shape[0], device=actions.device, dtype=actions.dtype)
         t = t[:, None, None]  # shape (B,1,1) for broadcast
 
         noisy_trajectory = (1 - t) * noise + t * actions
-        velocity = actions - noise
+        
+        # For velocity, extract only the actual action dimensions (first actual_action_dim)
+        # This matches the original data dimension before padding
+        velocity = actions[:, :, :self.actual_action_dim] - noise[:, :, :self.actual_action_dim]
 
         # Convert (continuous) t -> discrete if needed
         t_discretized = (t[:, 0, 0] * self.num_timestep_buckets).long()
@@ -330,16 +427,78 @@ class FlowmatchingActionHead(nn.Module):
             timestep=t_discretized,
             return_all_hidden_states=False,  # NOTE (YL): not using flare now
         )
-        pred = self.action_decoder(model_output, embodiment_id)
-        pred_actions = pred[:, -actions.shape[1] :]
-
-        # Slice out only the action portion of pred and target.
-        action_mask = action_input.action_mask
-        loss = F.mse_loss(pred_actions, velocity, reduction="none") * action_mask
-        loss = loss.sum() / action_mask.sum()
-        output_dict = {
-            "loss": loss,
-        }
+        
+        # Slice out only the action portion of model output
+        model_output_actions = model_output[:, -actions.shape[1] :]
+        
+        # Multi-head action prediction
+        if self.config.use_multi_action_heads:
+            pred_arm = self.action_arm_decoder(model_output_actions, embodiment_id)
+            pred_claw = self.action_claw_decoder(model_output_actions, embodiment_id)
+            pred_actions = torch.cat([pred_arm, pred_claw], dim=-1)  # (B, T, action_dim)
+            
+            # Split ground truth velocity into corresponding parts
+            velocity_arm = velocity[:, :, :self.config.action_arm_dim]  # (B, T, action_arm_dim)
+            velocity_claw = velocity[:, :, self.config.action_arm_dim:]  # (B, T, action_claw_dim)
+            
+            # Compute loss for each head
+            # action_mask is (B, T, encoder_action_dim), but we only need the first actual_action_dim
+            # Since velocity is already extracted from first actual_action_dim, we use the corresponding mask
+            action_mask = action_input.action_mask[:, :, :self.actual_action_dim]  # (B, T, actual_action_dim)
+            # Split mask for arm and claw
+            action_mask_arm = action_mask[:, :, :self.config.action_arm_dim]  # (B, T, action_arm_dim)
+            action_mask_claw = action_mask[:, :, self.config.action_arm_dim:]  # (B, T, action_claw_dim)
+            
+            loss_arm = F.mse_loss(pred_arm, velocity_arm, reduction="none") * action_mask_arm
+            loss_claw = F.mse_loss(pred_claw, velocity_claw, reduction="none") * action_mask_claw
+            
+            # Use learnable weights or fixed weights
+            if self.config.use_learnable_loss_weights and self.task_log_sigma is not None:
+                # Loss = Σ [1/(2σ²) * L_i + log(σ)]
+                # 这里使用 log(σ) 作为可学习参数，避免 σ 为负
+                loss_arm_mean = loss_arm.sum() / action_mask_arm.sum()
+                loss_claw_mean = loss_claw.sum() / action_mask_claw.sum()
+                
+                s_arm = self.task_log_sigma["arm"]
+                s_claw = self.task_log_sigma["claw"]
+                precision_arm = torch.exp(-2.0 * s_arm)  # 1 / σ²
+                precision_claw = torch.exp(-2.0 * s_claw)
+                
+                loss = precision_arm * loss_arm_mean + precision_claw * loss_claw_mean + s_arm + s_claw
+                
+                output_dict = {
+                    "loss": loss,
+                    "arm_loss": loss_arm_mean.item(),
+                    "claw_loss": loss_claw_mean.item(),
+                    "sigma_arm": torch.exp(s_arm).item(),
+                    "sigma_claw": torch.exp(s_claw).item(),
+                    "weight_arm": precision_arm.item(),
+                    "weight_claw": precision_claw.item(),
+                }
+            else:
+                # Use fixed weights
+                loss_arm_mean = loss_arm.sum() / action_mask_arm.sum()
+                loss_claw_mean = loss_claw.sum() / action_mask_claw.sum()
+                loss = self.config.arm_loss_weight * loss_arm_mean + self.config.claw_loss_weight * loss_claw_mean
+                
+                output_dict = {
+                    "loss": loss,
+                    "arm_loss": loss_arm_mean.item(),
+                    "claw_loss": loss_claw_mean.item(),
+                }
+        else:
+            # Single head (original behavior)
+            pred = self.action_decoder(model_output_actions, embodiment_id)
+            pred_actions = pred
+            
+            # Slice out only the action portion of pred and target.
+            action_mask = action_input.action_mask
+            loss = F.mse_loss(pred_actions, velocity, reduction="none") * action_mask
+            loss = loss.sum() / action_mask.sum()
+            output_dict = {
+                "loss": loss,
+            }
+        
         return BatchFeature(data=output_dict)
 
     @torch.no_grad()
@@ -354,13 +513,18 @@ class FlowmatchingActionHead(nn.Module):
         state_features = self.state_encoder(action_input.state, embodiment_id)
 
         # Set initial actions as the sampled noise.
+        # Use encoder_action_dim for internal processing (compatible with pretrained model)
         batch_size = vl_embs.shape[0]
         device = vl_embs.device
         actions = torch.randn(
-            size=(batch_size, self.config.action_horizon, self.config.action_dim),
+            size=(batch_size, self.config.action_horizon, self.encoder_action_dim),
             dtype=vl_embs.dtype,
             device=device,
         )
+        # Zero out padded dimensions to match training behavior
+        # In training, padded dimensions (after actual_action_dim) are always 0
+        if self.encoder_action_dim != self.actual_action_dim:
+            actions[:, :, self.actual_action_dim:] = 0.0
 
         num_steps = self.num_inference_timesteps
         dt = 1.0 / num_steps
@@ -389,13 +553,44 @@ class FlowmatchingActionHead(nn.Module):
                 encoder_hidden_states=vl_embs,
                 timestep=timesteps_tensor,
             )
-            pred = self.action_decoder(model_output, embodiment_id)
-
-            pred_velocity = pred[:, -self.action_horizon :]
+            
+            # Slice out only the action portion of model output
+            model_output_actions = model_output[:, -self.action_horizon :]
+            
+            # Multi-head action prediction
+            if self.config.use_multi_action_heads:
+                pred_arm = self.action_arm_decoder(model_output_actions, embodiment_id)
+                pred_claw = self.action_claw_decoder(model_output_actions, embodiment_id)
+                pred_velocity = torch.cat([pred_arm, pred_claw], dim=-1)  # (B, T, action_dim)
+            else:
+                pred = self.action_decoder(model_output_actions, embodiment_id)
+                pred_velocity = pred
 
             # Update actions using euler integration.
-            actions = actions + dt * pred_velocity
-        return BatchFeature(data={"action_pred": actions})
+            # If using multi-head, pred_velocity is actual_action_dim, but actions is encoder_action_dim
+            if self.encoder_action_dim != self.actual_action_dim:
+                # Pad pred_velocity to match encoder_action_dim
+                if self.encoder_action_dim > self.actual_action_dim:
+                    pad_size = self.encoder_action_dim - self.actual_action_dim
+                    padding = torch.zeros(
+                        (pred_velocity.shape[0], pred_velocity.shape[1], pad_size),
+                        device=pred_velocity.device,
+                        dtype=pred_velocity.dtype
+                    )
+                    pred_velocity_padded = torch.cat([pred_velocity, padding], dim=-1)
+                else:
+                    pred_velocity_padded = pred_velocity[:, :, :self.encoder_action_dim]
+                actions = actions + dt * pred_velocity_padded
+                # Zero out the padded dimensions to match training behavior
+                # In training, the padded dimensions (after actual_action_dim) are always 0
+                # This ensures action_encoder receives consistent input format
+                actions[:, :, self.actual_action_dim:] = 0.0
+            else:
+                actions = actions + dt * pred_velocity
+        
+        # Return only the actual action dimensions
+        actions_output = actions[:, :, :self.actual_action_dim]
+        return BatchFeature(data={"action_pred": actions_output})
 
     @property
     def device(self):

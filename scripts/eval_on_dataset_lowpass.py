@@ -13,6 +13,7 @@ Usage:
         --episode <episode_number> \
         [--image-zero]  # Optional: set all images to zero to test model dependency on images
         [--state-zero]  # Optional: set all state inputs to zero to test model dependency on state
+        [--cam-head-zero]  # Optional: set cam_head (image) to zero to test model dependency on cam_head
 """
 
 import os, sys
@@ -212,6 +213,7 @@ def eval_on_dataset(ckpt_path,
                     show_progress=True,
                     image_zero=False,
                     state_zero=False,
+                    cam_head_zero=False,
                     infer_per_frame: int = 1,
                     task_description: str | None = None):
     """
@@ -303,6 +305,8 @@ def eval_on_dataset(ckpt_path,
         print(f"⚠️  IMAGE ZERO MODE: All image inputs will be set to zero (for dependency testing)")
     if state_zero:
         print(f"⚠️  STATE ZERO MODE: All state inputs will be set to zero (for dependency testing)")
+    if cam_head_zero:
+        print(f"⚠️  CAM_HEAD ZERO MODE: cam_head (image) will be set to zero (for dependency testing)")
     
     policy.eval().to(device)
     
@@ -501,6 +505,7 @@ def eval_on_dataset(ckpt_path,
     last_data_step = 0
     predictions = []
     ground_truths = []
+    inference_times = []  # 记录每次推理的时间
     
     # 使用tqdm显示进度（如果启用）
     iterator = tqdm(enumerate(dataloader), total=dataset.num_frames, desc="Processing") if show_progress else enumerate(dataloader)
@@ -554,6 +559,20 @@ def eval_on_dataset(ckpt_path,
                     # 保持相同的形状和设备，但将所有像素值设为0
                     observation[key] = torch.zeros_like(observation[key])
         
+        # 如果启用cam_head_zero模式，将cam_head（image）的图像输入置零（用于验证模型对cam_head的依赖性）
+        if cam_head_zero:
+            # cam_head对应的相机名称是"image"，观测键是"observation.images.cam_head"
+            cam_head_obs_key = "observation.images.cam_head"
+            if cam_head_obs_key in observation:
+                observation[cam_head_obs_key] = torch.zeros_like(observation[cam_head_obs_key])
+            else:
+                # 向后兼容：尝试使用"image"作为键名
+                fallback_key = "observation.images.image"
+                if fallback_key in observation:
+                    observation[fallback_key] = torch.zeros_like(observation[fallback_key])
+                elif data_step == 0:
+                    print(f"⚠️  Warning: cam_head observation key not found. Available keys: {[k for k in observation.keys() if 'image' in k.lower()]}")
+        
         # 添加 task 字段（language instruction）
         # 如果提供了 task_description，则使用它覆盖数据集中的 task；否则使用数据集原本的 task
         if task_description is not None:
@@ -590,9 +609,22 @@ def eval_on_dataset(ckpt_path,
             # 使用预处理器处理输入
             processed_observation = preprocessor(observation)
             
+            # 精确测量 predict_action_chunk 的推理时间
+            # 使用 CUDA 同步确保准确测量 GPU 推理时间
+            if device.startswith('cuda'):
+                torch.cuda.synchronize()
+            inference_start = time.perf_counter()
+            
             # 模型推理
             with torch.inference_mode():
                 pred_actions = policy.predict_action_chunk(processed_observation)
+            
+            # 确保 GPU 操作完成后再记录结束时间
+            if device.startswith('cuda'):
+                torch.cuda.synchronize()
+            inference_end = time.perf_counter()
+            inference_time = inference_end - inference_start
+            inference_times.append(inference_time)
             
             # 打印action维度
             print(f"pred_actions shape: {pred_actions.shape}")
@@ -618,8 +650,23 @@ def eval_on_dataset(ckpt_path,
                     print(f"⚠️  Warning: First frame but no previous prediction. Performing inference anyway.")
                     # 执行推理
                     processed_observation = preprocessor(observation)
+                    
+                    # 精确测量 predict_action_chunk 的推理时间
+                    # 使用 CUDA 同步确保准确测量 GPU 推理时间
+                    if device.startswith('cuda'):
+                        torch.cuda.synchronize()
+                    inference_start = time.perf_counter()
+                    
                     with torch.inference_mode():
                         pred_actions = policy.predict_action_chunk(processed_observation)
+                    
+                    # 确保 GPU 操作完成后再记录结束时间
+                    if device.startswith('cuda'):
+                        torch.cuda.synchronize()
+                    inference_end = time.perf_counter()
+                    inference_time = inference_end - inference_start
+                    inference_times.append(inference_time)
+                    
                     pred_action_single, pred_chunk = denormalize_actions(pred_actions, action_dim, dataset_stats)
                     last_inferred_chunk = pred_chunk.copy()
                     last_inference_step = data_step
@@ -876,6 +923,35 @@ def eval_on_dataset(ckpt_path,
     print("-" * 80)
     print(f'{"Overall":<20} {overall_mse:<15.8f} {overall_mae:<15.8f}')
     
+    # ========= 推理时间统计 =========
+    if len(inference_times) > 0:
+        print("\n" + "="*80)
+        print("⏱️  Inference Time Statistics")
+        print("="*80)
+        avg_inference_time = np.mean(inference_times)
+        min_inference_time = np.min(inference_times)
+        max_inference_time = np.max(inference_times)
+        median_inference_time = np.median(inference_times)
+        std_inference_time = np.std(inference_times)
+        
+        print(f"Total inference calls: {len(inference_times)}")
+        print(f"Average inference time: {avg_inference_time*1000:.2f} ms")
+        print(f"Median inference time: {median_inference_time*1000:.2f} ms")
+        print(f"Min inference time: {min_inference_time*1000:.2f} ms")
+        print(f"Max inference time: {max_inference_time*1000:.2f} ms")
+        print(f"Std inference time: {std_inference_time*1000:.2f} ms")
+        
+        # 计算理论最大推理频率（基于平均推理时间）
+        # 这表示如果连续推理，理论上可以达到的最大频率
+        if avg_inference_time > 0:
+            max_frequency = 1.0 / avg_inference_time
+            print(f"Max theoretical inference frequency: {max_frequency:.2f} Hz")
+            print(f"  (Based on average inference time: {avg_inference_time*1000:.2f} ms)")
+        
+        print("="*80)
+    else:
+        print("\n⚠️  Warning: No inference time statistics available (no inference was performed)")
+    
     # 分组统计 - 根据action维度选择统计方式
     print("\n📊 Grouped Statistics:")
     print("-" * 80)
@@ -939,6 +1015,8 @@ if __name__ == "__main__":
                        help='Set all image inputs to zero (for testing model dependency on images)')
     parser.add_argument('--state-zero', action='store_true',
                        help='Set all state inputs to zero (for testing model dependency on state)')
+    parser.add_argument('--cam-head-zero', action='store_true',
+                       help='Set cam_head (image) input to zero (for testing model dependency on cam_head)')
     parser.add_argument('--infer-per-frame', type=int, default=1,
                        help='Run policy inference every N frames (default: 1 = every frame)')
     parser.add_argument('--task-description', type=str, default=None,
@@ -956,6 +1034,7 @@ if __name__ == "__main__":
     print(f"MuJoCo Visualization: {args.with_mujoco}")
     print(f"Image Zero Mode: {args.image_zero}")
     print(f"State Zero Mode: {args.state_zero}")
+    print(f"Cam Head Zero Mode: {args.cam_head_zero}")
     print(f"Infer Every N Frames: {args.infer_per_frame}")
     if args.task_description:
         print(f"Task Description (overridden): '{args.task_description}'")
@@ -972,6 +1051,7 @@ if __name__ == "__main__":
         show_progress=not args.no_progress,
         image_zero=args.image_zero,
         state_zero=args.state_zero,
+        cam_head_zero=args.cam_head_zero,
         infer_per_frame=args.infer_per_frame,
         task_description=args.task_description
     )

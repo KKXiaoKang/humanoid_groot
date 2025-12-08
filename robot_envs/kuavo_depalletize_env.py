@@ -21,7 +21,7 @@ from tqdm import tqdm
 
 # from config import process_Image
 from configs.config import topic_info, TASK_DATA_MODE, STATE_COMPONENTS, ACTION_COMPONENTS, CAMERA_COMPONENTS, get_camera_names
-
+from configs.config import ROBOT_VERSION
 class TargetPublisher:
     """
     在这里定义各种发布
@@ -120,35 +120,8 @@ class ObsBuffer:
             print(f"📷 Camera configuration based on CAMERA_COMPONENTS ({CAMERA_COMPONENTS}):")
             print(f"   Detected {len(self.img_topic_map)} cameras: {list(self.img_topic_map.keys())}")
 
-        # obs
-        if USE_WBC_OBS:
-            self.obs_topic_map = {
-                'dof_state': {
-                    'topic': '/sensors_data_raw',
-                    'msg_type': sensorsData,
-                    'frequency': 30,
-                    'callback': self.common_callback,
-                },
-                'ang_vel': {
-                    'topic': '/state_estimate/imu_data_filtered/angularVel',
-                    'msg_type': Float64MultiArray,
-                    'frequency': 500,
-                    'callback': self.common_callback,
-                },
-                'lin_acc': {
-                    'topic': '/state_estimate/imu_data_filtered/linearAccel',
-                    'msg_type': Float64MultiArray,
-                    'frequency': 500,
-                    'callback': self.common_callback,
-                },
-                'humanoid_wbc_observation': {
-                    'topic': '/humanoid_wbc_observation',
-                    'msg_type': mpc_observation,
-                    'frequency': 500,
-                    'callback': self.common_callback,
-                },
-            }
-        else:
+        # 根据机器人版本初始化监听obs_topic_map:
+        if ROBOT_VERSION == "4_pro":
             self.obs_topic_map = {
                 # 手臂关节状态
                 'dof_state': {
@@ -176,6 +149,40 @@ class ObsBuffer:
                     'topic': '/state_estimate/imu_data_filtered/linearAccel',
                     'msg_type': Float64MultiArray,
                     'frequency': 500,
+                    'callback': self.common_callback,
+                },
+                # 夹爪状态（必需，因为状态空间包含夹爪状态）
+                'claw_state': {
+                    'topic': '/leju_claw_state',
+                    'msg_type': lejuClawState,
+                    'frequency': 30,
+                    'callback': self.common_callback,
+                },
+            }
+            
+            # 如果STATE_COMPONENTS包含Com_z_pitch，添加质心观测
+            if "Com_z_pitch" in STATE_COMPONENTS:
+                from ocs2_msgs.msg import mpc_observation
+                self.obs_topic_map['com_z_pitch'] = {
+                    'topic': '/humanoid_wbc_observation',
+                    'msg_type': mpc_observation,
+                    'frequency': 500,
+                    'callback': self.common_callback,
+                }
+        elif ROBOT_VERSION == "5_wheel":
+            self.obs_topic_map = {
+                # 手臂关节状态
+                'dof_state': {
+                    'topic': '/sensors_data_raw',
+                    'msg_type': sensorsData,
+                    'frequency': 30,
+                    'callback': self.common_callback,
+                },
+                # 手臂关节速度
+                'dof_state_vel': {
+                    'topic': '/sensors_data_raw',
+                    'msg_type': sensorsData,
+                    'frequency': 30,
                     'callback': self.common_callback,
                 },
                 # 夹爪状态（必需，因为状态空间包含夹爪状态）
