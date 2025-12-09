@@ -627,7 +627,7 @@ def set_arm_quick_mode(enable: bool) -> bool:
 def run_inference_loop(policy, preprocessor, env, dataset_stats, task_description, device, 
                        control_arm=True, control_claw=True, action_chunk_size=50, 
                        enable_gui=False, rotate_head_camera=False, state_zero=False,
-                       is_first_inference=True):
+                       is_first_inference=True, skip_chunk_ratio=0.0):
     """
     运行推理循环（可以多次调用，每次调用开始新的推理会话）
     
@@ -665,6 +665,8 @@ def run_inference_loop(policy, preprocessor, env, dataset_stats, task_descriptio
         print(f"🔄 Head camera rotation enabled: images from 'image' camera will be rotated 180 degrees")
     if state_zero:
         print(f"⚠️  STATE ZERO MODE: All state inputs will be set to zero (for dependency testing)")
+    if skip_chunk_ratio > 0.0:
+        print(f"⏭️  Skip chunk ratio: {skip_chunk_ratio*100:.1f}% (will skip first {skip_chunk_ratio*100:.1f}% of each predicted chunk)")
     print(f"📝 Task description: '{task_description}'")
     print("="*80 + "\n")
     
@@ -834,6 +836,18 @@ def run_inference_loop(policy, preprocessor, env, dataset_stats, task_descriptio
                     # 如果没有统计信息，使用原始值
                     action_chunk = pred_actions[0].cpu().numpy()  # (chunk_size, action_dim)
                     rospy.logwarn("⚠️ Warning: No dataset stats found. Using raw predictions (may be normalized).")
+
+                # 根据skip_chunk_ratio跳过chunk的前百分之多少
+                if skip_chunk_ratio > 0.0:
+                    chunk_size = action_chunk.shape[0]
+                    skip_steps = int(np.round(chunk_size * skip_chunk_ratio))
+                    if skip_steps >= chunk_size:
+                        rospy.logwarn(f"⚠️ Warning: skip_chunk_ratio {skip_chunk_ratio*100:.1f}% results in skipping all {chunk_size} steps. Using last step only.")
+                        action_chunk = action_chunk[-1:].copy()  # 至少保留最后一步
+                    elif skip_steps > 0:
+                        original_size = chunk_size
+                        action_chunk = action_chunk[skip_steps:].copy()
+                        rospy.loginfo(f"⏭️  Skipped first {skip_steps}/{original_size} steps ({skip_chunk_ratio*100:.1f}%) of chunk. Remaining: {action_chunk.shape[0]} steps")
 
                 # 根据动作维度动态确定claw维度
                 action_dim = action_chunk.shape[1]
@@ -1027,7 +1041,7 @@ def final_reset_arm(json_path, env, control_arm=True, control_claw=True):
     rospy.loginfo("Arm reset completed!")
 
 
-def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chunk_size=50, lerobot_dataset_path=None, enable_gui=False, rotate_head_camera=False, state_zero=False, task_description=None):
+def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chunk_size=50, lerobot_dataset_path=None, enable_gui=False, rotate_head_camera=False, state_zero=False, task_description=None, skip_chunk_ratio=0.0):
     """
     在这里和实机/仿真交互，做网络推理（depalletize任务）
     支持多次推理：按'q'退出当前推理，可以快速重新开始下一次推理而无需重新加载模型
@@ -1043,6 +1057,7 @@ def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chun
         rotate_head_camera: 是否旋转头部相机图像180度
         state_zero: 是否将状态输入置零（用于验证模型对状态的依赖性）
         task_description: 任务描述字符串（language instruction），如果为None则从数据集加载或使用默认值
+        skip_chunk_ratio: 跳过chunk的前百分之多少（0.0-1.0），例如0.2表示跳过前20%
     """
     
     # 加载模型和环境（只执行一次）
@@ -1092,7 +1107,8 @@ def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chun
                 enable_gui=enable_gui,
                 rotate_head_camera=rotate_head_camera,
                 state_zero=state_zero,
-                is_first_inference=is_first_inference
+                is_first_inference=is_first_inference,
+                skip_chunk_ratio=skip_chunk_ratio
             )
             
             if normal_exit:
@@ -1172,8 +1188,14 @@ if __name__ == '__main__':
                         help='If set, set all state inputs to zero (for testing model dependency on state)')
     parser.add_argument('--task-description', type=str, default=None,
                         help='Task description (language instruction) for the model. If not provided, will use the first task from dataset or a default value.')
+    parser.add_argument('--skip-chunk-ratio', type=float, default=0.0,
+                        help='Skip the first percentage of each predicted chunk (0.0-1.0). For example, 0.2 means skip the first 20%% of the chunk. Default: 0.0 (no skipping)')
     
     args = parser.parse_args()
+    
+    # 验证skip_chunk_ratio范围
+    if args.skip_chunk_ratio < 0.0 or args.skip_chunk_ratio >= 1.0:
+        parser.error(f"--skip-chunk-ratio must be in range [0.0, 1.0), got {args.skip_chunk_ratio}")
     
     # 根据命令行参数和相机配置初始化GUI窗口
     camera_config = {name: info for name, info in topic_info.items() if 'image' in name}
@@ -1204,6 +1226,8 @@ if __name__ == '__main__':
         print(f"📁 Dataset path (for stats): {args.lerobot_dataset_path}")
     if args.task_description:
         print(f"📝 Task description: '{args.task_description}'")
+    if args.skip_chunk_ratio > 0.0:
+        print(f"⏭️  Skip chunk ratio: {args.skip_chunk_ratio*100:.1f}% (will skip first {args.skip_chunk_ratio*100:.1f}% of each predicted chunk)")
     print("="*80 + "\n")
 
     if args.eval:
@@ -1214,7 +1238,8 @@ if __name__ == '__main__':
              enable_gui=args.enable_gui,
              rotate_head_camera=args.rotate_head_camera,
              state_zero=args.state_zero,
-             task_description=args.task_description)
+             task_description=args.task_description,
+             skip_chunk_ratio=args.skip_chunk_ratio)
     elif args.replay:
         print("Replaying the model")
         lerobot_dataset_path = '/home/lab/kuavo-manip/lerobot_data/vel_wrend_box_613'
