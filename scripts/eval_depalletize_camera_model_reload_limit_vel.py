@@ -1,4 +1,6 @@
 import sys, os
+
+from pandas.core.missing import F
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import cv2
@@ -7,6 +9,65 @@ import rosbag
 from sensor_msgs.msg import JointState
 import json
 from std_srvs.srv import Trigger, TriggerRequest, SetBool, SetBoolRequest
+
+def resample_actions_with_speed_limit(actions: np.ndarray, dt: float, v_max, arm_dims: slice = slice(None)):
+    '''
+        resample actions (joint positions) which satisfy joint velocity limits
+        Only applies speed limit to arm dimensions, other dimensions are interpolated normally
+        
+        Args:
+            actions: Array of shape (T, D) where T is number of timesteps, D is action dimension
+            dt: Time interval between actions (seconds)
+            v_max: Maximum velocity (rad/s). Can be scalar or array of shape (arm_dim,)
+            arm_dims: Slice or indices specifying which dimensions are arm joints (to apply speed limit)
+        
+        Returns:
+            Array of shape (M, D) where M >= T, with speed-limited resampling
+    '''
+    T, D = actions.shape
+    actions = np.asarray(actions)
+    
+    # Convert v_max to array format
+    v_max = np.asarray(v_max)
+    if v_max.ndim == 0:
+        # If scalar, apply to all arm dimensions
+        if isinstance(arm_dims, slice):
+            arm_dim_size = len(range(*arm_dims.indices(D)))
+        else:
+            arm_dim_size = len(arm_dims)
+        v_max = np.full(arm_dim_size, v_max)
+    
+    new_actions = [actions[0]]
+
+    for t in range(T-1):
+        a0 = actions[t]
+        a1 = actions[t+1]
+
+        # Extract arm dimensions
+        if isinstance(arm_dims, slice):
+            arm_a0 = a0[arm_dims]
+            arm_a1 = a1[arm_dims]
+        else:
+            arm_a0 = a0[arm_dims]
+            arm_a1 = a1[arm_dims]
+
+        delta = arm_a1 - arm_a0
+        v_required = np.abs(delta) / dt
+
+        # Calculate scale factor based on arm velocity limits
+        scale = np.max(v_required / v_max) if len(v_max) > 0 and np.any(v_max > 0) else 1.0
+        scale = max(scale, 1.0)
+
+        # number of sub_steps
+        num_sub = int(np.ceil(scale))
+
+        # interpolate all dimensions
+        for s in range(1, num_sub + 1):
+            alpha = s / num_sub
+            new_a = a0 * (1 - alpha) + a1 * alpha
+            new_actions.append(new_a)
+
+    return np.stack(new_actions, axis=0)
 
 # Initialize GUI windows if requested
 def init_gui_windows(enable_gui=False, camera_config=None):
@@ -83,7 +144,7 @@ TARGET_CONTROL_DT = 1.0 / TARGET_CONTROL_FREQUENCY
 CHUNK_TRANSITION_DURATION_S = 0.2  # seconds of low-pass smoothing at chunk boundary
 LOWPASS_ALPHA = 0.85  # closer to 1 => smoother (slower) transitions
 ENABLE_CHUNK_TRANSITION_LOWPASS = True  # Enable/disable low-pass filtering at chunk boundaries (default: False, only linear interpolation within chunks)
-
+FIRST_MODEL_INFERENCE = True
 
 def resample_action_chunk(action_chunk: np.ndarray,
                           source_dt: float = MODEL_ACTION_DT,
@@ -631,7 +692,8 @@ def set_arm_quick_mode(enable: bool) -> bool:
 def run_inference_loop(policy, preprocessor, env, dataset_stats, task_description, device, 
                        control_arm=True, control_claw=True, action_chunk_size=50, 
                        enable_gui=False, rotate_head_camera=False, state_zero=False,
-                       is_first_inference=True, skip_chunk_ratio=0.0, model_action_dt=None):
+                       is_first_inference=True, skip_chunk_ratio=0.0, model_action_dt=None,
+                       sync_mode=False, max_joint_velocity=None):
     """
     运行推理循环（可以多次调用，每次调用开始新的推理会话）
     
@@ -651,10 +713,13 @@ def run_inference_loop(policy, preprocessor, env, dataset_stats, task_descriptio
         is_first_inference: 是否是第一次推理（第一次会加载bag文件，后续使用json文件重置）
         skip_chunk_ratio: 跳过chunk的前百分之多少
         model_action_dt: 模型动作时间间隔（秒），控制推理频率。如果为None，使用全局MODEL_ACTION_DT
+        sync_mode: 是否使用同步推理模式。如果True，推理一个chunk -> 执行完整个chunk -> get_obs -> 再推理下一个chunk
+        max_joint_velocity: 最大关节速度限制（rad/s）。如果提供，将对arm关节应用速度限制
     
     Returns:
         bool: True表示正常退出（按q），False表示被中断（Ctrl+C）
     """
+    global FIRST_MODEL_INFERENCE
     # 使用传入的model_action_dt或全局MODEL_ACTION_DT
     if model_action_dt is None:
         model_action_dt = MODEL_ACTION_DT
@@ -677,7 +742,12 @@ def run_inference_loop(policy, preprocessor, env, dataset_stats, task_descriptio
         print(f"⚠️  STATE ZERO MODE: All state inputs will be set to zero (for dependency testing)")
     if skip_chunk_ratio > 0.0:
         print(f"⏭️  Skip chunk ratio: {skip_chunk_ratio*100:.1f}% (will skip first {skip_chunk_ratio*100:.1f}% of each predicted chunk)")
-    print(f"⚡ Model action DT: {model_action_dt:.3f}s (inference frequency: {model_action_frequency:.1f} Hz)")
+    if sync_mode:
+        print(f"🔄 Sync mode: Enabled (inference -> execute chunk -> get_obs -> repeat)")
+    else:
+        print(f"⚡ Model action DT: {model_action_dt:.3f}s (inference frequency: {model_action_frequency:.1f} Hz)")
+    if max_joint_velocity is not None:
+        print(f"🚦 Max joint velocity limit: {max_joint_velocity:.2f} rad/s")
     print(f"📝 Task description: '{task_description}'")
     print("="*80 + "\n")
     
@@ -735,6 +805,7 @@ def run_inference_loop(policy, preprocessor, env, dataset_stats, task_descriptio
         
         input(f"轨迹回放 结束, 按回车继续 ==== 轨迹回放成功 ==== \n")
         time.sleep(1.0)
+        
         # 重要：在bag回放完成后，重新获取最新的观测数据
         # 这样才能获取到bag回放后的真实手臂位置
         rospy.loginfo("🔄 Updating observation data after bag replay...")
@@ -749,6 +820,343 @@ def run_inference_loop(policy, preprocessor, env, dataset_stats, task_descriptio
     print("💡 Press Ctrl+C to exit the program completely")
     print("="*80 + "\n")
     
+    # 同步模式：执行完整个chunk后再推理下一个
+    if sync_mode:
+        while True:
+            try:
+                # 准备观测
+                state = torch.from_numpy(obs_data["state"]).float()
+                observation = {}
+                
+                # 根据CAMERA_COMPONENTS动态处理相机图像
+                camera_names = get_camera_names(CAMERA_COMPONENTS)
+                for camera_name in camera_names:
+                    if camera_name in obs_data:
+                        camera_img_np = obs_data[camera_name]
+                        if camera_img_np.ndim != 4:
+                            rospy.logwarn(f"⚠️  Unexpected camera image shape: {camera_img_np.shape}, expected (T, H, W, C)")
+                            continue
+                        if rotate_head_camera and camera_name == "image":
+                            camera_img_np = np.rot90(camera_img_np, k=2, axes=(1, 2)).copy()
+                        camera_images = torch.from_numpy(np.moveaxis(camera_img_np, 3, 1).copy()).float() / 255
+                        obs_key = get_camera_observation_key(camera_name, use_image_features=False)
+                        observation[obs_key] = camera_images.to('cuda:0')
+                    elif step_counter == 0:
+                        rospy.logwarn(f"⚠️  Camera '{camera_name}' from CAMERA_COMPONENTS not found in obs_data.")
+                
+                if state_zero:
+                    observation['observation.state'] = torch.zeros_like(state).to('cuda:0')
+                else:
+                    observation['observation.state'] = state.to('cuda:0')
+                observation['task'] = task_description
+                
+                # 推理
+                processed_observation = preprocessor(observation)
+                with torch.inference_mode():
+                    pred_actions = policy.predict_action_chunk(processed_observation)
+                
+                # 反归一化
+                if dataset_stats and 'action' in dataset_stats:
+                    action_stats = dataset_stats['action']
+                    if 'min' in action_stats and 'max' in action_stats:
+                        action_min = torch.as_tensor(action_stats['min'], dtype=torch.float32, device=pred_actions.device)
+                        action_max = torch.as_tensor(action_stats['max'], dtype=torch.float32, device=pred_actions.device)
+                        action_dim = pred_actions.shape[-1]
+                        if action_min.numel() < action_dim:
+                            action_min = torch.nn.functional.pad(action_min.flatten()[:action_dim], (0, max(0, action_dim - action_min.numel())))
+                        if action_max.numel() < action_dim:
+                            action_max = torch.nn.functional.pad(action_max.flatten()[:action_dim], (0, max(0, action_dim - action_max.numel())))
+                        action_min = action_min[:action_dim]
+                        action_max = action_max[:action_dim]
+                        denom = action_max - action_min
+                        mask = denom != 0
+                        safe_denom = torch.where(mask, denom, torch.ones_like(denom))
+                        pred_actions_unnorm = (pred_actions + 1.0) * 0.5 * safe_denom + action_min
+                        pred_actions_unnorm = torch.where(mask, pred_actions_unnorm, action_min)
+                        action_chunk = pred_actions_unnorm[0].cpu().numpy()
+                    else:
+                        action_chunk = pred_actions[0].cpu().numpy()
+                else:
+                    action_chunk = pred_actions[0].cpu().numpy()
+                
+                # 跳过chunk的前百分之多少
+                if skip_chunk_ratio > 0.0:
+                    chunk_size = action_chunk.shape[0]
+                    skip_steps = int(np.round(chunk_size * skip_chunk_ratio))
+                    if skip_steps >= chunk_size:
+                        rospy.logwarn(f"⚠️ Warning: skip_chunk_ratio {skip_chunk_ratio*100:.1f}% results in skipping all {chunk_size} steps.")
+                        action_chunk = action_chunk[-1:].copy()
+                    elif skip_steps > 0:
+                        action_chunk = action_chunk[skip_steps:].copy()
+                        rospy.loginfo(f"⏭️  Skipped first {skip_steps}/{chunk_size} steps ({skip_chunk_ratio*100:.1f}%)")
+
+                # 确定arm和claw维度（需要在FIRST_MODEL_INFERENCE检查之前确定，以便提取手臂状态）
+                action_dim = action_chunk.shape[1]
+                if action_dim == 16:
+                    arm_dims = slice(0, 14)
+                    claw_dims = slice(14, 16)
+                elif action_dim == 18:
+                    arm_dims = slice(0, 14)
+                    claw_dims = slice(14, 16)
+                else:
+                    arm_dims = slice(0, 14)
+                    claw_dims = slice(14, min(16, action_dim))
+                
+                # 如果是第一次模型推理，需要在当前状态和第一个action之间进行插值
+                # 将插值动作序列和chunk合并，统一进行resample和速度限制处理
+                transition_chunk = None
+                if FIRST_MODEL_INFERENCE:
+                    rospy.loginfo("🔄 First model inference: generating smooth transition from current robot state to first action")
+                    
+                    # 获取当前机器人的手臂状态
+                    current_arm_state = obs_data["state"][0][arm_dims]  # 当前手臂关节位置（14维）
+                    
+                    # 获取当前夹爪状态
+                    current_claw_state = np.array([0.0, 0.0])  # 默认值
+                    try:
+                        if 'claw_state' in robot_obs and len(robot_obs['claw_state']) > 0:
+                            claw_data = robot_obs['claw_state']
+                            if claw_data.ndim == 2:
+                                current_claw_state = np.array(claw_data[-1], dtype=np.float32)
+                            elif claw_data.ndim == 1:
+                                current_claw_state = np.array(claw_data, dtype=np.float32)
+                            if current_claw_state.shape[0] != 2:
+                                current_claw_state = np.array([0.0, 0.0])
+                    except Exception as e:
+                        rospy.logwarn(f"Could not get current claw state: {e}, using default [0.0, 0.0]")
+                        current_claw_state = np.array([0.0, 0.0])
+                    
+                    # 获取第一个chunk的第一个action（已经跳过skip_chunk_ratio之后）
+                    if action_chunk.shape[0] > 0:
+                        first_action = action_chunk[0].copy()
+                        target_arm_state = first_action[arm_dims]  # 目标手臂关节位置
+                        target_claw_state = first_action[claw_dims]  # 目标夹爪位置
+                        
+                        # 检查是否需要cmd_pose
+                        has_cmd_pose = ("Cmd_pose_z" in ACTION_COMPONENTS or "Cmd_pose_pitch" in ACTION_COMPONENTS)
+                        if has_cmd_pose and action_dim >= 18:
+                            target_cmd_pose = first_action[16:18]
+                            current_cmd_pose = np.array([0.0, 0.0])  # 默认cmd_pose
+                        else:
+                            target_cmd_pose = None
+                            current_cmd_pose = None
+                        
+                        # 计算插值参数
+                        transition_duration = 0.2  # 过渡时间（秒），第一次推理时快速过渡到第一个action
+                        num_interp_steps = int(round(transition_duration / env.control_dt))
+                        num_interp_steps = max(1, num_interp_steps)  # 至少1步
+                        
+                        rospy.loginfo(f"   Current arm state: {current_arm_state}... (showing first 3 joints)")
+                        rospy.loginfo(f"   Target arm state: {target_arm_state}... (showing first 3 joints)")
+                        rospy.loginfo(f"   Generating {num_interp_steps} interpolation steps over {transition_duration:.2f}s")
+                        
+                        # 生成插值动作序列（作为过渡chunk，不立即执行）
+                        interp_actions = []
+                        for i in range(num_interp_steps):
+                            alpha = (i + 1) / num_interp_steps  # 从1/num_steps到1.0
+                            
+                            # 线性插值手臂关节
+                            interp_arm = current_arm_state + (target_arm_state - current_arm_state) * alpha
+                            
+                            # 线性插值夹爪
+                            interp_claw = current_claw_state + (target_claw_state - current_claw_state) * alpha
+                            
+                            # 构建完整的action
+                            if has_cmd_pose and target_cmd_pose is not None:
+                                # 18维格式：插值cmd_pose
+                                interp_cmd_pose = current_cmd_pose + (target_cmd_pose - current_cmd_pose) * alpha
+                                interp_action = np.concatenate([interp_arm, interp_claw, interp_cmd_pose])
+                            else:
+                                # 16维格式
+                                interp_action = np.concatenate([interp_arm, interp_claw])
+                            
+                            interp_actions.append(interp_action)
+                        
+                        # 将插值动作序列转换为numpy数组（作为过渡chunk）
+                        transition_chunk = np.array(interp_actions)  # shape: (num_interp_steps, action_dim)
+                        rospy.loginfo(f"   Generated transition chunk of size {transition_chunk.shape[0]}")
+                        
+                        # 将过渡chunk和原始chunk合并
+                        # 注意：transition_chunk的最后一个action应该等于first_action（或非常接近）
+                        # 但为了确保连续性，我们将transition_chunk和action_chunk合并
+                        action_chunk = np.vstack([transition_chunk, action_chunk])
+                        rospy.loginfo(f"   Combined transition + chunk: {transition_chunk.shape[0]} + {action_chunk.shape[0] - transition_chunk.shape[0]} = {action_chunk.shape[0]} steps")
+                    else:
+                        rospy.logwarn("⚠️  Warning: action_chunk is empty after skip_chunk_ratio, cannot generate transition")
+                    
+                    FIRST_MODEL_INFERENCE = False
+                
+                # 如果需要连接上一个chunk，添加桥接
+                if last_executed_action is not None:
+                    # 在chunk前添加上一个action，确保chunk间平滑连接
+                    action_chunk_with_bridge = np.vstack([last_executed_action, action_chunk])
+                else:
+                    action_chunk_with_bridge = action_chunk
+                
+                # 应用速度限制（如果提供）
+                if max_joint_velocity is not None:
+                    # 保存原始chunk的夹爪值（在速度限制前）
+                    original_chunk_for_claw = action_chunk.copy()
+                    
+                    # 使用控制频率的dt
+                    control_dt = env.control_dt
+                    
+                    # 如果有transition_chunk，需要分开处理：transition部分不应用速度限制（快速过渡），chunk部分应用速度限制
+                    if transition_chunk is not None:
+                        transition_size = transition_chunk.shape[0]
+                        transition_part = action_chunk[:transition_size]  # transition部分（不应用速度限制）
+                        chunk_part = action_chunk[transition_size:]  # chunk部分（应用速度限制）
+                        
+                        # 对chunk部分进行resample到control_dt频率
+                        if chunk_part.shape[0] > 0:
+                            resampled_chunk_part = resample_action_chunk(
+                                chunk_part,
+                                source_dt=model_action_dt if model_action_dt is not None else DEFAULT_MODEL_ACTION_DT,
+                                target_dt=control_dt
+                            )
+                            
+                            # 对chunk部分应用速度限制（不包括transition部分）
+                            # 需要连接transition的最后一个action和chunk部分
+                            if transition_size > 0:
+                                chunk_with_transition_end = np.vstack([transition_part[-1:], resampled_chunk_part])
+                                resampled_chunk_part = resample_actions_with_speed_limit(
+                                    chunk_with_transition_end,
+                                    dt=control_dt,
+                                    v_max=max_joint_velocity,
+                                    arm_dims=arm_dims
+                                )[1:]  # 移除transition的最后一个action
+                            
+                            # 合并transition（不应用速度限制）和resampled chunk（已应用速度限制）
+                            action_chunk = np.vstack([transition_part, resampled_chunk_part])
+                        else:
+                            # 如果chunk部分为空，只保留transition部分
+                            action_chunk = transition_part
+                    else:
+                        # 没有transition_chunk，正常处理整个chunk
+                        # 如果需要连接上一个chunk，添加桥接
+                        if last_executed_action is not None:
+                            action_chunk_with_bridge = np.vstack([last_executed_action, action_chunk])
+                        else:
+                            action_chunk_with_bridge = action_chunk
+                        
+                        # 只对手臂关节应用速度限制
+                        action_chunk_with_bridge = resample_actions_with_speed_limit(
+                            action_chunk_with_bridge,
+                            dt=control_dt,
+                            v_max=max_joint_velocity,
+                            arm_dims=arm_dims
+                        )
+                        # 移除桥接的action（如果添加了）
+                        if last_executed_action is not None:
+                            action_chunk = action_chunk_with_bridge[1:]
+                        else:
+                            action_chunk = action_chunk_with_bridge
+                    
+                    # 对夹爪应用zero-order hold（从原始chunk中提取）
+                    if action_chunk.shape[0] > 0 and original_chunk_for_claw.shape[0] > 0:
+                        # 将夹爪值插值到resampled chunk的时间点
+                        if original_chunk_for_claw.shape[0] > 1:
+                            # 对于合并后的chunk（包含transition），需要特殊处理
+                            # transition部分使用control_dt，chunk部分使用model_action_dt
+                            if transition_chunk is not None:
+                                # transition部分：使用control_dt
+                                transition_duration = transition_chunk.shape[0] * control_dt
+                                # chunk部分：使用model_action_dt
+                                source_dt_used = model_action_dt if model_action_dt is not None else DEFAULT_MODEL_ACTION_DT
+                                chunk_duration = (original_chunk_for_claw.shape[0] - transition_chunk.shape[0]) * source_dt_used
+                                
+                                # 构建源时间轴（transition部分 + chunk部分）
+                                transition_times = np.linspace(0.0, transition_duration, num=transition_chunk.shape[0], endpoint=False)
+                                chunk_start_time = transition_duration
+                                chunk_times = np.linspace(chunk_start_time, chunk_start_time + chunk_duration, 
+                                                        num=original_chunk_for_claw.shape[0] - transition_chunk.shape[0])
+                                source_times = np.concatenate([transition_times, chunk_times])
+                            else:
+                                source_dt_used = model_action_dt if model_action_dt is not None else DEFAULT_MODEL_ACTION_DT
+                                source_times = np.linspace(0.0, source_dt_used * (original_chunk_for_claw.shape[0] - 1), num=original_chunk_for_claw.shape[0])
+                            
+                            target_times = np.linspace(0.0, control_dt * (action_chunk.shape[0] - 1), num=action_chunk.shape[0])
+                            hold_indices = np.searchsorted(source_times, target_times, side="right") - 1
+                            hold_indices = np.clip(hold_indices, 0, original_chunk_for_claw.shape[0] - 1)
+                            action_chunk[:, claw_dims] = original_chunk_for_claw[hold_indices][:, claw_dims]
+                        else:
+                            action_chunk[:, claw_dims] = original_chunk_for_claw[0, claw_dims]
+                else:
+                    # 如果没有速度限制，使用resample_chunk_with_claw_hold来保持夹爪的zero-order hold
+                    # 但如果有transition_chunk，需要特殊处理
+                    if transition_chunk is not None:
+                        # 对于包含transition的情况，需要分别处理transition和chunk部分
+                        # transition部分已经是在control_dt频率下，不需要resample
+                        # chunk部分需要resample
+                        transition_size = transition_chunk.shape[0]
+                        chunk_part = action_chunk[transition_size:]
+                        if chunk_part.shape[0] > 0:
+                            resampled_chunk_part = resample_chunk_with_claw_hold(
+                                chunk_part,
+                                previous_action=action_chunk[transition_size - 1] if transition_size > 0 else last_executed_action,
+                                control_frequency=env.control_frequency,
+                                source_dt=model_action_dt if model_action_dt is not None else DEFAULT_MODEL_ACTION_DT,
+                                arm_dims=arm_dims,
+                                claw_dims=claw_dims
+                            )
+                            action_chunk = np.vstack([action_chunk[:transition_size], resampled_chunk_part])
+                    else:
+                        action_chunk = resample_chunk_with_claw_hold(
+                            action_chunk,
+                            previous_action=last_executed_action,
+                            control_frequency=env.control_frequency,
+                            source_dt=model_action_dt if model_action_dt is not None else DEFAULT_MODEL_ACTION_DT,
+                            arm_dims=arm_dims,
+                            claw_dims=claw_dims
+                        )
+                
+                # 执行整个chunk
+                rospy.loginfo(f"Executing chunk of size {action_chunk.shape[0]} in sync mode")
+                control_cmd_pose = ("Cmd_pose_z" in ACTION_COMPONENTS or "Cmd_pose_pitch" in ACTION_COMPONENTS)
+                
+                for action_step in action_chunk:
+                    env.exec_actions(actions=action_step,
+                                     control_arm=control_arm,
+                                     control_claw=control_claw,
+                                     control_cmd_pose=control_cmd_pose)
+                    step_counter += 1
+                    last_executed_action = action_step.copy()
+                    
+                    # 键盘监听
+                    key = 0
+                    if enable_gui:
+                        key = cv2.waitKey(1) & 0xFF
+                    else:
+                        try:
+                            import select
+                            if select.select([sys.stdin], [], [], 0)[0]:
+                                import termios
+                                import tty
+                                old_settings = termios.tcgetattr(sys.stdin)
+                                try:
+                                    tty.setraw(sys.stdin.fileno())
+                                    ch = sys.stdin.read(1)
+                                    if ch:
+                                        key = ord(ch)
+                                finally:
+                                    termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+                        except (ImportError, OSError, AttributeError):
+                            pass
+                    
+                    if key == ord('q') or key == 27:
+                        print("\n[Keyboard] Stopping current inference by user request")
+                        FIRST_MODEL_INFERENCE = True
+                        return True
+                
+                # 执行完chunk后，获取新的观测
+                obs_data, camera_obs, camera_obs_ts, robot_obs, robot_obs_ts = env.get_obs()
+                
+            except KeyboardInterrupt:
+                print("\n[Interrupted] Exiting by user Ctrl+C.")
+                FIRST_MODEL_INFERENCE = True
+                return False
+    
+    # 异步模式：原有的实现
     while True:
         try:
             state = torch.from_numpy(obs_data["state"]).float()
@@ -881,14 +1289,220 @@ def run_inference_loop(policy, preprocessor, env, dataset_stats, task_descriptio
                     claw_dims = slice(14, min(16, action_dim))
                     rospy.logwarn(f"Unknown action dimension {action_dim}, using default arm/claw split")
                 
-                resampled_chunk = resample_chunk_with_claw_hold(
-                    action_chunk,
-                    previous_action=last_executed_action,
-                    control_frequency=env.control_frequency,
-                    source_dt=model_action_dt,
-                    arm_dims=arm_dims,
-                    claw_dims=claw_dims
-                )
+                # 如果是第一次模型推理，需要在当前状态和第一个action之间进行插值
+                # 将插值动作序列和chunk合并，统一进行resample和速度限制处理
+                transition_chunk = None
+                if FIRST_MODEL_INFERENCE and action_chunk.shape[0] > 0:
+                    rospy.loginfo("🔄 First model inference (async mode): generating smooth transition from current robot state to first action")
+                    
+                    # 在异步模式下，需要先获取最新的obs_data和robot_obs（确保获取到bag回放后的真实状态）
+                    obs_data, camera_obs, camera_obs_ts, robot_obs_for_transition, robot_obs_ts = env.get_obs()
+                    
+                    # 获取当前机器人的手臂状态
+                    current_arm_state = obs_data["state"][0][arm_dims]  # 当前手臂关节位置（14维）
+                    
+                    # 获取当前夹爪状态
+                    current_claw_state = np.array([0.0, 0.0])  # 默认值
+                    try:
+                        if 'claw_state' in robot_obs_for_transition and len(robot_obs_for_transition['claw_state']) > 0:
+                            claw_data = robot_obs_for_transition['claw_state']
+                            if claw_data.ndim == 2:
+                                current_claw_state = np.array(claw_data[-1], dtype=np.float32)
+                            elif claw_data.ndim == 1:
+                                current_claw_state = np.array(claw_data, dtype=np.float32)
+                            if current_claw_state.shape[0] != 2:
+                                current_claw_state = np.array([0.0, 0.0])
+                    except Exception as e:
+                        rospy.logwarn(f"Could not get current claw state: {e}, using default [0.0, 0.0]")
+                        current_claw_state = np.array([0.0, 0.0])
+                    
+                    # 获取第一个chunk的第一个action（已经跳过skip_chunk_ratio之后）
+                    first_action = action_chunk[0].copy()
+                    target_arm_state = first_action[arm_dims]  # 目标手臂关节位置
+                    target_claw_state = first_action[claw_dims]  # 目标夹爪位置
+                    
+                    # 检查是否需要cmd_pose
+                    has_cmd_pose = ("Cmd_pose_z" in ACTION_COMPONENTS or "Cmd_pose_pitch" in ACTION_COMPONENTS)
+                    if has_cmd_pose and action_dim >= 18:
+                        target_cmd_pose = first_action[16:18]
+                        current_cmd_pose = np.array([0.0, 0.0])  # 默认cmd_pose
+                    else:
+                        target_cmd_pose = None
+                        current_cmd_pose = None
+                    
+                    # 计算插值参数
+                    transition_duration = 0.2  # 过渡时间（秒），第一次推理时快速过渡到第一个action
+                    num_interp_steps = int(round(transition_duration / env.control_dt))
+                    num_interp_steps = max(1, num_interp_steps)  # 至少1步
+                    
+                    rospy.loginfo(f"   Current arm state: {current_arm_state[:3]}... (showing first 3 joints)")
+                    rospy.loginfo(f"   Target arm state: {target_arm_state[:3]}... (showing first 3 joints)")
+                    rospy.loginfo(f"   Generating {num_interp_steps} interpolation steps over {transition_duration:.2f}s")
+                    
+                    # 生成插值动作序列（作为过渡chunk，不立即执行）
+                    interp_actions = []
+                    for i in range(num_interp_steps):
+                        alpha = (i + 1) / num_interp_steps  # 从1/num_steps到1.0
+                        
+                        # 线性插值手臂关节
+                        interp_arm = current_arm_state + (target_arm_state - current_arm_state) * alpha
+                        
+                        # 线性插值夹爪
+                        interp_claw = current_claw_state + (target_claw_state - current_claw_state) * alpha
+                        
+                        # 构建完整的action
+                        if has_cmd_pose and target_cmd_pose is not None:
+                            # 18维格式：插值cmd_pose
+                            interp_cmd_pose = current_cmd_pose + (target_cmd_pose - current_cmd_pose) * alpha
+                            interp_action = np.concatenate([interp_arm, interp_claw, interp_cmd_pose])
+                        else:
+                            # 16维格式
+                            interp_action = np.concatenate([interp_arm, interp_claw])
+                        
+                        interp_actions.append(interp_action)
+                    
+                    # 将插值动作序列转换为numpy数组（作为过渡chunk）
+                    transition_chunk = np.array(interp_actions)  # shape: (num_interp_steps, action_dim)
+                    rospy.loginfo(f"   Generated transition chunk of size {transition_chunk.shape[0]}")
+                    
+                    # 将过渡chunk和原始chunk合并
+                    action_chunk = np.vstack([transition_chunk, action_chunk])
+                    rospy.loginfo(f"   Combined transition + chunk: {transition_chunk.shape[0]} + {action_chunk.shape[0] - transition_chunk.shape[0]} = {action_chunk.shape[0]} steps")
+                    
+                    FIRST_MODEL_INFERENCE = False
+                
+                # 如果需要连接上一个chunk，添加桥接
+                if last_executed_action is not None:
+                    action_chunk_with_bridge = np.vstack([last_executed_action, action_chunk])
+                else:
+                    action_chunk_with_bridge = action_chunk
+                
+                # 应用速度限制（如果提供）
+                if max_joint_velocity is not None:
+                    # 保存原始chunk的夹爪值（在速度限制前）
+                    original_chunk_for_claw = action_chunk.copy()
+                    
+                    # 如果有transition_chunk，需要分开处理：transition部分不应用速度限制（快速过渡），chunk部分应用速度限制
+                    if transition_chunk is not None:
+                        transition_size = transition_chunk.shape[0]
+                        transition_part = action_chunk[:transition_size]  # transition部分（不应用速度限制）
+                        chunk_part = action_chunk[transition_size:]  # chunk部分（应用速度限制）
+                        
+                        # 对chunk部分进行resample到control_dt频率
+                        if chunk_part.shape[0] > 0:
+                            resampled_chunk_part = resample_action_chunk(
+                                chunk_part,
+                                source_dt=model_action_dt,
+                                target_dt=env.control_dt
+                            )
+                            
+                            # 对chunk部分应用速度限制（不包括transition部分）
+                            # 需要连接transition的最后一个action和chunk部分
+                            if transition_size > 0:
+                                chunk_with_transition_end = np.vstack([transition_part[-1:], resampled_chunk_part])
+                                resampled_chunk_part = resample_actions_with_speed_limit(
+                                    chunk_with_transition_end,
+                                    dt=env.control_dt,
+                                    v_max=max_joint_velocity,
+                                    arm_dims=arm_dims
+                                )[1:]  # 移除transition的最后一个action
+                            
+                            # 合并transition（不应用速度限制）和resampled chunk（已应用速度限制）
+                            resampled_chunk = np.vstack([transition_part, resampled_chunk_part])
+                        else:
+                            # 如果chunk部分为空，只保留transition部分
+                            resampled_chunk = transition_part
+                    else:
+                        # 没有transition_chunk，正常处理整个chunk
+                        # 先resample到控制频率
+                        if last_executed_action is not None:
+                            resampled_bridge = resample_action_chunk(
+                                action_chunk_with_bridge,
+                                source_dt=model_action_dt,
+                                target_dt=env.control_dt
+                            )
+                            resampled_chunk = resampled_bridge[1:]  # 移除桥接的action
+                        else:
+                            resampled_chunk = resample_action_chunk(
+                                action_chunk,
+                                source_dt=model_action_dt,
+                                target_dt=env.control_dt
+                            )
+                        
+                        # 应用速度限制到arm关节
+                        if last_executed_action is not None:
+                            # 将上一个action和resampled chunk连接，应用速度限制
+                            chunk_with_prev = np.vstack([last_executed_action, resampled_chunk])
+                            resampled_chunk = resample_actions_with_speed_limit(
+                                chunk_with_prev,
+                                dt=env.control_dt,
+                                v_max=max_joint_velocity,
+                                arm_dims=arm_dims
+                            )[1:]  # 移除桥接的action
+                        else:
+                            resampled_chunk = resample_actions_with_speed_limit(
+                                resampled_chunk,
+                                dt=env.control_dt,
+                                v_max=max_joint_velocity,
+                                arm_dims=arm_dims
+                            )
+                    
+                    # 对夹爪应用zero-order hold（从原始chunk中提取）
+                    if resampled_chunk.shape[0] > 0 and original_chunk_for_claw.shape[0] > 0:
+                        # 将夹爪值插值到resampled chunk的时间点
+                        if original_chunk_for_claw.shape[0] > 1:
+                            # 对于合并后的chunk（包含transition），需要特殊处理
+                            if transition_chunk is not None:
+                                # transition部分：使用control_dt
+                                transition_duration = transition_chunk.shape[0] * env.control_dt
+                                # chunk部分：使用model_action_dt
+                                chunk_duration = (original_chunk_for_claw.shape[0] - transition_chunk.shape[0]) * model_action_dt
+                                
+                                # 构建源时间轴（transition部分 + chunk部分）
+                                transition_times = np.linspace(0.0, transition_duration, num=transition_chunk.shape[0], endpoint=False)
+                                chunk_start_time = transition_duration
+                                chunk_times = np.linspace(chunk_start_time, chunk_start_time + chunk_duration, 
+                                                        num=original_chunk_for_claw.shape[0] - transition_chunk.shape[0])
+                                source_times = np.concatenate([transition_times, chunk_times])
+                            else:
+                                source_times = np.linspace(0.0, model_action_dt * (original_chunk_for_claw.shape[0] - 1), num=original_chunk_for_claw.shape[0])
+                            
+                            target_times = np.linspace(0.0, env.control_dt * (resampled_chunk.shape[0] - 1), num=resampled_chunk.shape[0])
+                            hold_indices = np.searchsorted(source_times, target_times, side="right") - 1
+                            hold_indices = np.clip(hold_indices, 0, original_chunk_for_claw.shape[0] - 1)
+                            resampled_chunk[:, claw_dims] = original_chunk_for_claw[hold_indices][:, claw_dims]
+                        else:
+                            resampled_chunk[:, claw_dims] = original_chunk_for_claw[0, claw_dims]
+                else:
+                    # 没有速度限制，使用原有的resample方法
+                    # 但如果有transition_chunk，需要特殊处理
+                    if transition_chunk is not None:
+                        # 对于包含transition的情况，需要分别处理transition和chunk部分
+                        # transition部分已经是在control_dt频率下，不需要resample
+                        # chunk部分需要resample
+                        transition_size = transition_chunk.shape[0]
+                        chunk_part = action_chunk[transition_size:]
+                        if chunk_part.shape[0] > 0:
+                            resampled_chunk_part = resample_chunk_with_claw_hold(
+                                chunk_part,
+                                previous_action=action_chunk[transition_size - 1] if transition_size > 0 else last_executed_action,
+                                control_frequency=env.control_frequency,
+                                source_dt=model_action_dt,
+                                arm_dims=arm_dims,
+                                claw_dims=claw_dims
+                            )
+                            resampled_chunk = np.vstack([action_chunk[:transition_size], resampled_chunk_part])
+                        else:
+                            resampled_chunk = action_chunk[:transition_size]
+                    else:
+                        resampled_chunk = resample_chunk_with_claw_hold(
+                            action_chunk,
+                            previous_action=last_executed_action,
+                            control_frequency=env.control_frequency,
+                            source_dt=model_action_dt,
+                            arm_dims=arm_dims,
+                            claw_dims=claw_dims
+                        )
 
                 # Apply low-pass filtering at chunk boundaries only if enabled
                 if ENABLE_CHUNK_TRANSITION_LOWPASS:
@@ -957,10 +1571,12 @@ def run_inference_loop(policy, preprocessor, env, dataset_stats, task_descriptio
             
             if key == ord('q') or key == 27:  # 'q' or ESC to quit current inference
                 print("\n[Keyboard] Stopping current inference by user request (q or ESC pressed)")
+                FIRST_MODEL_INFERENCE = True
                 return True  # 返回True表示正常退出当前推理
             
         except KeyboardInterrupt:
             print("\n[Interrupted] Exiting by user Ctrl+C.")
+            FIRST_MODEL_INFERENCE = True
             return False  # 返回False表示被中断
     
     return True  # 正常情况下不会到达这里
@@ -1057,7 +1673,7 @@ def final_reset_arm(json_path, env, control_arm=True, control_claw=True):
     rospy.loginfo("Arm reset completed!")
 
 
-def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chunk_size=50, lerobot_dataset_path=None, enable_gui=False, rotate_head_camera=False, state_zero=False, task_description=None, skip_chunk_ratio=0.0, model_action_dt=None):
+def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chunk_size=50, lerobot_dataset_path=None, enable_gui=False, rotate_head_camera=False, state_zero=False, task_description=None, skip_chunk_ratio=0.0, model_action_dt=None, sync_mode=False, max_joint_velocity=None):
     """
     在这里和实机/仿真交互，做网络推理（depalletize任务）
     支持多次推理：按'q'退出当前推理，可以快速重新开始下一次推理而无需重新加载模型
@@ -1075,7 +1691,9 @@ def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chun
         task_description: 任务描述字符串（language instruction），如果为None则从数据集加载或使用默认值
         skip_chunk_ratio: 跳过chunk的前百分之多少（0.0-1.0），例如0.2表示跳过前20%
         model_action_dt: 模型动作时间间隔（秒），控制推理频率。例如：0.1 = 10 Hz, 0.05 = 20 Hz, 0.033 = 30 Hz
-                        如果为None，使用默认值 0.1 秒（10 Hz）
+                        如果为None，使用默认值 0.1 秒（10 Hz）。在sync_mode下不使用此参数
+        sync_mode: 是否使用同步推理模式。如果True，推理一个chunk -> 执行完整个chunk -> get_obs -> 再推理下一个chunk
+        max_joint_velocity: 最大关节速度限制（rad/s）。如果提供，将对arm关节应用速度限制
     """
     
     # 加载模型和环境（只执行一次）
@@ -1127,7 +1745,9 @@ def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chun
                 state_zero=state_zero,
                 is_first_inference=is_first_inference,
                 skip_chunk_ratio=skip_chunk_ratio,
-                model_action_dt=model_action_dt
+                model_action_dt=model_action_dt,
+                sync_mode=sync_mode,
+                max_joint_velocity=max_joint_velocity
             )
             
             if normal_exit:
@@ -1212,7 +1832,13 @@ if __name__ == '__main__':
     parser.add_argument('--model-action-dt', type=float, default=None,
                         help='Time interval between predicted actions in seconds (controls inference frequency). '
                              'Smaller values = higher frequency. Examples: 0.1 = 10 Hz, 0.05 = 20 Hz, 0.033 = 30 Hz. '
-                             'Default: 0.1 (10 Hz). Note: Model was trained with 0.1s interval.')
+                             'Default: 0.1 (10 Hz). Note: Model was trained with 0.1s interval. Ignored in sync mode.')
+    parser.add_argument('--sync-mode', action='store_true',
+                        help='Enable synchronous inference mode: inference -> execute chunk -> get_obs -> repeat. '
+                             'In this mode, model_action_dt is ignored.')
+    parser.add_argument('--max-joint-velocity', type=float, default=None,
+                        help='Maximum joint velocity limit in rad/s. If provided, will apply speed limiting to arm joints. '
+                             'Example: 2.0 means max 2.0 rad/s per joint.')
     
     args = parser.parse_args()
     
@@ -1261,8 +1887,12 @@ if __name__ == '__main__':
         print(f"📝 Task description: '{args.task_description}'")
     if args.skip_chunk_ratio > 0.0:
         print(f"⏭️  Skip chunk ratio: {args.skip_chunk_ratio*100:.1f}% (will skip first {args.skip_chunk_ratio*100:.1f}% of each predicted chunk)")
-    if args.model_action_dt is not None:
+    if args.sync_mode:
+        print(f"🔄 Sync mode: Enabled")
+    elif args.model_action_dt is not None:
         print(f"⚡ Model action DT: {args.model_action_dt:.3f}s (inference frequency: {1.0/args.model_action_dt:.1f} Hz)")
+    if args.max_joint_velocity is not None:
+        print(f"🚦 Max joint velocity limit: {args.max_joint_velocity:.2f} rad/s")
     print("="*80 + "\n")
 
     if args.eval:
@@ -1275,7 +1905,9 @@ if __name__ == '__main__':
              state_zero=args.state_zero,
              task_description=args.task_description,
              skip_chunk_ratio=args.skip_chunk_ratio,
-             model_action_dt=args.model_action_dt)
+             model_action_dt=args.model_action_dt,
+             sync_mode=args.sync_mode,
+             max_joint_velocity=args.max_joint_velocity)
     elif args.replay:
         print("Replaying the model")
         lerobot_dataset_path = '/home/lab/kuavo-manip/lerobot_data/vel_wrend_box_613'
