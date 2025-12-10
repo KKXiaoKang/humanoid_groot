@@ -735,6 +735,11 @@ def run_inference_loop(policy, preprocessor, env, dataset_stats, task_descriptio
         
         input(f"轨迹回放 结束, 按回车继续 ==== 轨迹回放成功 ==== \n")
         time.sleep(1.0)
+        # 重要：在bag回放完成后，重新获取最新的观测数据
+        # 这样才能获取到bag回放后的真实手臂位置
+        rospy.loginfo("🔄 Updating observation data after bag replay...")
+        obs_data, camera_obs, camera_obs_ts, robot_obs, robot_obs_ts = env.get_obs()
+        rospy.loginfo("✅ Observation data updated with post-bag-replay robot state")
     else:
         rospy.loginfo("Skipping bag file replay (not first inference). Using JSON reset instead.")
     
