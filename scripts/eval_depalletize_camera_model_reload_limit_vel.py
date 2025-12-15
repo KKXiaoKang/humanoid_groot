@@ -692,7 +692,7 @@ def set_arm_quick_mode(enable: bool) -> bool:
 def run_inference_loop(policy, preprocessor, env, dataset_stats, task_description, device, 
                        control_arm=True, control_claw=True, action_chunk_size=50, 
                        enable_gui=False, rotate_head_camera=False, state_zero=False,
-                       is_first_inference=True, skip_chunk_ratio=0.0, model_action_dt=None,
+                       is_first_inference=True, skip_chunk_ratio=0.0, skip_chunk_from_end=False, model_action_dt=None,
                        sync_mode=False, max_joint_velocity=None):
     """
     运行推理循环（可以多次调用，每次调用开始新的推理会话）
@@ -711,7 +711,8 @@ def run_inference_loop(policy, preprocessor, env, dataset_stats, task_descriptio
         rotate_head_camera: 是否旋转头部相机
         state_zero: 是否将状态置零
         is_first_inference: 是否是第一次推理（第一次会加载bag文件，后续使用json文件重置）
-        skip_chunk_ratio: 跳过chunk的前百分之多少
+        skip_chunk_ratio: 跳过chunk的百分之多少（0.0-1.0）
+        skip_chunk_from_end: 如果True，跳过chunk的后百分之多少；如果False，跳过chunk的前百分之多少
         model_action_dt: 模型动作时间间隔（秒），控制推理频率。如果为None，使用全局MODEL_ACTION_DT
         sync_mode: 是否使用同步推理模式。如果True，推理一个chunk -> 执行完整个chunk -> get_obs -> 再推理下一个chunk
         max_joint_velocity: 最大关节速度限制（rad/s）。如果提供，将对arm关节应用速度限制
@@ -741,7 +742,8 @@ def run_inference_loop(policy, preprocessor, env, dataset_stats, task_descriptio
     if state_zero:
         print(f"⚠️  STATE ZERO MODE: All state inputs will be set to zero (for dependency testing)")
     if skip_chunk_ratio > 0.0:
-        print(f"⏭️  Skip chunk ratio: {skip_chunk_ratio*100:.1f}% (will skip first {skip_chunk_ratio*100:.1f}% of each predicted chunk)")
+        skip_direction = "last" if skip_chunk_from_end else "first"
+        print(f"⏭️  Skip chunk ratio: {skip_chunk_ratio*100:.1f}% (will skip {skip_direction} {skip_chunk_ratio*100:.1f}% of each predicted chunk)")
     if sync_mode:
         print(f"🔄 Sync mode: Enabled (inference -> execute chunk -> get_obs -> repeat)")
     else:
@@ -879,7 +881,7 @@ def run_inference_loop(policy, preprocessor, env, dataset_stats, task_descriptio
                 else:
                     action_chunk = pred_actions[0].cpu().numpy()
                 
-                # 跳过chunk的前百分之多少
+                # 跳过chunk的百分之多少（前面或后面）
                 if skip_chunk_ratio > 0.0:
                     chunk_size = action_chunk.shape[0]
                     skip_steps = int(np.round(chunk_size * skip_chunk_ratio))
@@ -887,8 +889,14 @@ def run_inference_loop(policy, preprocessor, env, dataset_stats, task_descriptio
                         rospy.logwarn(f"⚠️ Warning: skip_chunk_ratio {skip_chunk_ratio*100:.1f}% results in skipping all {chunk_size} steps.")
                         action_chunk = action_chunk[-1:].copy()
                     elif skip_steps > 0:
-                        action_chunk = action_chunk[skip_steps:].copy()
-                        rospy.loginfo(f"⏭️  Skipped first {skip_steps}/{chunk_size} steps ({skip_chunk_ratio*100:.1f}%)")
+                        if skip_chunk_from_end:
+                            # 跳过后面的步骤
+                            action_chunk = action_chunk[:-skip_steps].copy()
+                            rospy.loginfo(f"⏭️  Skipped last {skip_steps}/{chunk_size} steps ({skip_chunk_ratio*100:.1f}%)")
+                        else:
+                            # 跳过前面的步骤
+                            action_chunk = action_chunk[skip_steps:].copy()
+                            rospy.loginfo(f"⏭️  Skipped first {skip_steps}/{chunk_size} steps ({skip_chunk_ratio*100:.1f}%)")
 
                 # 确定arm和claw维度（需要在FIRST_MODEL_INFERENCE检查之前确定，以便提取手臂状态）
                 action_dim = action_chunk.shape[1]
@@ -1261,7 +1269,7 @@ def run_inference_loop(policy, preprocessor, env, dataset_stats, task_descriptio
                     action_chunk = pred_actions[0].cpu().numpy()  # (chunk_size, action_dim)
                     rospy.logwarn("⚠️ Warning: No dataset stats found. Using raw predictions (may be normalized).")
 
-                # 根据skip_chunk_ratio跳过chunk的前百分之多少
+                # 根据skip_chunk_ratio跳过chunk的百分之多少（前面或后面）
                 if skip_chunk_ratio > 0.0:
                     chunk_size = action_chunk.shape[0]
                     skip_steps = int(np.round(chunk_size * skip_chunk_ratio))
@@ -1270,8 +1278,14 @@ def run_inference_loop(policy, preprocessor, env, dataset_stats, task_descriptio
                         action_chunk = action_chunk[-1:].copy()  # 至少保留最后一步
                     elif skip_steps > 0:
                         original_size = chunk_size
-                        action_chunk = action_chunk[skip_steps:].copy()
-                        rospy.loginfo(f"⏭️  Skipped first {skip_steps}/{original_size} steps ({skip_chunk_ratio*100:.1f}%) of chunk. Remaining: {action_chunk.shape[0]} steps")
+                        if skip_chunk_from_end:
+                            # 跳过后面的步骤
+                            action_chunk = action_chunk[:-skip_steps].copy()
+                            rospy.loginfo(f"⏭️  Skipped last {skip_steps}/{original_size} steps ({skip_chunk_ratio*100:.1f}%) of chunk. Remaining: {action_chunk.shape[0]} steps")
+                        else:
+                            # 跳过前面的步骤
+                            action_chunk = action_chunk[skip_steps:].copy()
+                            rospy.loginfo(f"⏭️  Skipped first {skip_steps}/{original_size} steps ({skip_chunk_ratio*100:.1f}%) of chunk. Remaining: {action_chunk.shape[0]} steps")
 
                 # 根据动作维度动态确定claw维度
                 action_dim = action_chunk.shape[1]
@@ -1673,7 +1687,7 @@ def final_reset_arm(json_path, env, control_arm=True, control_claw=True):
     rospy.loginfo("Arm reset completed!")
 
 
-def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chunk_size=50, lerobot_dataset_path=None, enable_gui=False, rotate_head_camera=False, state_zero=False, task_description=None, skip_chunk_ratio=0.0, model_action_dt=None, sync_mode=False, max_joint_velocity=None):
+def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chunk_size=50, lerobot_dataset_path=None, enable_gui=False, rotate_head_camera=False, state_zero=False, task_description=None, skip_chunk_ratio=0.0, skip_chunk_from_end=False, model_action_dt=None, sync_mode=False, max_joint_velocity=None):
     """
     在这里和实机/仿真交互，做网络推理（depalletize任务）
     支持多次推理：按'q'退出当前推理，可以快速重新开始下一次推理而无需重新加载模型
@@ -1689,7 +1703,8 @@ def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chun
         rotate_head_camera: 是否旋转头部相机图像180度
         state_zero: 是否将状态输入置零（用于验证模型对状态的依赖性）
         task_description: 任务描述字符串（language instruction），如果为None则从数据集加载或使用默认值
-        skip_chunk_ratio: 跳过chunk的前百分之多少（0.0-1.0），例如0.2表示跳过前20%
+        skip_chunk_ratio: 跳过chunk的百分之多少（0.0-1.0），例如0.2表示跳过20%
+        skip_chunk_from_end: 如果True，跳过chunk的后百分之多少；如果False，跳过chunk的前百分之多少
         model_action_dt: 模型动作时间间隔（秒），控制推理频率。例如：0.1 = 10 Hz, 0.05 = 20 Hz, 0.033 = 30 Hz
                         如果为None，使用默认值 0.1 秒（10 Hz）。在sync_mode下不使用此参数
         sync_mode: 是否使用同步推理模式。如果True，推理一个chunk -> 执行完整个chunk -> get_obs -> 再推理下一个chunk
@@ -1745,6 +1760,7 @@ def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chun
                 state_zero=state_zero,
                 is_first_inference=is_first_inference,
                 skip_chunk_ratio=skip_chunk_ratio,
+                skip_chunk_from_end=skip_chunk_from_end,
                 model_action_dt=model_action_dt,
                 sync_mode=sync_mode,
                 max_joint_velocity=max_joint_velocity
@@ -1828,7 +1844,9 @@ if __name__ == '__main__':
     parser.add_argument('--task-description', type=str, default=None,
                         help='Task description (language instruction) for the model. If not provided, will use the first task from dataset or a default value.')
     parser.add_argument('--skip-chunk-ratio', type=float, default=0.0,
-                        help='Skip the first percentage of each predicted chunk (0.0-1.0). For example, 0.2 means skip the first 20%% of the chunk. Default: 0.0 (no skipping)')
+                        help='Skip the percentage of each predicted chunk (0.0-1.0). For example, 0.2 means skip 20%% of the chunk. Default: 0.0 (no skipping)')
+    parser.add_argument('--skip-chunk-from-end', action='store_true',
+                        help='If set, skip the last percentage of each chunk (instead of the first). Works with --skip-chunk-ratio. Default: False (skip from beginning)')
     parser.add_argument('--model-action-dt', type=float, default=None,
                         help='Time interval between predicted actions in seconds (controls inference frequency). '
                              'Smaller values = higher frequency. Examples: 0.1 = 10 Hz, 0.05 = 20 Hz, 0.033 = 30 Hz. '
@@ -1886,7 +1904,8 @@ if __name__ == '__main__':
     if args.task_description:
         print(f"📝 Task description: '{args.task_description}'")
     if args.skip_chunk_ratio > 0.0:
-        print(f"⏭️  Skip chunk ratio: {args.skip_chunk_ratio*100:.1f}% (will skip first {args.skip_chunk_ratio*100:.1f}% of each predicted chunk)")
+        skip_direction = "last" if args.skip_chunk_from_end else "first"
+        print(f"⏭️  Skip chunk ratio: {args.skip_chunk_ratio*100:.1f}% (will skip {skip_direction} {args.skip_chunk_ratio*100:.1f}% of each predicted chunk)")
     if args.sync_mode:
         print(f"🔄 Sync mode: Enabled")
     elif args.model_action_dt is not None:
@@ -1905,6 +1924,7 @@ if __name__ == '__main__':
              state_zero=args.state_zero,
              task_description=args.task_description,
              skip_chunk_ratio=args.skip_chunk_ratio,
+             skip_chunk_from_end=args.skip_chunk_from_end,
              model_action_dt=args.model_action_dt,
              sync_mode=args.sync_mode,
              max_joint_velocity=args.max_joint_velocity)

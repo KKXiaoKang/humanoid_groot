@@ -49,7 +49,7 @@ graph TB
         ActionFeatWithPos["action_features + pos_emb<br/>B x T x 1536<br/>如果启用add_pos_embed"]
         DiTInput["拼接输入 sa_embs<br/>state + future_tokens + action_features<br/>B x (1+32+T) x 1536"]
         
-        subgraph DiT["DiT Diffusion Transformer tune_diffusion_model控制"]
+        subgraph DiT["DiT tune_diffusion_model"]
             subgraph DiTBlocks["16层 DiT Blocks"]
                 DiT1["DiT Block 1<br/>Cross-Attn + Self-Attn"]
                 DiT2["DiT Block 2<br/>Self-Attn only"]
