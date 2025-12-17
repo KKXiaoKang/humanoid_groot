@@ -502,7 +502,24 @@ class FlowmatchingActionHead(nn.Module):
         return BatchFeature(data=output_dict)
 
     @torch.no_grad()
-    def get_action(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
+    def get_action(
+        self, 
+        backbone_output: BatchFeature, 
+        action_input: BatchFeature,
+        n_guided_action: torch.Tensor | None = None,
+        guide_strength: float = 0.5
+    ) -> BatchFeature:
+        """
+        Generate action predictions with optional inpainting support.
+        
+        Args:
+            backbone_output: Backbone features
+            action_input: Action input features
+            n_guided_action: Optional guided action prefix (B, T_g, D) for inpainting
+            guide_strength: Strength of inpainting (0.0-1.0). 
+                           >= 0.999 uses hard inpainting (direct replacement),
+                           < 0.999 uses soft inpainting (weighted interpolation)
+        """
         backbone_output = self.process_backbone_output(backbone_output)
 
         # Get vision and language embeddings.
@@ -525,6 +542,28 @@ class FlowmatchingActionHead(nn.Module):
         # In training, padded dimensions (after actual_action_dim) are always 0
         if self.encoder_action_dim != self.actual_action_dim:
             actions[:, :, self.actual_action_dim:] = 0.0
+
+        # Initialize with guided action if provided (similar to modeling_flow_matching_jit.py)
+        T_g = None
+        if n_guided_action is not None:
+            # Ensure n_guided_action matches encoder_action_dim for internal processing
+            if n_guided_action.shape[-1] != self.encoder_action_dim:
+                if n_guided_action.shape[-1] < self.encoder_action_dim:
+                    # Pad if needed
+                    pad_size = self.encoder_action_dim - n_guided_action.shape[-1]
+                    padding = torch.zeros(
+                        (n_guided_action.shape[0], n_guided_action.shape[1], pad_size),
+                        device=n_guided_action.device,
+                        dtype=n_guided_action.dtype
+                    )
+                    n_guided_action = torch.cat([n_guided_action, padding], dim=-1)
+                else:
+                    # Truncate if larger
+                    n_guided_action = n_guided_action[:, :, :self.encoder_action_dim]
+            
+            T_g = n_guided_action.shape[1]
+            # Initialize prefix with guided action
+            actions[:, :T_g, :] = n_guided_action
 
         num_steps = self.num_inference_timesteps
         dt = 1.0 / num_steps
@@ -587,6 +626,16 @@ class FlowmatchingActionHead(nn.Module):
                 actions[:, :, self.actual_action_dim:] = 0.0
             else:
                 actions = actions + dt * pred_velocity
+            
+            # Apply inpainting after each ODE step (similar to modeling_flow_matching_jit.py)
+            if n_guided_action is not None and T_g is not None:
+                # soft/hard inpainting of prefix
+                if guide_strength >= 0.999:
+                    # Hard inpainting: direct replacement
+                    actions[:, :T_g, :] = n_guided_action
+                else:
+                    # Soft inpainting: weighted interpolation
+                    actions[:, :T_g, :] = (1 - guide_strength) * actions[:, :T_g, :] + guide_strength * n_guided_action
         
         # Return only the actual action dimensions
         actions_output = actions[:, :, :self.actual_action_dim]

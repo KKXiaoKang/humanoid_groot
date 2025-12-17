@@ -365,11 +365,28 @@ class GR00TN15(PreTrainedModel):
     def get_action(
         self,
         inputs: dict,
+        n_guided_action: torch.Tensor | None = None,
+        guide_strength: float = 0.5,
     ) -> BatchFeature:
+        """
+        Generate action predictions with optional inpainting support.
+        
+        Args:
+            inputs: Model inputs
+            n_guided_action: Optional guided action prefix (B, T_g, D) for inpainting
+            guide_strength: Strength of inpainting (0.0-1.0). 
+                           >= 0.999 uses hard inpainting (direct replacement),
+                           < 0.999 uses soft inpainting (weighted interpolation)
+        """
         backbone_inputs, action_inputs = self.prepare_input(inputs)
         # Because the behavior of backbones remains the same for training and inference, we can use `forward` for backbones.
         backbone_outputs = self.backbone(backbone_inputs)
-        action_head_outputs = self.action_head.get_action(backbone_outputs, action_inputs)
+        action_head_outputs = self.action_head.get_action(
+            backbone_outputs, 
+            action_inputs,
+            n_guided_action=n_guided_action,
+            guide_strength=guide_strength
+        )
         self.validate_data(action_head_outputs, backbone_outputs, is_training=False)
         return action_head_outputs
 

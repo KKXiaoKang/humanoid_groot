@@ -138,10 +138,26 @@ class GrootPolicy(PreTrainedPolicy):
         return loss, loss_dict
 
     @torch.no_grad()
-    def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
+    def predict_action_chunk(
+        self, 
+        batch: dict[str, Tensor], 
+        guided_action: Tensor | None = None,
+        guide_strength: float = 0.5
+    ) -> Tensor:
         """Predict a chunk of actions for inference by delegating to Isaac-GR00T.
 
-        Returns a tensor of shape (B, n_action_steps, action_dim).
+        Args:
+            batch: Input batch for inference
+            guided_action: Optional guided action prefix (B, T_g, D) for inpainting.
+                          Should be in normalized space (same as model internal format).
+                          If provided, the first T_g timesteps will be inpainted.
+            guide_strength: Strength of inpainting (0.0-1.0). 
+                           >= 0.999 uses hard inpainting (direct replacement),
+                           < 0.999 uses soft inpainting (weighted interpolation).
+                           Default: 0.5 (soft inpainting).
+
+        Returns:
+            Tensor of shape (B, n_action_steps, action_dim).
         """
         self.eval()
 
@@ -160,7 +176,11 @@ class GrootPolicy(PreTrainedPolicy):
 
         # Use bf16 autocast for inference to keep memory low and match backbone dtype
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=self.config.use_bf16):
-            outputs = self._groot_model.get_action(groot_inputs)
+            outputs = self._groot_model.get_action(
+                groot_inputs,
+                n_guided_action=guided_action,
+                guide_strength=guide_strength
+            )
 
         actions = outputs.get("action_pred")
 
