@@ -1573,6 +1573,143 @@ class MultiLeRobotDataset(torch.utils.data.Dataset):
         # with multiple robots of different ranges. Instead we should have one normalization
         # per robot.
         self.stats = aggregate_stats([dataset.meta.stats for dataset in self._datasets])
+        
+        # Create a synthetic meta object for compatibility with training code
+        # Use the first dataset's meta as base, but override key properties
+        self._base_meta = self._datasets[0].meta
+        self._create_synthetic_meta()
+    
+    def _create_synthetic_meta(self):
+        """Create a synthetic meta object that aggregates metadata from all sub-datasets.
+        
+        This creates a proxy object that behaves like LeRobotDatasetMetadata but aggregates
+        data from all sub-datasets, which is needed for compatibility with training code.
+        """
+        print("Creating synthetic meta for MultiLeRobotDataset...")
+        # Merge episodes with adjusted indices for EpisodeAwareSampler
+        dataset_from_indices = []
+        dataset_to_indices = []
+        current_global_index = 0
+        
+        for idx, dataset in enumerate(self._datasets):
+            print(f"Processing dataset {idx+1}/{len(self._datasets)}: {self.repo_ids[idx]}")
+            episodes_before = len(dataset_from_indices)
+            if dataset.meta.episodes is not None:
+                from_indices = dataset.meta.episodes["dataset_from_index"]
+                to_indices = dataset.meta.episodes["dataset_to_index"]
+                # Handle both list/array and datasets.Dataset formats
+                if hasattr(from_indices, '__iter__') and not isinstance(from_indices, str):
+                    for from_idx, to_idx in zip(from_indices, to_indices):
+                        from_val = from_idx.item() if hasattr(from_idx, 'item') else from_idx
+                        to_val = to_idx.item() if hasattr(to_idx, 'item') else to_idx
+                        ep_length = to_val - from_val
+                        dataset_from_indices.append(current_global_index)
+                        dataset_to_indices.append(current_global_index + ep_length)
+                        current_global_index += ep_length
+                else:
+                    # Single episode case
+                    from_val = from_indices.item() if hasattr(from_indices, 'item') else from_indices
+                    to_val = to_indices.item() if hasattr(to_indices, 'item') else to_indices
+                    ep_length = to_val - from_val
+                    dataset_from_indices.append(current_global_index)
+                    dataset_to_indices.append(current_global_index + ep_length)
+                    current_global_index += ep_length
+                episodes_added = len(dataset_from_indices) - episodes_before
+                print(f"  Added {episodes_added} episodes from dataset {idx+1}, total episodes so far: {len(dataset_from_indices)}, global index: {current_global_index}")
+        
+        print(f"Total episodes merged: {len(dataset_from_indices)}, total frames: {current_global_index}")
+        
+        # Create a simple proxy class that delegates to base_meta but overrides some properties
+        class SyntheticMeta:
+            def __init__(self, base_meta, datasets, aggregated_stats, intersection_features, 
+                        dataset_from_indices, dataset_to_indices):
+                self._base_meta = base_meta
+                self._datasets = datasets
+                self._aggregated_stats = aggregated_stats
+                self._intersection_features = intersection_features
+                self._dataset_from_indices = dataset_from_indices
+                self._dataset_to_indices = dataset_to_indices
+                # Merge tasks from all datasets
+                self._merge_tasks()
+                # Create episodes dict-like object
+                self._create_episodes()
+            
+            def _merge_tasks(self):
+                """Merge tasks from all datasets, creating a unified task mapping."""
+                all_tasks = {}
+                for dataset in self._datasets:
+                    if dataset.meta.tasks is not None:
+                        for task_name, row in dataset.meta.tasks.iterrows():
+                            if task_name not in all_tasks:
+                                all_tasks[task_name] = len(all_tasks)
+                
+                if all_tasks:
+                    self.tasks = pd.DataFrame(
+                        {"task_index": list(all_tasks.values())},
+                        index=list(all_tasks.keys())
+                    )
+                else:
+                    self.tasks = self._base_meta.tasks
+            
+            def _create_episodes(self):
+                """Create a dict-like episodes object that supports ["dataset_from_index"] and ["dataset_to_index"] access."""
+                class EpisodesDict:
+                    def __init__(self, from_indices, to_indices):
+                        self._from_indices = from_indices
+                        self._to_indices = to_indices
+                    
+                    def __getitem__(self, key):
+                        if key == "dataset_from_index":
+                            return self._from_indices
+                        elif key == "dataset_to_index":
+                            return self._to_indices
+                        else:
+                            raise KeyError(f"Key '{key}' not found in episodes")
+                    
+                    def keys(self):
+                        return ["dataset_from_index", "dataset_to_index"]
+                
+                self.episodes = EpisodesDict(self._dataset_from_indices, self._dataset_to_indices)
+            
+            # Delegate other properties to base_meta
+            @property
+            def repo_id(self):
+                return ",".join([ds.meta.repo_id for ds in self._datasets])
+            
+            @property
+            def info(self):
+                # Aggregate info from all datasets
+                base_info = self._base_meta.info.copy()
+                base_info["total_episodes"] = sum(ds.meta.total_episodes for ds in self._datasets)
+                base_info["total_frames"] = sum(ds.meta.total_frames for ds in self._datasets)
+                return base_info
+            
+            @property
+            def stats(self):
+                return self._aggregated_stats
+            
+            @property
+            def features(self):
+                # Return intersection features
+                return {k: self._base_meta.features[k] for k in self._intersection_features 
+                       if k in self._base_meta.features}
+            
+            def __getattr__(self, name):
+                # Delegate any other attributes to base_meta
+                return getattr(self._base_meta, name)
+        
+        intersection_features = set(self._datasets[0].features)
+        for ds in self._datasets[1:]:
+            intersection_features.intersection_update(ds.features)
+        
+        self.meta = SyntheticMeta(
+            self._base_meta,
+            self._datasets,
+            self.stats,
+            intersection_features,
+            dataset_from_indices,
+            dataset_to_indices
+        )
 
     @property
     def repo_id_to_index(self):

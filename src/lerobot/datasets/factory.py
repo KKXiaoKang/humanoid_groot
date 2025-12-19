@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
+from pathlib import Path
 from pprint import pformat
 
 import torch
@@ -74,9 +75,6 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
     Args:
         cfg (TrainPipelineConfig): A TrainPipelineConfig config which contains a DatasetConfig and a PreTrainedConfig.
 
-    Raises:
-        NotImplementedError: The MultiLeRobotDataset is currently deactivated.
-
     Returns:
         LeRobotDataset | MultiLeRobotDataset
     """
@@ -84,14 +82,21 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
         ImageTransforms(cfg.dataset.image_transforms) if cfg.dataset.image_transforms.enable else None
     )
 
-    if isinstance(cfg.dataset.repo_id, str):
+    # Handle comma-separated repo_id string (from command line) by converting to list
+    repo_id = cfg.dataset.repo_id
+    if isinstance(repo_id, str) and ',' in repo_id:
+        # Split comma-separated string into list and strip whitespace
+        repo_id = [ds_id.strip() for ds_id in repo_id.split(',')]
+        logging.info(f"Detected comma-separated repo_id, converted to list: {repo_id}")
+
+    if isinstance(repo_id, str):
         ds_meta = LeRobotDatasetMetadata(
-            cfg.dataset.repo_id, root=cfg.dataset.root, revision=cfg.dataset.revision
+            repo_id, root=cfg.dataset.root, revision=cfg.dataset.revision
         )
         delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta)
         if not cfg.dataset.streaming:
             dataset = LeRobotDataset(
-                cfg.dataset.repo_id,
+                repo_id,
                 root=cfg.dataset.root,
                 episodes=cfg.dataset.episodes,
                 delta_timestamps=delta_timestamps,
@@ -101,7 +106,7 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
             )
         else:
             dataset = StreamingLeRobotDataset(
-                cfg.dataset.repo_id,
+                repo_id,
                 root=cfg.dataset.root,
                 episodes=cfg.dataset.episodes,
                 delta_timestamps=delta_timestamps,
@@ -110,11 +115,39 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
                 max_num_shards=cfg.num_workers,
             )
     else:
-        raise NotImplementedError("The MultiLeRobotDataset isn't supported for now.")
+        # Multi-dataset support: create MultiLeRobotDataset
+        # repo_id is now a list (either was a list originally, or was converted from comma-separated string)
+        # First, load metadata from first dataset to resolve delta_timestamps
+        # For multi-dataset, root is the parent directory, so we need to append the first repo_id
+        first_ds_root = None
+        if cfg.dataset.root:
+            first_ds_root = Path(cfg.dataset.root) / repo_id[0]
+        first_ds_meta = LeRobotDatasetMetadata(
+            repo_id[0], root=first_ds_root, revision=cfg.dataset.revision
+        )
+        delta_timestamps = resolve_delta_timestamps(cfg.policy, first_ds_meta)
+        
+        # Handle episodes parameter: MultiLeRobotDataset expects a dict mapping repo_id to episode list,
+        # or None to use all episodes. If a list is provided, we'll use None (all episodes for all datasets).
+        # Users who want to specify different episodes per dataset should pass a dict.
+        episodes_param = None
+        if isinstance(cfg.dataset.episodes, dict):
+            episodes_param = cfg.dataset.episodes
+        elif cfg.dataset.episodes is not None:
+            # If a list is provided, we can't easily map it to multiple datasets.
+            # Log a warning and use None (all episodes) instead.
+            logging.warning(
+                f"episodes parameter provided as list, but multiple datasets specified. "
+                f"Using all episodes for all datasets. To specify episodes per dataset, "
+                f"provide a dict mapping repo_id to episode list."
+            )
+        
+        print(f"Creating MultiLeRobotDataset with {len(repo_id)} datasets: {repo_id}")
         dataset = MultiLeRobotDataset(
-            cfg.dataset.repo_id,
-            # TODO(aliberts): add proper support for multi dataset
-            # delta_timestamps=delta_timestamps,
+            repo_id,
+            root=cfg.dataset.root,
+            episodes=episodes_param,
+            delta_timestamps=delta_timestamps,
             image_transforms=image_transforms,
             video_backend=cfg.dataset.video_backend,
         )

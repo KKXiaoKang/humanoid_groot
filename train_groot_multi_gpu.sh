@@ -12,12 +12,30 @@
 # ============================================================================
 
 # 设置输出目录
-OUTPUT_DIR="./outputs/11_27_groot_full_tune_depalletize_3orb_green_grey_mix"
+OUTPUT_DIR="./outputs/12_19_multi_gpu_multi_lerobotdataset_test"
 JOB_NAME="groot_depalletize"
 
 # 数据集配置
-DATASET_ROOT="/home/zhicheng/KangKK/humanoid_groot/lerobot_data/1125_groot_train_data_with_task_filtered"
-DATASET_REPO_ID="1125_groot_train_data_with_task_filtered"
+# ============================================================================
+# 单数据集配置（原方式）:
+#   - root 应该直接指向数据集目录（包含 meta/ 和 data/ 的目录）
+#   - repo_id 为单个数据集名称
+# 
+# 多数据集配置（新方式）:
+#   - root 应该指向包含所有数据集目录的父目录
+#   - repo_id 为逗号分隔的多个数据集名称
+#   例如: DATASET_REPO_ID="dataset1,dataset2,dataset3"
+#   数据集路径: ${DATASET_ROOT}/dataset1/, ${DATASET_ROOT}/dataset2/, ...
+# ============================================================================
+
+# 单数据集配置（当前使用）
+# DATASET_ROOT="/home/zhicheng/KangKK/humanoid_groot/lerobot_data/1125_groot_train_data_with_task_filtered"
+# DATASET_REPO_ID="1125_groot_train_data_with_task_filtered"
+
+# 多数据集配置（使用两个数据集）
+DATASET_ROOT="/home/zhicheng/KangKK/humanoid_groot/lerobot_data/v3_0_datasets"
+DATASET_REPO_ID="1212_4322,1215_four_box"
+
 
 # GPU选择配置
 # 方式1: 通过命令行参数指定 (推荐)
@@ -71,7 +89,7 @@ fi
 
 # 训练参数 (可根据GPU内存调整)
 # 注意: batch_size 是每个GPU的batch size，总的有效batch size = batch_size * num_gpus
-BATCH_SIZE=20          # 每个GPU的batch size
+BATCH_SIZE=16          # 每个GPU的batch size
 NUM_STEPS=80000        # 训练步数
 SAVE_FREQ=8000         # 每8000步保存一次checkpoint
 LOG_FREQ=100           # 每100步打印一次日志
