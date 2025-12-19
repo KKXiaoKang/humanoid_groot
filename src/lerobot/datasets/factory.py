@@ -74,9 +74,6 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
     Args:
         cfg (TrainPipelineConfig): A TrainPipelineConfig config which contains a DatasetConfig and a PreTrainedConfig.
 
-    Raises:
-        NotImplementedError: The MultiLeRobotDataset is currently deactivated.
-
     Returns:
         LeRobotDataset | MultiLeRobotDataset
     """
@@ -84,14 +81,21 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
         ImageTransforms(cfg.dataset.image_transforms) if cfg.dataset.image_transforms.enable else None
     )
 
-    if isinstance(cfg.dataset.repo_id, str):
+    # Handle comma-separated repo_id string (from command line) by converting to list
+    repo_id = cfg.dataset.repo_id
+    if isinstance(repo_id, str) and ',' in repo_id:
+        # Split comma-separated string into list and strip whitespace
+        repo_id = [ds_id.strip() for ds_id in repo_id.split(',')]
+        logging.info(f"Detected comma-separated repo_id, converted to list: {repo_id}")
+
+    if isinstance(repo_id, str):
         ds_meta = LeRobotDatasetMetadata(
-            cfg.dataset.repo_id, root=cfg.dataset.root, revision=cfg.dataset.revision
+            repo_id, root=cfg.dataset.root, revision=cfg.dataset.revision
         )
         delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta)
         if not cfg.dataset.streaming:
             dataset = LeRobotDataset(
-                cfg.dataset.repo_id,
+                repo_id,
                 root=cfg.dataset.root,
                 episodes=cfg.dataset.episodes,
                 delta_timestamps=delta_timestamps,
@@ -101,7 +105,7 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
             )
         else:
             dataset = StreamingLeRobotDataset(
-                cfg.dataset.repo_id,
+                repo_id,
                 root=cfg.dataset.root,
                 episodes=cfg.dataset.episodes,
                 delta_timestamps=delta_timestamps,
@@ -111,9 +115,10 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
             )
     else:
         # Multi-dataset support: create MultiLeRobotDataset
+        # repo_id is now a list (either was a list originally, or was converted from comma-separated string)
         # First, load metadata from first dataset to resolve delta_timestamps
         first_ds_meta = LeRobotDatasetMetadata(
-            cfg.dataset.repo_id[0], root=cfg.dataset.root, revision=cfg.dataset.revision
+            repo_id[0], root=cfg.dataset.root, revision=cfg.dataset.revision
         )
         delta_timestamps = resolve_delta_timestamps(cfg.policy, first_ds_meta)
         
@@ -133,7 +138,7 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
             )
         
         dataset = MultiLeRobotDataset(
-            cfg.dataset.repo_id,
+            repo_id,
             root=cfg.dataset.root,
             episodes=episodes_param,
             delta_timestamps=delta_timestamps,
