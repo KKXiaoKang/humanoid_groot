@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
+from pathlib import Path
 from pprint import pformat
 
 import torch
@@ -117,8 +118,12 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
         # Multi-dataset support: create MultiLeRobotDataset
         # repo_id is now a list (either was a list originally, or was converted from comma-separated string)
         # First, load metadata from first dataset to resolve delta_timestamps
+        # For multi-dataset, root is the parent directory, so we need to append the first repo_id
+        first_ds_root = None
+        if cfg.dataset.root:
+            first_ds_root = Path(cfg.dataset.root) / repo_id[0]
         first_ds_meta = LeRobotDatasetMetadata(
-            repo_id[0], root=cfg.dataset.root, revision=cfg.dataset.revision
+            repo_id[0], root=first_ds_root, revision=cfg.dataset.revision
         )
         delta_timestamps = resolve_delta_timestamps(cfg.policy, first_ds_meta)
         
