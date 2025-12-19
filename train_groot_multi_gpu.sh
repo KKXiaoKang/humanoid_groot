@@ -16,8 +16,25 @@ OUTPUT_DIR="./outputs/11_27_groot_full_tune_depalletize_3orb_green_grey_mix"
 JOB_NAME="groot_depalletize"
 
 # 数据集配置
-DATASET_ROOT="/home/zhicheng/KangKK/humanoid_groot/lerobot_data/1125_groot_train_data_with_task_filtered"
-DATASET_REPO_ID="1125_groot_train_data_with_task_filtered"
+# ============================================================================
+# 单数据集配置（原方式）:
+#   - root 应该直接指向数据集目录（包含 meta/ 和 data/ 的目录）
+#   - repo_id 为单个数据集名称
+# 
+# 多数据集配置（新方式）:
+#   - root 应该指向包含所有数据集目录的父目录
+#   - repo_id 为逗号分隔的多个数据集名称
+#   例如: DATASET_REPO_ID="dataset1,dataset2,dataset3"
+#   数据集路径: ${DATASET_ROOT}/dataset1/, ${DATASET_ROOT}/dataset2/, ...
+# ============================================================================
+
+# 单数据集配置（当前使用）
+# DATASET_ROOT="/home/zhicheng/KangKK/humanoid_groot/lerobot_data/1125_groot_train_data_with_task_filtered"
+# DATASET_REPO_ID="1125_groot_train_data_with_task_filtered"
+
+# 多数据集配置（使用两个数据集）
+DATASET_ROOT="/home/lab/lerobot_groot/lerobot_data/v3_0_dataset"
+DATASET_REPO_ID="1212_5w_groot_train_data_with_task,1215_5w_groot_4311_4322_4611_4633"
 
 # GPU选择配置
 # 方式1: 通过命令行参数指定 (推荐)

@@ -110,11 +110,33 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
                 max_num_shards=cfg.num_workers,
             )
     else:
-        raise NotImplementedError("The MultiLeRobotDataset isn't supported for now.")
+        # Multi-dataset support: create MultiLeRobotDataset
+        # First, load metadata from first dataset to resolve delta_timestamps
+        first_ds_meta = LeRobotDatasetMetadata(
+            cfg.dataset.repo_id[0], root=cfg.dataset.root, revision=cfg.dataset.revision
+        )
+        delta_timestamps = resolve_delta_timestamps(cfg.policy, first_ds_meta)
+        
+        # Handle episodes parameter: MultiLeRobotDataset expects a dict mapping repo_id to episode list,
+        # or None to use all episodes. If a list is provided, we'll use None (all episodes for all datasets).
+        # Users who want to specify different episodes per dataset should pass a dict.
+        episodes_param = None
+        if isinstance(cfg.dataset.episodes, dict):
+            episodes_param = cfg.dataset.episodes
+        elif cfg.dataset.episodes is not None:
+            # If a list is provided, we can't easily map it to multiple datasets.
+            # Log a warning and use None (all episodes) instead.
+            logging.warning(
+                f"episodes parameter provided as list, but multiple datasets specified. "
+                f"Using all episodes for all datasets. To specify episodes per dataset, "
+                f"provide a dict mapping repo_id to episode list."
+            )
+        
         dataset = MultiLeRobotDataset(
             cfg.dataset.repo_id,
-            # TODO(aliberts): add proper support for multi dataset
-            # delta_timestamps=delta_timestamps,
+            root=cfg.dataset.root,
+            episodes=episodes_param,
+            delta_timestamps=delta_timestamps,
             image_transforms=image_transforms,
             video_backend=cfg.dataset.video_backend,
         )
