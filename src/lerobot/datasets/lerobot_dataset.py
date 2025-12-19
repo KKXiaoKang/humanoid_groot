@@ -1585,12 +1585,15 @@ class MultiLeRobotDataset(torch.utils.data.Dataset):
         This creates a proxy object that behaves like LeRobotDatasetMetadata but aggregates
         data from all sub-datasets, which is needed for compatibility with training code.
         """
+        print("Creating synthetic meta for MultiLeRobotDataset...")
         # Merge episodes with adjusted indices for EpisodeAwareSampler
         dataset_from_indices = []
         dataset_to_indices = []
         current_global_index = 0
         
-        for dataset in self._datasets:
+        for idx, dataset in enumerate(self._datasets):
+            print(f"Processing dataset {idx+1}/{len(self._datasets)}: {self.repo_ids[idx]}")
+            episodes_before = len(dataset_from_indices)
             if dataset.meta.episodes is not None:
                 from_indices = dataset.meta.episodes["dataset_from_index"]
                 to_indices = dataset.meta.episodes["dataset_to_index"]
@@ -1611,6 +1614,10 @@ class MultiLeRobotDataset(torch.utils.data.Dataset):
                     dataset_from_indices.append(current_global_index)
                     dataset_to_indices.append(current_global_index + ep_length)
                     current_global_index += ep_length
+                episodes_added = len(dataset_from_indices) - episodes_before
+                print(f"  Added {episodes_added} episodes from dataset {idx+1}, total episodes so far: {len(dataset_from_indices)}, global index: {current_global_index}")
+        
+        print(f"Total episodes merged: {len(dataset_from_indices)}, total frames: {current_global_index}")
         
         # Create a simple proxy class that delegates to base_meta but overrides some properties
         class SyntheticMeta:

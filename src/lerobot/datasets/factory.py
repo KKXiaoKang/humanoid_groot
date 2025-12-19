@@ -142,6 +142,7 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
                 f"provide a dict mapping repo_id to episode list."
             )
         
+        print(f"Creating MultiLeRobotDataset with {len(repo_id)} datasets: {repo_id}")
         dataset = MultiLeRobotDataset(
             repo_id,
             root=cfg.dataset.root,
