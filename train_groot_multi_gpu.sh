@@ -9,6 +9,13 @@
 #   bash train_groot_multi_gpu.sh                    # 使用所有可用GPU
 #   bash train_groot_multi_gpu.sh --gpu 0,1,2        # 使用指定的GPU
 #   bash train_groot_multi_gpu.sh -g 0,1             # 使用GPU 0和1
+#
+# 重要提示 - 学习率缩放:
+#   LeRobot不会自动缩放学习率，多卡训练时需要手动缩放
+#   - 8卡训练时，有效batch size = batch_size × 8
+#   - 学习率应该相应缩放: lr = base_lr × num_gpus (线性缩放)
+#   - 脚本会自动根据GPU数量计算并应用缩放后的学习率
+#   - 如果效果不理想，可以尝试平方根缩放 (修改 LR_SCALING_MODE="sqrt")
 # ============================================================================
 
 # 设置输出目录
@@ -96,6 +103,30 @@ LOG_FREQ=100           # 每100步打印一次日志
 EVAL_FREQ=0            # 设置为0禁用评估
 NUM_WORKERS=8          # 数据加载器工作进程数（每个GPU）
 
+# 学习率配置
+# ============================================================================
+# 重要: LeRobot不会自动缩放学习率，需要手动根据GPU数量缩放
+# 
+# 学习率缩放策略:
+#   - 线性缩放 (推荐): BASE_LR × NUM_GPUS (适用于大batch size)
+#   - 平方根缩放: BASE_LR × √NUM_GPUS (更保守，适用于中等batch size)
+# 
+# 对于8卡训练，有效batch size = 16 × 8 = 128，建议使用线性缩放
+# ============================================================================
+BASE_LR=1e-4           # 单卡时的基础学习率
+LR_SCALING_MODE="linear"  # "linear" 或 "sqrt" (线性缩放或平方根缩放)
+
+# 根据GPU数量自动计算缩放后的学习率
+if [ "$LR_SCALING_MODE" = "sqrt" ]; then
+    # 平方根缩放: lr = base_lr × √num_gpus
+    SCALED_LR=$(python3 -c "import math; print('{:.6f}'.format($BASE_LR * math.sqrt($NUM_GPUS)))")
+    echo "使用平方根缩放: lr = ${BASE_LR} × √${NUM_GPUS} = ${SCALED_LR}"
+else
+    # 线性缩放: lr = base_lr × num_gpus
+    SCALED_LR=$(python3 -c "print('{:.6f}'.format($BASE_LR * $NUM_GPUS))")
+    echo "使用线性缩放: lr = ${BASE_LR} × ${NUM_GPUS} = ${SCALED_LR}"
+fi
+
 # 是否从checkpoint继续训练
 RESUME=false
 
@@ -131,7 +162,7 @@ accelerate launch \
   --policy.use_bf16=true \
   --policy.max_state_dim=64 \
   --policy.max_action_dim=32 \
-  --policy.optimizer_lr=1e-4 \
+  --policy.optimizer_lr=${SCALED_LR} \
   --policy.warmup_ratio=0.05 \
   --policy.chunk_size=32 \
   --policy.n_action_steps=32 \
@@ -150,5 +181,6 @@ echo "训练完成！"
 echo "模型保存在: ${OUTPUT_DIR}"
 echo "Checkpoints保存在: ${OUTPUT_DIR}/checkpoints/"
 echo "有效batch size: ${BATCH_SIZE} x ${NUM_GPUS} = $((BATCH_SIZE * NUM_GPUS))"
+echo "学习率配置: 基础LR=${BASE_LR}, 缩放后LR=${SCALED_LR} (${LR_SCALING_MODE}缩放)"
 echo "=========================================="
 
