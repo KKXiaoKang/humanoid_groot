@@ -30,7 +30,8 @@ from tqdm import tqdm
 # 使用GrootPolicy模型
 from lerobot.policies.groot.modeling_groot import GrootPolicy
 from lerobot.policies.groot.processor_groot import make_groot_pre_post_processors
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.datasets.lerobot_dataset import LeRobotDataset, MultiLeRobotDataset
+from lerobot.datasets.compute_stats import aggregate_stats
 
 # 导入配置模块（如果存在）
 try:
@@ -215,7 +216,8 @@ def eval_on_dataset(ckpt_path,
                     state_zero=False,
                     cam_head_zero=False,
                     infer_per_frame: int = 1,
-                    task_description: str | None = None):
+                    task_description: str | None = None,
+                    training_dataset_paths: list[str] | None = None):
     """
     在数据集上评估模型
     
@@ -230,6 +232,7 @@ def eval_on_dataset(ckpt_path,
         state_zero: 是否将状态输入置零（用于验证模型对状态的依赖性）
         infer_per_frame: 每隔多少个frame重新推理一次（>=1）。
         task_description: 任务描述字符串（language instruction），如果提供则覆盖数据集中的task，否则使用数据集原本的task。
+        training_dataset_paths: 用于计算统计信息的训练数据集路径列表。如果提供，将使用这些数据集计算合并的统计信息用于反归一化。
     """
     # ----------- 一些参数 ----------------
     mse_per_action_dim = OrderedDict() # 记录每个动作维度的MSE
@@ -312,9 +315,40 @@ def eval_on_dataset(ckpt_path,
     
     # Load dataset statistics for normalization
     print(f"\n📂 Loading dataset for statistics...")
-    dataset_for_stats = LeRobotDataset(repo_id=0, root=lerobot_dataset_path)
-    dataset_stats = dataset_for_stats.meta.stats if hasattr(dataset_for_stats.meta, 'stats') else None
-    print(f"✅ Dataset statistics loaded: {list(dataset_stats.keys()) if dataset_stats else 'None'}")
+    if training_dataset_paths is not None and len(training_dataset_paths) > 0:
+        # 使用多个训练数据集计算合并的统计信息
+        print(f"📊 Loading {len(training_dataset_paths)} training datasets for aggregated statistics:")
+        for i, path in enumerate(training_dataset_paths):
+            print(f"   {i+1}. {path}")
+        
+        # 从完整路径加载数据集
+        # 如果路径是完整的数据集根目录，直接使用路径作为root，repo_id可以是0或路径名
+        training_datasets = []
+        for path in training_dataset_paths:
+            path_obj = Path(path)
+            # 使用路径名作为repo_id，完整路径作为root
+            # LeRobotDataset会直接使用root，不会与repo_id拼接
+            repo_id = path_obj.name  # 路径的最后一部分作为repo_id（用于标识）
+            root = path_obj          # 完整路径作为root
+            print(f"   Loading dataset: repo_id='{repo_id}', root='{root}'")
+            dataset = LeRobotDataset(repo_id=repo_id, root=root)
+            training_datasets.append(dataset)
+        
+        # 聚合统计信息
+        print(f"📊 Aggregating statistics from {len(training_datasets)} datasets...")
+        stats_list = [ds.meta.stats for ds in training_datasets if ds.meta.stats is not None]
+        if len(stats_list) > 0:
+            dataset_stats = aggregate_stats(stats_list)
+            print(f"✅ Aggregated statistics loaded: {list(dataset_stats.keys())}")
+        else:
+            print("⚠️  Warning: No statistics found in training datasets")
+            dataset_stats = None
+    else:
+        # 使用单个数据集（评估数据集本身）的统计信息
+        print(f"📊 Using statistics from evaluation dataset: {lerobot_dataset_path}")
+        dataset_for_stats = LeRobotDataset(repo_id=0, root=lerobot_dataset_path)
+        dataset_stats = dataset_for_stats.meta.stats if hasattr(dataset_for_stats.meta, 'stats') else None
+        print(f"✅ Dataset statistics loaded: {list(dataset_stats.keys()) if dataset_stats else 'None'}")
     
     # Create preprocessor and postprocessor
     print(f"\n🔧 Creating preprocessor and postprocessor...")
@@ -1021,6 +1055,8 @@ if __name__ == "__main__":
                        help='Run policy inference every N frames (default: 1 = every frame)')
     parser.add_argument('--task-description', type=str, default=None,
                        help='Task description (language instruction) to override the task from dataset. If not provided, will use the task from dataset.')
+    parser.add_argument('--training-dataset-paths', nargs='+', type=str, default=None,
+                       help='Paths to training datasets for computing aggregated statistics. If provided, statistics from all these datasets will be aggregated and used for denormalization. Example: --training-dataset-paths /path/to/dataset1 /path/to/dataset2')
 
     args = parser.parse_args()
     
@@ -1040,6 +1076,10 @@ if __name__ == "__main__":
         print(f"Task Description (overridden): '{args.task_description}'")
     else:
         print(f"Task Description: Will use task from dataset")
+    if args.training_dataset_paths:
+        print(f"Training Dataset Paths (for statistics): {args.training_dataset_paths}")
+    else:
+        print(f"Training Dataset Paths: Using evaluation dataset statistics")
     print("="*80)
     
     eval_on_dataset(
@@ -1053,5 +1093,6 @@ if __name__ == "__main__":
         state_zero=args.state_zero,
         cam_head_zero=args.cam_head_zero,
         infer_per_frame=args.infer_per_frame,
-        task_description=args.task_description
+        task_description=args.task_description,
+        training_dataset_paths=args.training_dataset_paths
     )

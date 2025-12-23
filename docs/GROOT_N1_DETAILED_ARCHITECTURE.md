@@ -226,6 +226,254 @@ DiT Block:
       └─ Query, Key, Value: hidden_states (1536维)
 ```
 
+## 多模态融合机制详解
+
+GROOT N1.5采用了**分层多模态融合**策略，将不同模态的信息逐步融合：
+
+### 第一阶段：Vision-Language融合（Eagle-2 VLM内部）
+
+**融合方式：Token替换 + LLM自注意力**
+
+```233:249:src/lerobot/policies/groot/eagle2_hg_model/modeling_eagle2_5_vl.py
+        b, n, c = input_embeds.shape
+        input_embeds = input_embeds.reshape(b * n, c)
+
+        input_ids = input_ids.reshape(b * n)
+        selected = input_ids == self.image_token_index
+        try:
+            input_embeds[selected] = input_embeds[selected] * 0.0 + vit_embeds.reshape(-1, c)
+        except Exception as e:
+            vit_embeds = vit_embeds.reshape(-1, c)
+            print(
+                f"warning: {e}, input_embeds[selected].shape={input_embeds[selected].shape}, "
+                f"vit_embeds.shape={vit_embeds.shape}"
+            )
+            n_token = selected.sum()
+            input_embeds[selected] = input_embeds[selected] * 0.0 + vit_embeds[:n_token]
+
+        input_embeds = input_embeds.reshape(b, n, c)
+
+        outputs = self.language_model(
+            inputs_embeds=input_embeds
+```
+
+**关键步骤**：
+1. **视觉编码**：图像通过SigLip编码器得到patch tokens，维度为`VIT_dim`
+2. **维度对齐**：通过`mlp1`将视觉特征投影到`2048`维，与语言embedding维度一致
+3. **Token替换**：在文本序列的`image_token`位置，直接用视觉特征替换文本embedding
+   - `input_embeds[image_token位置] = vit_embeds`
+   - 这是一种**早期融合（Early Fusion）**策略
+4. **联合编码**：替换后的序列输入到Qwen3-1.5B的12层Transformer中
+   - 通过**Self-Attention机制**，视觉和语言tokens可以相互关注
+   - LLM的每一层都会进行跨模态的信息交互
+
+**优势**：
+- ✅ 视觉和语言在统一的语义空间中表示（都是2048维）
+- ✅ LLM的自注意力机制天然支持跨模态交互
+- ✅ 预训练的VLM已经学会了视觉-语言对齐
+
+### 第二阶段：Vision-Language特征增强（vl_self_attention）
+
+**融合方式：自注意力增强**
+
+```334:339:src/lerobot/policies/groot/action_head/flow_matching_action_head.py
+    def process_backbone_output(self, backbone_output: BatchFeature) -> BatchFeature:
+        backbone_features = backbone_output["backbone_features"]
+        backbone_features = self.vlln(backbone_features)
+        backbone_features = self.vl_self_attention(backbone_features)
+        backbone_output["backbone_features"] = backbone_features
+        return backbone_output
+```
+
+**作用**：
+- 对已经融合的视觉-语言特征进行**4层自注意力处理**
+- 进一步强化视觉和语言之间的关联
+- 为后续的跨模态注意力做准备
+
+### 第三阶段：Vision-Language与State-Action融合（DiT Cross-Attention）
+
+**融合方式：交叉注意力（Cross-Attention）**
+
+```417:429:src/lerobot/policies/groot/action_head/flow_matching_action_head.py
+        # Join vision, language, state and action embedding along sequence dimension.
+        future_tokens = self.future_tokens.weight.unsqueeze(0).expand(vl_embs.shape[0], -1, -1)
+        sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1)
+
+        vl_attn_mask = backbone_output.backbone_attention_mask
+
+        model_output = self.model(
+            hidden_states=sa_embs,
+            encoder_hidden_states=vl_embs,
+            encoder_attention_mask=vl_attn_mask,
+            timestep=t_discretized,
+            return_all_hidden_states=False,  # NOTE (YL): not using flare now
+        )
+```
+
+**关键机制**：
+
+1. **序列拼接**：
+   - `sa_embs = [state_features, future_tokens, action_features]`
+   - 维度：`B × (1 + 32 + T) × 1536`
+   - State、Future tokens和Action tokens在序列维度拼接
+
+2. **Cross-Attention融合**：
+   ```
+   Query (Q): 来自 sa_embs (state+future+action, 1536维)
+   Key (K):   来自 vl_embs (vision+language, 2048维) → 通过to_k投影到1536维
+   Value (V): 来自 vl_embs (vision+language, 2048维) → 通过to_v投影到1536维
+   ```
+
+3. **维度对齐**：
+   - Vision-Language特征：`2048`维
+   - State-Action特征：`1536`维
+   - 通过`to_k`和`to_v`投影层将encoder特征投影到`1536`维
+
+4. **注意力计算**：
+   ```python
+   # 伪代码
+   Q = sa_embs @ W_q  # (B, S, 1536)
+   K = vl_embs @ to_k  # (B, T, 2048) → (B, T, 1536)
+   V = vl_embs @ to_v  # (B, T, 2048) → (B, T, 1536)
+   
+   attention_scores = Q @ K^T / sqrt(d_k)  # (B, S, T)
+   attention_output = attention_scores @ V   # (B, S, 1536)
+   ```
+
+**DiT Block结构**：
+```147:184:src/lerobot/policies/groot/action_head/cross_attention_dit.py
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        encoder_hidden_states: torch.Tensor | None = None,
+        encoder_attention_mask: torch.Tensor | None = None,
+        temb: torch.LongTensor | None = None,
+    ) -> torch.Tensor:
+        # 0. Self-Attention
+        if self.norm_type == "ada_norm":
+            norm_hidden_states = self.norm1(hidden_states, temb)
+        else:
+            norm_hidden_states = self.norm1(hidden_states)
+
+        if self.pos_embed is not None:
+            norm_hidden_states = self.pos_embed(norm_hidden_states)
+
+        attn_output = self.attn1(
+            norm_hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            attention_mask=attention_mask,
+            # encoder_attention_mask=encoder_attention_mask,
+        )
+        if self.final_dropout:
+            attn_output = self.final_dropout(attn_output)
+
+        hidden_states = attn_output + hidden_states
+        if hidden_states.ndim == 4:
+            hidden_states = hidden_states.squeeze(1)
+
+        # 4. Feed-forward
+        norm_hidden_states = self.norm3(hidden_states)
+        ff_output = self.ff(norm_hidden_states)
+
+        hidden_states = ff_output + hidden_states
+        if hidden_states.ndim == 4:
+            hidden_states = hidden_states.squeeze(1)
+        return hidden_states
+```
+
+每个DiT Block包含：
+- **Cross-Attention**：State-Action tokens关注Vision-Language特征
+- **Self-Attention**：State-Action tokens之间的交互（在interleaved层）
+- **Feed-Forward**：特征变换
+
+### 多模态融合的常见技巧总结
+
+GROOT N1.5使用了以下多模态融合技巧：
+
+#### 1. **早期融合（Early Fusion）**
+- **位置**：Eagle-2 VLM中，视觉和语言在输入层融合
+- **方法**：Token替换，将视觉特征直接插入文本序列
+- **优势**：让LLM的每一层都能处理多模态信息
+
+#### 2. **交叉注意力（Cross-Attention）**
+- **位置**：DiT Block中
+- **方法**：Query来自一个模态，Key/Value来自另一个模态
+- **优势**：允许不同模态之间进行灵活的注意力交互
+
+#### 3. **维度对齐投影**
+- **位置**：
+  - `mlp1`: VIT_dim → 2048（视觉-语言对齐）
+  - `to_k/to_v`: 2048 → 1536（Vision-Language与State-Action对齐）
+- **方法**：通过线性投影层统一不同模态的表示空间
+- **优势**：确保不同模态的特征可以在同一空间中进行交互
+
+#### 4. **序列拼接**
+- **位置**：State、Future tokens、Action tokens的拼接
+- **方法**：在序列维度拼接不同模态的tokens
+- **优势**：保持各模态的独立性，同时允许Self-Attention进行交互
+
+#### 5. **分层融合**
+- **策略**：分三个阶段逐步融合
+  1. Vision + Language（Eagle-2 VLM）
+  2. Vision-Language增强（vl_self_attention）
+  3. Vision-Language + State-Action（DiT Cross-Attention）
+- **优势**：每个阶段专注于特定的融合任务，避免一次性融合的复杂性
+
+#### 6. **自注意力增强**
+- **位置**：vl_self_attention（4层）
+- **方法**：对融合后的Vision-Language特征进行自注意力处理
+- **优势**：进一步强化视觉和语言之间的关联
+
+#### 7. **位置编码**
+- **位置**：Action features的可选位置编码
+- **方法**：`action_features + position_embedding`
+- **优势**：为序列中的不同位置提供位置信息
+
+### 融合流程图
+
+```
+图像 (B×T×V×C×H×W)
+  ↓ SigLip编码
+视觉tokens (B×num_patches×VIT_dim)
+  ↓ mlp1投影
+视觉特征 (B×num_patches×2048)
+  ↓
+文本 (Task Description)
+  ↓ Tokenizer + Embedding
+文本特征 (B×seq_len×2048)
+  ↓
+【融合点1：Token替换】
+  ↓ 在image_token位置插入视觉特征
+融合序列 (B×(seq_len+num_patches)×2048)
+  ↓ Qwen3-1.5B LLM (12层Self-Attention)
+Vision-Language特征 (B×T×2048)
+  ↓ vl_self_attention (4层Self-Attention)
+增强的VL特征 (B×T×2048)
+  ↓
+机器人状态 (B×64)
+  ↓ State Encoder
+状态特征 (B×1×1536)
+  ↓
+动作序列 (B×T×32)
+  ↓ Action Encoder
+动作特征 (B×T×1536)
+  ↓
+Future Tokens (B×32×1536)
+  ↓
+【融合点2：序列拼接】
+  ↓ torch.cat([state, future, action], dim=1)
+State-Action序列 (B×(1+32+T)×1536)
+  ↓
+【融合点3：DiT Cross-Attention】
+  ↓ Query: State-Action序列 (1536维)
+  ↓ Key/Value: VL特征 (2048→1536维投影)
+  ↓ 16层DiT Blocks (Cross-Attn + Self-Attn)
+融合后的动作特征 (B×T×1024)
+  ↓ Action Decoders
+预测动作 (B×T×16)
+```
+
 ## 模块层级结构
 
 ### EagleBackbone

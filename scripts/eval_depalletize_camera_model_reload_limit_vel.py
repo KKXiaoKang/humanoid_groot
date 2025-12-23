@@ -120,7 +120,8 @@ from configs.config import ROBOT_VERSION
 # 使用GrootPolicy模型
 from lerobot.policies.groot.modeling_groot import GrootPolicy
 from lerobot.policies.groot.processor_groot import make_groot_pre_post_processors
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.datasets.lerobot_dataset import LeRobotDataset, MultiLeRobotDataset
+from lerobot.datasets.compute_stats import aggregate_stats
 
 # import torchvision
 # import matplotlib.pyplot as plt
@@ -578,6 +579,9 @@ def load_model_and_env(ckpt_path, model_type, action_chunk_size=50, lerobot_data
     """
     加载模型和环境（只执行一次，避免重复加载）
     
+    Args:
+        lerobot_dataset_path: 数据集路径，可以是单个路径（str）或多个路径（list[str]）。如果提供多个路径，将聚合这些数据集的统计信息用于反归一化。
+    
     Returns:
         tuple: (policy, preprocessor, postprocessor, env, dataset_stats, task_description, device)
     """
@@ -592,41 +596,75 @@ def load_model_and_env(ckpt_path, model_type, action_chunk_size=50, lerobot_data
     print(f"\n📂 Loading dataset for statistics and task information...")
     dataset_stats = None
     available_tasks = None
-    if lerobot_dataset_path:
-        try:
-            dataset_for_stats = LeRobotDataset(repo_id=0, root=lerobot_dataset_path)
-            dataset_stats = dataset_for_stats.meta.stats if hasattr(dataset_for_stats.meta, 'stats') else None
-            print(f"✅ Dataset statistics loaded: {list(dataset_stats.keys()) if dataset_stats else 'None'}")
-            if dataset_stats is None:
-                print("⚠️ Warning: Dataset has no statistics. Action denormalization may not work correctly.")
-            elif 'action' not in dataset_stats:
-                print("⚠️ Warning: Dataset statistics do not contain 'action' key. Action denormalization may not work correctly.")
-            
-            # 加载可用的任务列表
-            if hasattr(dataset_for_stats.meta, 'tasks') and dataset_for_stats.meta.tasks is not None:
-                available_tasks = list(dataset_for_stats.meta.tasks.index)
-                print(f"✅ Available tasks in dataset: {available_tasks}")
-        except Exception as e:
-            print(f"⚠️ Warning: Could not load dataset statistics: {e}")
-            print("   This may cause normalization issues during inference")
-    else:
-        print("⚠️ Warning: No dataset path provided. Using default dataset for statistics.")
-        try:
-            dataset_for_stats = LeRobotDataset(repo_id=0, root='/home/lab/lerobot_groot/lerobot_data/new_demo/1118_sim_depalletize')
-            dataset_stats = dataset_for_stats.meta.stats if hasattr(dataset_for_stats.meta, 'stats') else None
-            print(f"✅ Dataset statistics loaded from default path: {list(dataset_stats.keys()) if dataset_stats else 'None'}")
-            if dataset_stats is None:
-                print("⚠️ Warning: Default dataset has no statistics. Action denormalization may not work correctly.")
-            elif 'action' not in dataset_stats:
-                print("⚠️ Warning: Default dataset statistics do not contain 'action' key. Action denormalization may not work correctly.")
-            
-            # 加载可用的任务列表
-            if hasattr(dataset_for_stats.meta, 'tasks') and dataset_for_stats.meta.tasks is not None:
-                available_tasks = list(dataset_for_stats.meta.tasks.index)
-                print(f"✅ Available tasks in default dataset: {available_tasks}")
-        except Exception as e:
-            print(f"⚠️ Warning: Could not load default dataset statistics: {e}")
-            print("   This may cause normalization issues during inference")
+    
+    # 处理 lerobot_dataset_path：可以是单个路径（str）或多个路径（list）
+    dataset_paths = []
+    if lerobot_dataset_path is not None:
+        if isinstance(lerobot_dataset_path, (list, tuple)):
+            dataset_paths = list(lerobot_dataset_path)
+        else:
+            dataset_paths = [lerobot_dataset_path]
+    
+    # 如果提供了多个数据集路径，使用聚合统计信息
+    if len(dataset_paths) > 1:
+        # 使用多个数据集计算合并的统计信息
+        print(f"📊 Loading {len(dataset_paths)} datasets for aggregated statistics:")
+        for i, path in enumerate(dataset_paths):
+            print(f"   {i+1}. {path}")
+        
+        # 从完整路径加载数据集
+        # 如果路径是完整的数据集根目录，直接使用路径作为root，repo_id可以是0或路径名
+        training_datasets = []
+        for path in dataset_paths:
+            path_obj = Path(path)
+            # 使用路径名作为repo_id，完整路径作为root
+            # LeRobotDataset会直接使用root，不会与repo_id拼接
+            repo_id = path_obj.name  # 路径的最后一部分作为repo_id（用于标识）
+            root = path_obj          # 完整路径作为root
+            print(f"   Loading dataset: repo_id='{repo_id}', root='{root}'")
+            dataset = LeRobotDataset(repo_id=repo_id, root=root)
+            training_datasets.append(dataset)
+        
+        # 聚合统计信息
+        print(f"📊 Aggregating statistics from {len(training_datasets)} datasets...")
+        stats_list = [ds.meta.stats for ds in training_datasets if ds.meta.stats is not None]
+        if len(stats_list) > 0:
+            dataset_stats = aggregate_stats(stats_list)
+            print(f"✅ Aggregated statistics loaded: {list(dataset_stats.keys())}")
+        else:
+            print("⚠️  Warning: No statistics found in training datasets")
+            dataset_stats = None
+        
+        # 从第一个数据集加载任务列表（用于任务描述）
+        if len(training_datasets) > 0:
+            dataset_for_tasks = training_datasets[0]
+            if hasattr(dataset_for_tasks.meta, 'tasks') and dataset_for_tasks.meta.tasks is not None:
+                available_tasks = list(dataset_for_tasks.meta.tasks.index)
+                print(f"✅ Available tasks from first dataset: {available_tasks}")
+    
+    # 如果只有一个数据集路径或加载失败，使用单个数据集
+    if dataset_stats is None:
+        if len(dataset_paths) == 1:
+            # 单个数据集路径
+            try:
+                dataset_for_stats = LeRobotDataset(repo_id=0, root=dataset_paths[0])
+                dataset_stats = dataset_for_stats.meta.stats if hasattr(dataset_for_stats.meta, 'stats') else None
+                print(f"📊 Using statistics from provided dataset: {dataset_paths[0]}")
+                print(f"✅ Dataset statistics loaded: {list(dataset_stats.keys()) if dataset_stats else 'None'}")
+                if dataset_stats is None:
+                    print("⚠️ Warning: Dataset has no statistics. Action denormalization may not work correctly.")
+                elif 'action' not in dataset_stats:
+                    print("⚠️ Warning: Dataset statistics do not contain 'action' key. Action denormalization may not work correctly.")
+                
+                # 加载可用的任务列表
+                if hasattr(dataset_for_stats.meta, 'tasks') and dataset_for_stats.meta.tasks is not None:
+                    available_tasks = list(dataset_for_stats.meta.tasks.index)
+                    print(f"✅ Available tasks in dataset: {available_tasks}")
+            except Exception as e:
+                raise ValueError(f"❌ Error: Could not load dataset statistics from {dataset_paths[0]}: {e}. Please check the dataset path and try again.")
+        elif len(dataset_paths) == 0:
+            # 没有提供数据集路径，抛出异常
+            raise ValueError("❌ Error: No dataset path provided. Please specify --lerobot_dataset_path with at least one dataset path. Example: --lerobot_dataset_path /path/to/dataset")
     
     # 确定要使用的任务描述
     if task_description is None:
@@ -1706,7 +1744,7 @@ def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chun
         control_arm: 是否控制手臂
         control_claw: 是否控制夹爪
         action_chunk_size: 动作块大小
-        lerobot_dataset_path: 数据集路径（用于加载统计信息，可选）
+        lerobot_dataset_path: 数据集路径，可以是单个路径（str）或多个路径（list[str]）。如果提供多个路径，将聚合这些数据集的统计信息用于反归一化。
         enable_gui: 是否启用GUI窗口显示相机图像
         rotate_head_camera: 是否旋转头部相机图像180度
         state_zero: 是否将状态输入置零（用于验证模型对状态的依赖性）
@@ -1842,7 +1880,7 @@ if __name__ == '__main__':
     parser.add_argument('--eval', action='store_true', help='Evaluate the model in real-time environment')
     parser.add_argument('--replay', action='store_true', help='Replay the model')
     parser.add_argument('--action_chunk_size', type=int, default=20, help='Number of action steps')
-    parser.add_argument('--lerobot_dataset_path', type=str, default=None, help='Path to the LeRobot dataset for loading statistics (optional)')
+    parser.add_argument('--lerobot_dataset_path', nargs='+', type=str, default=None, help='Path(s) to the LeRobot dataset(s) for loading statistics. Can specify multiple paths (space-separated) to aggregate statistics from multiple datasets. Example: --lerobot_dataset_path /path/to/dataset1 /path/to/dataset2')
     parser.add_argument('--enable_gui', action='store_true',
                         help='Enable GUI windows for camera display (default: disabled)')
     parser.add_argument('--rotate-head-camera', action='store_true',
@@ -1908,7 +1946,12 @@ if __name__ == '__main__':
     if args.state_zero:
         print(f"⚠️  State zero mode: Enabled (all state inputs will be set to zero)")
     if args.lerobot_dataset_path:
-        print(f"📁 Dataset path (for stats): {args.lerobot_dataset_path}")
+        if len(args.lerobot_dataset_path) > 1:
+            print(f"📊 Dataset paths (for aggregated stats): {args.lerobot_dataset_path}")
+        else:
+            print(f"📁 Dataset path (for stats): {args.lerobot_dataset_path[0]}")
+    else:
+        print(f"📊 Dataset path: Using default dataset statistics")
     if args.task_description:
         print(f"📝 Task description: '{args.task_description}'")
     if args.skip_chunk_ratio > 0.0:
