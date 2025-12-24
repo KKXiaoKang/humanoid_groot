@@ -780,27 +780,27 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
     # 加载并回放初始轨迹（只在第一次推理时加载bag文件）
     if is_first_inference:
         init_traj_bag_path = '/home/lab/kuavo-manip/robot_depalletize_init_traj.bag'
-        if os.path.exists(init_traj_bag_path):
-            rospy.loginfo("Loading and replaying initial trajectory from bag file (first inference only)...")
-            # FIXME:第一帧的位置4pro和5wheel不一样，需要处理
-            if ROBOT_VERSION == "4_pro":
-                load_and_replay_init_trajectory(
-                    bag_path=init_traj_bag_path,
-                    env=env,
-                    control_arm=control_arm,
-                    control_claw=control_claw
-                )
-                rospy.logwarn(f"Initial trajectory bag file not found: {init_traj_bag_path}")
-                rospy.loginfo("4_pro robot Initial trajectory replay completed. Starting model inference...")
-                time.sleep(1.0)
-            elif ROBOT_VERSION == "5_wheel":
-                cur_dir = os.path.dirname(os.path.abspath(__file__))
-                final_reset_arm(
-                    json_path=os.path.join(cur_dir, 'utils/start_arm_traj.json'), 
-                    env=env,
-                    control_arm=control_arm,
-                    control_claw=control_claw
-                )
+        # if os.path.exists(init_traj_bag_path):
+        #     rospy.loginfo("Loading and replaying initial trajectory from bag file (first inference only)...")
+        #     # FIXME:第一帧的位置4pro和5wheel不一样，需要处理
+        if ROBOT_VERSION == "4_pro":
+            load_and_replay_init_trajectory(
+                bag_path=init_traj_bag_path,
+                env=env,
+                control_arm=control_arm,
+                control_claw=control_claw
+            )
+            rospy.logwarn(f"Initial trajectory bag file not found: {init_traj_bag_path}")
+            rospy.loginfo("4_pro robot Initial trajectory replay completed. Starting model inference...")
+            time.sleep(1.0)
+        elif ROBOT_VERSION == "5_wheel":
+            cur_dir = os.path.dirname(os.path.abspath(__file__))
+            final_reset_arm(
+                json_path=os.path.join(cur_dir, 'utils/start_arm_traj.json'), 
+                env=env,
+                control_arm=control_arm,
+                control_claw=control_claw
+            )
         
         input(f"轨迹回放 结束, 按回车继续 ==== 轨迹回放成功 ==== \n")
         time.sleep(1.0)
