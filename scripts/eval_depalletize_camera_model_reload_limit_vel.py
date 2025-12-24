@@ -120,8 +120,8 @@ from configs.config import ROBOT_VERSION
 # 使用GrootPolicy模型
 from lerobot.policies.groot.modeling_groot import GrootPolicy
 from lerobot.policies.groot.processor_groot import make_groot_pre_post_processors
-from lerobot.datasets.lerobot_dataset import LeRobotDataset, MultiLeRobotDataset
-from lerobot.datasets.compute_stats import aggregate_stats
+from lerobot.policies.factory import make_pre_post_processors
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 # import torchvision
 # import matplotlib.pyplot as plt
@@ -575,15 +575,21 @@ def reset_inference_state(policy, env):
     rospy.loginfo("✅ Inference state reset complete")
 
 
-def load_model_and_env(ckpt_path, model_type, action_chunk_size=50, lerobot_dataset_path=None, enable_gui=False, rotate_head_camera=False, state_zero=False, task_description=None):
+def load_model_and_env(ckpt_path, model_type, action_chunk_size=50, enable_gui=False, rotate_head_camera=False, state_zero=False, task_description=None):
     """
     加载模型和环境（只执行一次，避免重复加载）
     
     Args:
-        lerobot_dataset_path: 数据集路径，可以是单个路径（str）或多个路径（list[str]）。如果提供多个路径，将聚合这些数据集的统计信息用于反归一化。
+        ckpt_path: 模型checkpoint路径
+        model_type: 模型类型（已废弃，保留用于兼容性）
+        action_chunk_size: 动作块大小
+        enable_gui: 是否启用GUI
+        rotate_head_camera: 是否旋转头部相机
+        state_zero: 是否将状态置零
+        task_description: 任务描述字符串，如果为None则使用默认值
     
     Returns:
-        tuple: (policy, preprocessor, postprocessor, env, dataset_stats, task_description, device)
+        tuple: (policy, preprocessor, postprocessor, env, task_description, device)
     """
     # ---------- 1. load GrootPolicy from checkpoint ---------------
     device = "cuda:0"
@@ -592,105 +598,50 @@ def load_model_and_env(ckpt_path, model_type, action_chunk_size=50, lerobot_data
     policy.config.device = device
     policy.config.n_action_steps = action_chunk_size
     
-    # Load dataset statistics for normalization and task information
-    print(f"\n📂 Loading dataset for statistics and task information...")
-    dataset_stats = None
-    available_tasks = None
-    
-    # 处理 lerobot_dataset_path：可以是单个路径（str）或多个路径（list）
-    dataset_paths = []
-    if lerobot_dataset_path is not None:
-        if isinstance(lerobot_dataset_path, (list, tuple)):
-            dataset_paths = list(lerobot_dataset_path)
-        else:
-            dataset_paths = [lerobot_dataset_path]
-    
-    # 如果提供了多个数据集路径，使用聚合统计信息
-    if len(dataset_paths) > 1:
-        # 使用多个数据集计算合并的统计信息
-        print(f"📊 Loading {len(dataset_paths)} datasets for aggregated statistics:")
-        for i, path in enumerate(dataset_paths):
-            print(f"   {i+1}. {path}")
-        
-        # 从完整路径加载数据集
-        # 如果路径是完整的数据集根目录，直接使用路径作为root，repo_id可以是0或路径名
-        training_datasets = []
-        for path in dataset_paths:
-            path_obj = Path(path)
-            # 使用路径名作为repo_id，完整路径作为root
-            # LeRobotDataset会直接使用root，不会与repo_id拼接
-            repo_id = path_obj.name  # 路径的最后一部分作为repo_id（用于标识）
-            root = path_obj          # 完整路径作为root
-            print(f"   Loading dataset: repo_id='{repo_id}', root='{root}'")
-            dataset = LeRobotDataset(repo_id=repo_id, root=root)
-            training_datasets.append(dataset)
-        
-        # 聚合统计信息
-        print(f"📊 Aggregating statistics from {len(training_datasets)} datasets...")
-        stats_list = [ds.meta.stats for ds in training_datasets if ds.meta.stats is not None]
-        if len(stats_list) > 0:
-            dataset_stats = aggregate_stats(stats_list)
-            print(f"✅ Aggregated statistics loaded: {list(dataset_stats.keys())}")
-        else:
-            print("⚠️  Warning: No statistics found in training datasets")
-            dataset_stats = None
-        
-        # 从第一个数据集加载任务列表（用于任务描述）
-        if len(training_datasets) > 0:
-            dataset_for_tasks = training_datasets[0]
-            if hasattr(dataset_for_tasks.meta, 'tasks') and dataset_for_tasks.meta.tasks is not None:
-                available_tasks = list(dataset_for_tasks.meta.tasks.index)
-                print(f"✅ Available tasks from first dataset: {available_tasks}")
-    
-    # 如果只有一个数据集路径或加载失败，使用单个数据集
-    if dataset_stats is None:
-        if len(dataset_paths) == 1:
-            # 单个数据集路径
-            try:
-                dataset_for_stats = LeRobotDataset(repo_id=0, root=dataset_paths[0])
-                dataset_stats = dataset_for_stats.meta.stats if hasattr(dataset_for_stats.meta, 'stats') else None
-                print(f"📊 Using statistics from provided dataset: {dataset_paths[0]}")
-                print(f"✅ Dataset statistics loaded: {list(dataset_stats.keys()) if dataset_stats else 'None'}")
-                if dataset_stats is None:
-                    print("⚠️ Warning: Dataset has no statistics. Action denormalization may not work correctly.")
-                elif 'action' not in dataset_stats:
-                    print("⚠️ Warning: Dataset statistics do not contain 'action' key. Action denormalization may not work correctly.")
-                
-                # 加载可用的任务列表
-                if hasattr(dataset_for_stats.meta, 'tasks') and dataset_for_stats.meta.tasks is not None:
-                    available_tasks = list(dataset_for_stats.meta.tasks.index)
-                    print(f"✅ Available tasks in dataset: {available_tasks}")
-            except Exception as e:
-                raise ValueError(f"❌ Error: Could not load dataset statistics from {dataset_paths[0]}: {e}. Please check the dataset path and try again.")
-        elif len(dataset_paths) == 0:
-            # 没有提供数据集路径，抛出异常
-            raise ValueError("❌ Error: No dataset path provided. Please specify --lerobot_dataset_path with at least one dataset path. Example: --lerobot_dataset_path /path/to/dataset")
-    
     # 确定要使用的任务描述
     if task_description is None:
-        if available_tasks and len(available_tasks) > 0:
-            # 使用数据集中第一个任务作为默认值
-            task_description = available_tasks[0]
-            print(f"📝 Using first task from dataset as default: '{task_description}'")
-        else:
-            # 使用通用默认值
-            task_description = "Depalletize the box"
-            print(f"📝 No task found in dataset, using default: '{task_description}'")
+        # 使用通用默认值
+        task_description = "Depalletize the box"
+        print(f"📝 Using default task description: '{task_description}'")
     else:
         print(f"📝 Using provided task description: '{task_description}'")
     
-    # 如果提供了任务描述但不在可用任务列表中，给出警告
-    if available_tasks and task_description not in available_tasks:
-        print(f"⚠️ Warning: Task '{task_description}' not found in dataset tasks: {available_tasks}")
-        print(f"   Using provided task description anyway...")
-    
-    # Create preprocessor and postprocessor
-    print(f"\n🔧 Creating preprocessor and postprocessor...")
-    preprocessor, postprocessor = make_groot_pre_post_processors(
-        config=policy.config,
-        dataset_stats=dataset_stats,
-    )
-    print("✅ Preprocessor and postprocessor created")
+    # 从 checkpoint 加载 preprocessor 和 postprocessor（必须包含 dataset_stats）
+    print(f"\n🔧 Loading preprocessor and postprocessor from checkpoint...")
+    try:
+        # 从 checkpoint 加载，不提供 dataset_stats，让它从 checkpoint 中加载
+        preprocessor, postprocessor = make_pre_post_processors(
+            policy_cfg=policy.config,
+            pretrained_path=ckpt_path,
+        )
+        print("✅ Preprocessor and postprocessor loaded from checkpoint")
+        
+        # 检查 postprocessor 中是否有 stats
+        # 从 postprocessor 的步骤中提取 stats（如果存在）
+        dataset_stats = None
+        for step in postprocessor.steps:
+            if hasattr(step, 'stats') and step.stats is not None:
+                dataset_stats = step.stats
+                print(f"✅ Found dataset_stats in checkpoint postprocessor")
+                break
+        
+        if dataset_stats is None:
+            raise ValueError(
+                "❌ ERROR: No dataset_stats found in checkpoint postprocessor. "
+                "The checkpoint must contain dataset_stats for normalization. "
+                "Please ensure the checkpoint was saved with proper statistics."
+            )
+        
+        print(f"✅ Using dataset_stats from checkpoint: {list(dataset_stats.keys()) if dataset_stats else 'None'}")
+                
+    except ValueError as e:
+        # 如果是我们抛出的 ValueError（stats 缺失），直接抛出
+        raise
+    except Exception as e:
+        raise RuntimeError(
+            f"❌ ERROR: Failed to load processors from checkpoint: {e}\n"
+            f"   Please ensure the checkpoint path is correct and contains preprocessor/postprocessor files."
+        ) from e
     
     # Debug: Print model configuration
     print(f"🔍 Model configuration input_features keys: {list(policy.config.input_features.keys()) if hasattr(policy.config, 'input_features') else 'N/A'}")
@@ -708,7 +659,7 @@ def load_model_and_env(ckpt_path, model_type, action_chunk_size=50, lerobot_data
     print(" ======================  Buffer ready ====================== ")
     time.sleep(1)
     
-    return policy, preprocessor, postprocessor, env, dataset_stats, task_description, device
+    return policy, preprocessor, postprocessor, env, task_description, device
 
 def set_arm_quick_mode(enable: bool) -> bool:
     """开关手臂快速模式"""
@@ -727,7 +678,7 @@ def set_arm_quick_mode(enable: bool) -> bool:
         rospy.logerr(f"Service call failed: {e}")
         return False
 
-def run_inference_loop(policy, preprocessor, env, dataset_stats, task_description, device, 
+def run_inference_loop(policy, preprocessor, postprocessor, env, task_description, device, 
                        control_arm=True, control_claw=True, action_chunk_size=50, 
                        enable_gui=False, rotate_head_camera=False, state_zero=False,
                        is_first_inference=True, skip_chunk_ratio=0.0, skip_chunk_from_end=False, model_action_dt=None,
@@ -738,8 +689,8 @@ def run_inference_loop(policy, preprocessor, env, dataset_stats, task_descriptio
     Args:
         policy: 已加载的GrootPolicy模型
         preprocessor: 预处理器
+        postprocessor: 后处理器（用于反归一化）
         env: 已初始化的GrabBoxMpcEnv环境
-        dataset_stats: 数据集统计信息
         task_description: 任务描述
         device: 设备
         control_arm: 是否控制手臂
@@ -903,29 +854,21 @@ def run_inference_loop(policy, preprocessor, env, dataset_stats, task_descriptio
                 with torch.inference_mode():
                     pred_actions = policy.predict_action_chunk(processed_observation)
                 
-                # 反归一化
-                if dataset_stats and 'action' in dataset_stats:
-                    action_stats = dataset_stats['action']
-                    if 'min' in action_stats and 'max' in action_stats:
-                        action_min = torch.as_tensor(action_stats['min'], dtype=torch.float32, device=pred_actions.device)
-                        action_max = torch.as_tensor(action_stats['max'], dtype=torch.float32, device=pred_actions.device)
-                        action_dim = pred_actions.shape[-1]
-                        if action_min.numel() < action_dim:
-                            action_min = torch.nn.functional.pad(action_min.flatten()[:action_dim], (0, max(0, action_dim - action_min.numel())))
-                        if action_max.numel() < action_dim:
-                            action_max = torch.nn.functional.pad(action_max.flatten()[:action_dim], (0, max(0, action_dim - action_max.numel())))
-                        action_min = action_min[:action_dim]
-                        action_max = action_max[:action_dim]
-                        denom = action_max - action_min
-                        mask = denom != 0
-                        safe_denom = torch.where(mask, denom, torch.ones_like(denom))
-                        pred_actions_unnorm = (pred_actions + 1.0) * 0.5 * safe_denom + action_min
-                        pred_actions_unnorm = torch.where(mask, pred_actions_unnorm, action_min)
-                        action_chunk = pred_actions_unnorm[0].cpu().numpy()
-                    else:
-                        action_chunk = pred_actions[0].cpu().numpy()
-                else:
-                    action_chunk = pred_actions[0].cpu().numpy()
+                # 使用 postprocessor 进行反归一化
+                # pred_actions shape: (batch_size, chunk_size, action_dim)
+                # postprocessor 期望输入是 (B, action_dim)，所以需要处理整个 chunk
+                _, chunk_size, _ = pred_actions.shape
+                processed_actions = []
+                for i in range(chunk_size):
+                    # 提取单个 action: (B, action_dim)
+                    single_action = pred_actions[:, i, :]
+                    # 使用 postprocessor 进行反归一化
+                    processed_action = postprocessor(single_action)
+                    processed_actions.append(processed_action)
+                
+                # 堆叠回 (B, chunk_size, action_dim)，然后转换为 numpy
+                pred_actions_unnorm = torch.stack(processed_actions, dim=1)  # (B, chunk_size, action_dim)
+                action_chunk = pred_actions_unnorm[0].cpu().numpy()  # (chunk_size, action_dim)
                 
                 # 跳过chunk的百分之多少（前面或后面）
                 if skip_chunk_ratio > 0.0:
@@ -1278,42 +1221,21 @@ def run_inference_loop(policy, preprocessor, env, dataset_stats, task_descriptio
                 # 注意：pred_actions是归一化后的值，范围在[-1, 1]
                 # 需要手动反归一化到真实单位
                 
-                # 手动反归一化整个chunk
-                if dataset_stats and 'action' in dataset_stats:
-                    action_stats = dataset_stats['action']
-                    if 'min' in action_stats and 'max' in action_stats:
-                        action_min = torch.as_tensor(action_stats['min'], dtype=torch.float32, device=pred_actions.device)
-                        action_max = torch.as_tensor(action_stats['max'], dtype=torch.float32, device=pred_actions.device)
-                        
-                        # 确保维度匹配
-                        action_dim = pred_actions.shape[-1]
-                        if action_min.numel() < action_dim:
-                            action_min = torch.nn.functional.pad(action_min.flatten()[:action_dim], (0, max(0, action_dim - action_min.numel())))
-                        if action_max.numel() < action_dim:
-                            action_max = torch.nn.functional.pad(action_max.flatten()[:action_dim], (0, max(0, action_dim - action_max.numel())))
-                        
-                        action_min = action_min[:action_dim]
-                        action_max = action_max[:action_dim]
-                        
-                        # 反归一化公式：x = (y + 1) / 2 * (max - min) + min
-                        denom = action_max - action_min
-                        mask = denom != 0
-                        safe_denom = torch.where(mask, denom, torch.ones_like(denom))
-                        
-                        # 反归一化整个chunk
-                        pred_actions_unnorm = (pred_actions + 1.0) * 0.5 * safe_denom + action_min
-                        pred_actions_unnorm = torch.where(mask, pred_actions_unnorm, action_min)
-                        
-                        # 转换为numpy
-                        action_chunk = pred_actions_unnorm[0].cpu().numpy()  # (chunk_size, action_dim)
-                    else:
-                        # 如果没有统计信息，使用原始值（可能已经是反归一化的）
-                        action_chunk = pred_actions[0].cpu().numpy()  # (chunk_size, action_dim)
-                        rospy.logwarn("⚠️ Warning: No action min/max stats found. Using raw predictions (may be normalized).")
-                else:
-                    # 如果没有统计信息，使用原始值
-                    action_chunk = pred_actions[0].cpu().numpy()  # (chunk_size, action_dim)
-                    rospy.logwarn("⚠️ Warning: No dataset stats found. Using raw predictions (may be normalized).")
+                # 使用 postprocessor 进行反归一化
+                # pred_actions shape: (batch_size, chunk_size, action_dim)
+                # postprocessor 期望输入是 (B, action_dim)，所以需要处理整个 chunk
+                _, chunk_size, _ = pred_actions.shape
+                processed_actions = []
+                for i in range(chunk_size):
+                    # 提取单个 action: (B, action_dim)
+                    single_action = pred_actions[:, i, :]
+                    # 使用 postprocessor 进行反归一化
+                    processed_action = postprocessor(single_action)
+                    processed_actions.append(processed_action)
+                
+                # 堆叠回 (B, chunk_size, action_dim)，然后转换为 numpy
+                pred_actions_unnorm = torch.stack(processed_actions, dim=1)  # (B, chunk_size, action_dim)
+                action_chunk = pred_actions_unnorm[0].cpu().numpy()  # (chunk_size, action_dim)
 
                 # 根据skip_chunk_ratio跳过chunk的百分之多少（前面或后面）
                 if skip_chunk_ratio > 0.0:
@@ -1733,7 +1655,7 @@ def final_reset_arm(json_path, env, control_arm=True, control_claw=True):
     rospy.loginfo("Arm reset completed!")
 
 
-def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chunk_size=50, lerobot_dataset_path=None, enable_gui=False, rotate_head_camera=False, state_zero=False, task_description=None, skip_chunk_ratio=0.0, skip_chunk_from_end=False, model_action_dt=None, sync_mode=False, max_joint_velocity=None):
+def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chunk_size=50, enable_gui=False, rotate_head_camera=False, state_zero=False, task_description=None, skip_chunk_ratio=0.0, skip_chunk_from_end=False, model_action_dt=None, sync_mode=False, max_joint_velocity=None):
     """
     在这里和实机/仿真交互，做网络推理（depalletize任务）
     支持多次推理：按'q'退出当前推理，可以快速重新开始下一次推理而无需重新加载模型
@@ -1744,11 +1666,10 @@ def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chun
         control_arm: 是否控制手臂
         control_claw: 是否控制夹爪
         action_chunk_size: 动作块大小
-        lerobot_dataset_path: 数据集路径，可以是单个路径（str）或多个路径（list[str]）。如果提供多个路径，将聚合这些数据集的统计信息用于反归一化。
         enable_gui: 是否启用GUI窗口显示相机图像
         rotate_head_camera: 是否旋转头部相机图像180度
         state_zero: 是否将状态输入置零（用于验证模型对状态的依赖性）
-        task_description: 任务描述字符串（language instruction），如果为None则从数据集加载或使用默认值
+        task_description: 任务描述字符串（language instruction），如果为None则使用默认值
         skip_chunk_ratio: 跳过chunk的百分之多少（0.0-1.0），例如0.2表示跳过20%
         skip_chunk_from_end: 如果True，跳过chunk的后百分之多少；如果False，跳过chunk的前百分之多少
         model_action_dt: 模型动作时间间隔（秒），控制推理频率。例如：0.1 = 10 Hz, 0.05 = 20 Hz, 0.033 = 30 Hz
@@ -1758,11 +1679,10 @@ def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chun
     """
     
     # 加载模型和环境（只执行一次）
-    policy, preprocessor, postprocessor, env, dataset_stats, final_task_description, device = load_model_and_env(
+    policy, preprocessor, postprocessor, env, final_task_description, device = load_model_and_env(
         ckpt_path=ckpt_path,
         model_type=model_type,
         action_chunk_size=action_chunk_size,
-        lerobot_dataset_path=lerobot_dataset_path,
         enable_gui=enable_gui,
         rotate_head_camera=rotate_head_camera,
         state_zero=state_zero,
@@ -1794,8 +1714,8 @@ def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chun
             normal_exit = run_inference_loop(
                 policy=policy,
                 preprocessor=preprocessor,
+                postprocessor=postprocessor,
                 env=env,
-                dataset_stats=dataset_stats,
                 task_description=final_task_description,
                 device=device,
                 control_arm=control_arm,
@@ -1880,7 +1800,6 @@ if __name__ == '__main__':
     parser.add_argument('--eval', action='store_true', help='Evaluate the model in real-time environment')
     parser.add_argument('--replay', action='store_true', help='Replay the model')
     parser.add_argument('--action_chunk_size', type=int, default=20, help='Number of action steps')
-    parser.add_argument('--lerobot_dataset_path', nargs='+', type=str, default=None, help='Path(s) to the LeRobot dataset(s) for loading statistics. Can specify multiple paths (space-separated) to aggregate statistics from multiple datasets. Example: --lerobot_dataset_path /path/to/dataset1 /path/to/dataset2')
     parser.add_argument('--enable_gui', action='store_true',
                         help='Enable GUI windows for camera display (default: disabled)')
     parser.add_argument('--rotate-head-camera', action='store_true',
@@ -1945,13 +1864,6 @@ if __name__ == '__main__':
         print(f"🔄 Rotate head camera: Enabled (images from 'image' camera will be rotated 180 degrees)")
     if args.state_zero:
         print(f"⚠️  State zero mode: Enabled (all state inputs will be set to zero)")
-    if args.lerobot_dataset_path:
-        if len(args.lerobot_dataset_path) > 1:
-            print(f"📊 Dataset paths (for aggregated stats): {args.lerobot_dataset_path}")
-        else:
-            print(f"📁 Dataset path (for stats): {args.lerobot_dataset_path[0]}")
-    else:
-        print(f"📊 Dataset path: Using default dataset statistics")
     if args.task_description:
         print(f"📝 Task description: '{args.task_description}'")
     if args.skip_chunk_ratio > 0.0:
@@ -1969,7 +1881,6 @@ if __name__ == '__main__':
         print("🚀 Starting real-time evaluation...")
         eval(args.ckpt_path, model_type=args.model_type, control_arm=True, control_claw=True, 
              action_chunk_size=args.action_chunk_size, 
-             lerobot_dataset_path=args.lerobot_dataset_path,
              enable_gui=args.enable_gui,
              rotate_head_camera=args.rotate_head_camera,
              state_zero=args.state_zero,
