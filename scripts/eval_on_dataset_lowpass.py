@@ -17,7 +17,13 @@ Usage:
 """
 
 import os, sys
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+# Ensure repo root and `src/` are on sys.path so we import the in-repo `lerobot` (with RTC changes),
+# instead of an older site-packages installation.
+_repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+_src_root = os.path.join(_repo_root, "src")
+for _p in (_src_root, _repo_root):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 import torch
 import numpy as np
@@ -217,7 +223,15 @@ def eval_on_dataset(ckpt_path,
                     state_zero=False,
                     cam_head_zero=False,
                     infer_per_frame: int = 1,
-                    task_description: str | None = None):
+                    task_description: str | None = None,
+                    # ---- RTC (local, no server/client) ----
+                    use_rtc: bool = False,
+                    rtc_dt: float = MODEL_ACTION_DT,
+                    rtc_beta: float = 5.0,
+                    rtc_smin: int = 1,
+                    rtc_delay_buffer_size: int = 10,
+                    rtc_extra_delay_steps: int = 0,
+                    inject_inference_delay_ms: float = 0.0):
     """
     在数据集上评估模型
     
@@ -237,6 +251,17 @@ def eval_on_dataset(ckpt_path,
     mse_per_action_dim = OrderedDict() # 记录每个动作维度的MSE
     mae_per_action_dim = OrderedDict() # 记录每个动作维度的MAE
     infer_per_frame = max(1, infer_per_frame)  # 至少每帧推理一次
+    rtc_dt = float(rtc_dt)
+    if rtc_dt <= 0:
+        raise ValueError(f"rtc_dt must be positive, got {rtc_dt}")
+
+    # RTC local state
+    rtc_prev_chunk_norm: torch.Tensor | None = None  # (B, H, A) normalized
+    rtc_delay_hist: list[int] = []
+    rtc_guided_calls = 0
+    rtc_prefix_err_max: list[float] = []
+    rtc_prefix_err_mean: list[float] = []
+    chunk_boundary_jump: list[float] = []  # L2 jump between prev executed and new first action (unnormalized)
 
     # ------------- 初始化visualizer (可选) -------------
     if RERUN_AVAILABLE:
@@ -265,6 +290,17 @@ def eval_on_dataset(ckpt_path,
         print(f"📝 Task description (overridden): '{task_description}'")
     else:
         print(f"📝 Task description: Will use task from dataset")
+    if use_rtc:
+        print(
+            f"🧩 RTC ENABLED (local): rtc_dt={rtc_dt}s, beta={rtc_beta}, smin={rtc_smin}, "
+            f"delay_buf={rtc_delay_buffer_size}, extra_d={rtc_extra_delay_steps}, inject_delay_ms={inject_inference_delay_ms}"
+        )
+        print(f"🔍 RTC API available on policy: {hasattr(policy, 'predict_action_chunk_rtc')}")
+        try:
+            import inspect
+            print(f"🔍 policy defined in: {inspect.getfile(policy.__class__)}")
+        except Exception:
+            pass
     if image_zero:
         print(f"⚠️  IMAGE ZERO MODE: All image inputs will be set to zero (for dependency testing)")
     if state_zero:
@@ -602,9 +638,46 @@ def eval_on_dataset(ckpt_path,
                 torch.cuda.synchronize()
             inference_start = time.perf_counter()
             
-            # 模型推理
-            with torch.inference_mode():
-                pred_actions = policy.predict_action_chunk(processed_observation)
+            if inject_inference_delay_ms > 0:
+                time.sleep(inject_inference_delay_ms / 1000.0)
+
+            # 模型推理（RTC 本地模式：需要 autograd 做 VJP，不能用 inference_mode）
+            if use_rtc and hasattr(policy, "predict_action_chunk_rtc") and (rtc_prev_chunk_norm is not None):
+                d_est = max(rtc_delay_hist) if len(rtc_delay_hist) > 0 else 0
+                d_est = int(d_est) + int(rtc_extra_delay_steps)
+                H = int(n_actions)
+                # 用 infer_per_frame 近似“已执行步数 s”，并保证 d <= s <= H - d
+                s = max(int(rtc_smin), int(infer_per_frame), int(d_est))
+                s = min(s, max(s, H - d_est))
+
+                pred_actions = policy.predict_action_chunk_rtc(
+                    processed_observation,
+                    rtc_prev_actions=rtc_prev_chunk_norm,
+                    rtc_d=d_est,
+                    rtc_s=s,
+                    rtc_beta=float(rtc_beta),
+                ).detach()
+                rtc_guided_calls += 1
+
+                # 冻结前缀误差（normalized）用于快速验证 RTC inpainting 是否生效
+                suffix = rtc_prev_chunk_norm[:, s:, :]
+                if suffix.shape[1] < H:
+                    pad = torch.zeros(
+                        (suffix.shape[0], H - suffix.shape[1], suffix.shape[2]),
+                        device=suffix.device,
+                        dtype=suffix.dtype,
+                    )
+                    aprev = torch.cat([suffix, pad], dim=1)
+                else:
+                    aprev = suffix[:, :H, :]
+                d_clamped = max(0, min(int(d_est), H))
+                if d_clamped > 0:
+                    diff = (pred_actions[:, :d_clamped, :] - aprev[:, :d_clamped, :]).abs()
+                    rtc_prefix_err_max.append(float(diff.max().item()))
+                    rtc_prefix_err_mean.append(float(diff.mean().item()))
+            else:
+                with torch.inference_mode():
+                    pred_actions = policy.predict_action_chunk(processed_observation)
             
             # 确保 GPU 操作完成后再记录结束时间
             if device.startswith('cuda'):
@@ -612,6 +685,14 @@ def eval_on_dataset(ckpt_path,
             inference_end = time.perf_counter()
             inference_time = inference_end - inference_start
             inference_times.append(inference_time)
+
+            # 更新 RTC delay buffer + prev chunk（normalized）
+            if use_rtc:
+                d_obs = int(np.ceil(inference_time / max(rtc_dt, 1e-6))) + int(rtc_extra_delay_steps)
+                rtc_delay_hist.append(d_obs)
+                if len(rtc_delay_hist) > int(rtc_delay_buffer_size):
+                    rtc_delay_hist = rtc_delay_hist[-int(rtc_delay_buffer_size):]
+                rtc_prev_chunk_norm = pred_actions.detach()
             
             # 打印action维度
             print(f"pred_actions shape: {pred_actions.shape}")
@@ -632,6 +713,13 @@ def eval_on_dataset(ckpt_path,
             pred_actions_unnorm = torch.stack(processed_actions, dim=1)  # (B, chunk_size, action_dim)
             pred_chunk = pred_actions_unnorm[0].cpu().numpy()  # (chunk_size, action_dim)
             pred_action_single = pred_chunk[0]  # (action_dim,) - 取第一个 action
+
+            # 记录 chunk 边界跳变（unnormalized、未经过低通）
+            if previous_resampled_action is not None:
+                try:
+                    chunk_boundary_jump.append(float(np.linalg.norm(pred_action_single - previous_resampled_action)))
+                except Exception:
+                    pass
             
             # 保存预测结果供后续帧使用
             last_inferred_chunk = pred_chunk.copy()
@@ -785,13 +873,13 @@ def eval_on_dataset(ckpt_path,
                         width=2
                     )
 
-                    if last_data_step != data_step and last_data_step > 0:
-                        vizer.del_chunk(
-                            name=f"chunk/action_dim_{dim}/pred_seg_{last_data_step}",
-                            chunk_data=pred_chunk[:, dim],
-                            step_id=last_data_step,
-                            width=0.5
-                        )
+                    # if last_data_step != data_step and last_data_step > 0:
+                    #     vizer.del_chunk(
+                    #         name=f"chunk/action_dim_{dim}/pred_seg_{last_data_step}",
+                    #         chunk_data=pred_chunk[:, dim],
+                    #         step_id=last_data_step,
+                    #         width=0.5
+                    #     )
             
             if should_infer and resampled_chunk is not None and resampled_chunk.size > 0:
                 resampled_steps_axis = np.arange(control_step_cursor, control_step_cursor + resampled_chunk.shape[0], dtype=int)
@@ -959,6 +1047,31 @@ def eval_on_dataset(ckpt_path,
         print("="*80)
     else:
         print("\n⚠️  Warning: No inference time statistics available (no inference was performed)")
+
+    # ========= RTC 验证统计（本地，无 server/client）=========
+    if use_rtc:
+        print("\n" + "=" * 80)
+        print("🧩 RTC Local Evaluation Summary (no server/client)")
+        print("=" * 80)
+        print(f"RTC-guided inference calls: {rtc_guided_calls}")
+        if len(rtc_prefix_err_max) > 0:
+            print(f"Frozen-prefix |abs| error (normalized) over {len(rtc_prefix_err_max)} guided calls:")
+            print(f"  - max : mean={np.mean(rtc_prefix_err_max):.6f}, p95={np.percentile(rtc_prefix_err_max,95):.6f}")
+            print(f"  - mean: mean={np.mean(rtc_prefix_err_mean):.6f}, p95={np.percentile(rtc_prefix_err_mean,95):.6f}")
+            print("Interpretation: 越接近 0，说明 RTC 冻结前缀约束越强（inpainting 生效）。")
+        else:
+            if rtc_guided_calls > 0:
+                print("RTC 已触发，但当前估计 d=0（或 d_clamped=0），因此没有冻结前缀误差可统计。")
+                print("建议：增大 --inject-inference-delay-ms 或调整 --rtc-dt 使 d>=1。")
+            else:
+                print("RTC 未触发：通常是 policy 没有 predict_action_chunk_rtc（环境导入到旧版 lerobot 或未合入 RTC 代码）。")
+        if len(chunk_boundary_jump) > 0:
+            print(f"Chunk boundary jump (unnormalized L2) over {len(chunk_boundary_jump)} boundaries:")
+            print(
+                f"  - mean={np.mean(chunk_boundary_jump):.6f}, p95={np.percentile(chunk_boundary_jump,95):.6f}, "
+                f"max={np.max(chunk_boundary_jump):.6f}"
+            )
+        print("=" * 80)
     
     # 分组统计 - 根据action维度选择统计方式
     print("\n📊 Grouped Statistics:")
@@ -1030,6 +1143,22 @@ if __name__ == "__main__":
     parser.add_argument('--task-description', type=str, default=None,
                        help='Task description (language instruction) to override the task from dataset. If not provided, will use the task from dataset.')
 
+    # RTC (local, no server/client)
+    parser.add_argument('--use-rtc', action='store_true',
+                        help='Enable RTC guided inpainting locally (no server/client).')
+    parser.add_argument('--rtc-dt', type=float, default=MODEL_ACTION_DT,
+                        help='RTC timestep (seconds per step) used to convert inference time -> delay steps d.')
+    parser.add_argument('--rtc-beta', type=float, default=5.0,
+                        help='RTC guidance clipping beta (recommended ~5).')
+    parser.add_argument('--rtc-smin', type=int, default=1,
+                        help='RTC minimum execution horizon s_min (in steps).')
+    parser.add_argument('--rtc-delay-buffer-size', type=int, default=10,
+                        help='RTC delay buffer size (conservative d_est = max over recent observed delays).')
+    parser.add_argument('--rtc-extra-delay-steps', type=int, default=0,
+                        help='Extra safety margin added to d (in steps).')
+    parser.add_argument('--inject-inference-delay-ms', type=float, default=0.0,
+                        help='Artificially sleep this many ms before each inference to simulate extra latency.')
+
     args = parser.parse_args()
     
     print("\n" + "="*80)
@@ -1061,5 +1190,12 @@ if __name__ == "__main__":
         state_zero=args.state_zero,
         cam_head_zero=args.cam_head_zero,
         infer_per_frame=args.infer_per_frame,
-        task_description=args.task_description
+        task_description=args.task_description,
+        use_rtc=args.use_rtc,
+        rtc_dt=args.rtc_dt,
+        rtc_beta=args.rtc_beta,
+        rtc_smin=args.rtc_smin,
+        rtc_delay_buffer_size=args.rtc_delay_buffer_size,
+        rtc_extra_delay_steps=args.rtc_extra_delay_steps,
+        inject_inference_delay_ms=args.inject_inference_delay_ms,
     )

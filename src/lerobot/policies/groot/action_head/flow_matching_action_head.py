@@ -531,19 +531,114 @@ class FlowmatchingActionHead(nn.Module):
         
         return BatchFeature(data=output_dict)
 
-    @torch.no_grad()
     def get_action(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
+        """
+        Inference-time action sampling.
+
+        - Default path: plain flow matching sampling (no guidance), executed under `torch.no_grad()`.
+        - RTC path (Real-Time Chunking, arXiv:2506.07339): if `rtc_prev_actions` + (`rtc_d`, `rtc_s`) are
+          provided in `action_input`, we run guided inpainting (soft-masked ΠGDM-style guidance) and enable
+          gradients w.r.t. the sampled actions only.
+        """
+        # RTC knobs are passed through `action_input` (BatchFeature wraps the raw dict).
+        use_rtc = (
+            "rtc_prev_actions" in action_input
+            and "rtc_d" in action_input
+            and "rtc_s" in action_input
+            and action_input["rtc_prev_actions"] is not None
+        )
+
+        if not use_rtc:
+            with torch.no_grad():
+                return self._get_action_base(backbone_output, action_input)
+
+        return self._get_action_rtc(backbone_output, action_input)
+
+    def _predict_velocity(
+        self,
+        vl_embs: torch.Tensor,
+        state_features: torch.Tensor,
+        actions: torch.Tensor,
+        timesteps_tensor: torch.Tensor,
+        embodiment_id: torch.Tensor,
+    ) -> torch.Tensor:
+        """v_pi(A, o, tau) in the RTC paper: predicts velocity field for the current action chunk."""
+        action_features = self.action_encoder(actions, timesteps_tensor, embodiment_id)
+        if self.config.add_pos_embed:
+            pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=actions.device)
+            pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
+            action_features = action_features + pos_embs
+
+        future_tokens = self.future_tokens.weight.unsqueeze(0).expand(vl_embs.shape[0], -1, -1)
+        sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1)
+
+        model_output = self.model(
+            hidden_states=sa_embs,
+            encoder_hidden_states=vl_embs,
+            timestep=timesteps_tensor,
+        )
+        model_output_actions = model_output[:, -self.action_horizon :]
+
+        if self.config.use_multi_action_heads:
+            pred_arm = self.action_arm_decoder(model_output_actions, embodiment_id)
+            pred_claw = self.action_claw_decoder(model_output_actions, embodiment_id)
+            pred_velocity = torch.cat([pred_arm, pred_claw], dim=-1)  # (B, T, actual_action_dim)
+        else:
+            pred_velocity = self.action_decoder(model_output_actions, embodiment_id)  # (B, T, action_dim)
+
+        # Pad/truncate to encoder_action_dim so the action_encoder input format stays consistent.
+        if self.encoder_action_dim != self.actual_action_dim:
+            if self.encoder_action_dim > self.actual_action_dim:
+                pad_size = self.encoder_action_dim - self.actual_action_dim
+                padding = torch.zeros(
+                    (pred_velocity.shape[0], pred_velocity.shape[1], pad_size),
+                    device=pred_velocity.device,
+                    dtype=pred_velocity.dtype,
+                )
+                pred_velocity = torch.cat([pred_velocity, padding], dim=-1)
+            else:
+                pred_velocity = pred_velocity[:, :, : self.encoder_action_dim]
+
+        return pred_velocity
+
+    def _rtc_compute_soft_mask(
+        self,
+        horizon: int,
+        d: int,
+        s: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """
+        Soft masking weights W (Eq. 5 in RTC paper), implemented as a simple exponential decay:
+        - W[i] = 1 for i < d
+        - W[i] decays from 1 -> exp(-1) for d <= i < horizon - s
+        - W[i] = 0 for i >= horizon - s
+        """
+        H = horizon
+        d = int(max(0, min(d, H)))
+        s = int(max(0, min(s, H)))
+        mid_end = max(d, H - s)
+
+        w = torch.zeros((H,), device=device, dtype=dtype)
+        if d > 0:
+            w[:d] = 1.0
+        if mid_end > d:
+            # Exponential decay over the overlap region
+            n = mid_end - d
+            # linspace includes endpoints, use n steps for indices [d, mid_end-1]
+            decay = torch.linspace(0.0, 1.0, steps=n, device=device, dtype=dtype)
+            w[d:mid_end] = torch.exp(-decay)
+        # tail stays at 0
+        return w
+
+    def _get_action_base(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
         backbone_output = self.process_backbone_output(backbone_output)
 
-        # Get vision and language embeddings.
         vl_embs = backbone_output.backbone_features
         embodiment_id = action_input.embodiment_id
-
-        # Embed state.
         state_features = self.state_encoder(action_input.state, embodiment_id)
 
-        # Set initial actions as the sampled noise.
-        # Use encoder_action_dim for internal processing (compatible with pretrained model)
         batch_size = vl_embs.shape[0]
         device = vl_embs.device
         actions = torch.randn(
@@ -551,76 +646,142 @@ class FlowmatchingActionHead(nn.Module):
             dtype=vl_embs.dtype,
             device=device,
         )
-        # Zero out padded dimensions to match training behavior
-        # In training, padded dimensions (after actual_action_dim) are always 0
         if self.encoder_action_dim != self.actual_action_dim:
             actions[:, :, self.actual_action_dim:] = 0.0
 
         num_steps = self.num_inference_timesteps
         dt = 1.0 / num_steps
 
-        # Run denoising steps.
         for t in range(num_steps):
-            t_cont = t / float(num_steps)  # e.g. goes 0, 1/N, 2/N, ...
+            t_cont = t / float(num_steps)
             t_discretized = int(t_cont * self.num_timestep_buckets)
-
-            # Embed noised action trajectory.
             timesteps_tensor = torch.full(size=(batch_size,), fill_value=t_discretized, device=device)
-            action_features = self.action_encoder(actions, timesteps_tensor, embodiment_id)
-            # Maybe add position embedding.
-            if self.config.add_pos_embed:
-                pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
-                pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
-                action_features = action_features + pos_embs
 
-            # Join vision, language, state and action embedding along sequence dimension.
-            future_tokens = self.future_tokens.weight.unsqueeze(0).expand(vl_embs.shape[0], -1, -1)
-            sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1)
-
-            # Run model forward.
-            model_output = self.model(
-                hidden_states=sa_embs,
-                encoder_hidden_states=vl_embs,
-                timestep=timesteps_tensor,
+            pred_velocity = self._predict_velocity(
+                vl_embs=vl_embs,
+                state_features=state_features,
+                actions=actions,
+                timesteps_tensor=timesteps_tensor,
+                embodiment_id=embodiment_id,
             )
-            
-            # Slice out only the action portion of model output
-            model_output_actions = model_output[:, -self.action_horizon :]
-            
-            # Multi-head action prediction
-            if self.config.use_multi_action_heads:
-                pred_arm = self.action_arm_decoder(model_output_actions, embodiment_id)
-                pred_claw = self.action_claw_decoder(model_output_actions, embodiment_id)
-                pred_velocity = torch.cat([pred_arm, pred_claw], dim=-1)  # (B, T, action_dim)
-            else:
-                pred = self.action_decoder(model_output_actions, embodiment_id)
-                pred_velocity = pred
 
-            # Update actions using euler integration.
-            # If using multi-head, pred_velocity is actual_action_dim, but actions is encoder_action_dim
+            actions = actions + dt * pred_velocity
             if self.encoder_action_dim != self.actual_action_dim:
-                # Pad pred_velocity to match encoder_action_dim
-                if self.encoder_action_dim > self.actual_action_dim:
-                    pad_size = self.encoder_action_dim - self.actual_action_dim
-                    padding = torch.zeros(
-                        (pred_velocity.shape[0], pred_velocity.shape[1], pad_size),
-                        device=pred_velocity.device,
-                        dtype=pred_velocity.dtype
-                    )
-                    pred_velocity_padded = torch.cat([pred_velocity, padding], dim=-1)
-                else:
-                    pred_velocity_padded = pred_velocity[:, :, :self.encoder_action_dim]
-                actions = actions + dt * pred_velocity_padded
-                # Zero out the padded dimensions to match training behavior
-                # In training, the padded dimensions (after actual_action_dim) are always 0
-                # This ensures action_encoder receives consistent input format
                 actions[:, :, self.actual_action_dim:] = 0.0
+
+        return BatchFeature(data={"action_pred": actions[:, :, : self.actual_action_dim]})
+
+    def _get_action_rtc(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
+        """
+        RTC guided inpainting for flow matching policies (Algorithm 1 in RTC paper).
+
+        Expected `action_input` keys:
+        - rtc_prev_actions: previous chunk (B, H, action_dim) in *the same action space* as the policy outputs
+        - rtc_d: estimated inference delay in controller steps
+        - rtc_s: number of steps executed since last inference started (i.e., offset into prev chunk)
+        - rtc_beta (optional): guidance clipping β (default 5.0)
+        """
+        backbone_output = self.process_backbone_output(backbone_output)
+
+        vl_embs = backbone_output.backbone_features
+        embodiment_id = action_input.embodiment_id
+        state_features = self.state_encoder(action_input.state, embodiment_id)
+
+        batch_size = vl_embs.shape[0]
+        device = vl_embs.device
+        dtype = vl_embs.dtype
+
+        H = int(self.config.action_horizon)
+        num_steps = int(self.num_inference_timesteps)
+        dt = 1.0 / float(num_steps)
+
+        rtc_prev = action_input["rtc_prev_actions"]
+        rtc_d = int(action_input["rtc_d"])
+        rtc_s = int(action_input["rtc_s"])
+        rtc_beta = float(action_input.get("rtc_beta", 5.0))
+
+        # Clamp to algorithm constraints: d <= s <= H - d (we keep it safe for edge cases).
+        rtc_d = max(0, min(rtc_d, H))
+        rtc_s = max(rtc_d, min(rtc_s, max(rtc_d, H - rtc_d)))
+
+        # Normalize shapes: prev actions are expected to be (B, H, actual_action_dim) or (B, H, encoder_action_dim).
+        if not isinstance(rtc_prev, torch.Tensor):
+            rtc_prev = torch.tensor(rtc_prev, device=device, dtype=dtype)
+        else:
+            rtc_prev = rtc_prev.to(device=device, dtype=dtype)
+
+        # Pad prev to encoder_action_dim if needed (so f(A) and target match shapes).
+        if rtc_prev.shape[-1] != self.encoder_action_dim:
+            if rtc_prev.shape[-1] < self.encoder_action_dim:
+                pad_size = self.encoder_action_dim - rtc_prev.shape[-1]
+                pad = torch.zeros((rtc_prev.shape[0], rtc_prev.shape[1], pad_size), device=device, dtype=dtype)
+                rtc_prev = torch.cat([rtc_prev, pad], dim=-1)
             else:
-                actions = actions + dt * pred_velocity
-        
-        # Return only the actual action dimensions
-        actions_output = actions[:, :, :self.actual_action_dim]
-        return BatchFeature(data={"action_pred": actions_output})
+                rtc_prev = rtc_prev[:, :, : self.encoder_action_dim]
+
+        # Build Aprev as remaining suffix from previous chunk, right-padded to length H.
+        # This corresponds to Algorithm 1: Aprev = Acur[s : H-1], then pad to length H.
+        suffix = rtc_prev[:, rtc_s:, :]
+        if suffix.shape[1] < H:
+            pad_len = H - suffix.shape[1]
+            pad = torch.zeros((batch_size, pad_len, self.encoder_action_dim), device=device, dtype=dtype)
+            Aprev = torch.cat([suffix, pad], dim=1)
+        else:
+            Aprev = suffix[:, :H, :]
+
+        # Soft mask W (shape (H,)) -> broadcast to (B, H, 1)
+        W = self._rtc_compute_soft_mask(H, rtc_d, rtc_s, device=device, dtype=dtype).view(1, H, 1)
+
+        # Initialize actions with Gaussian noise (A0 ~ N(0, I))
+        actions = torch.randn((batch_size, H, self.encoder_action_dim), device=device, dtype=dtype)
+        if self.encoder_action_dim != self.actual_action_dim:
+            actions[:, :, self.actual_action_dim:] = 0.0
+
+        eps = 1e-6
+        for t in range(num_steps):
+            tau = t / float(num_steps)  # in [0, 1)
+            t_discretized = int(tau * self.num_timestep_buckets)
+            timesteps_tensor = torch.full((batch_size,), fill_value=t_discretized, device=device)
+
+            # Detach across steps to avoid building a huge autograd graph; only need VJP for current step.
+            actions = actions.detach().requires_grad_(True)
+
+            v = self._predict_velocity(
+                vl_embs=vl_embs,
+                state_features=state_features,
+                actions=actions,
+                timesteps_tensor=timesteps_tensor,
+                embodiment_id=embodiment_id,
+            )
+
+            # Define denoising function f(A) = A + (1 - tau) * v(A, o, tau)  (Eq. 3)
+            fA = actions + (1.0 - tau) * v
+
+            # Weighted error term e = (Aprev - f(A)) * diag(W)  (Eq. 2 specialized)
+            e = (Aprev - fA) * W
+
+            # Vector-Jacobian product g = e · ∂f/∂A via reverse-mode autodiff (Algorithm 1, line 28)
+            g = torch.autograd.grad(
+                outputs=fA,
+                inputs=actions,
+                grad_outputs=e,
+                retain_graph=False,
+                create_graph=False,
+                allow_unused=False,
+            )[0]
+
+            # Guidance weight clipping β (Sec. 4.1 / A.2)
+            r_tau2 = 2.0 * (1.0 - tau) ** 2 / (tau + (1.0 - tau) ** 2 + eps)
+            guidance_weight = (1.0 - tau) / (max(tau, eps) * r_tau2 + eps)
+            guidance_weight = min(rtc_beta, float(guidance_weight))
+
+            # Integration step (Eq. 1) + guidance term (Eq. 2)
+            actions = actions + dt * v + guidance_weight * g
+
+            if self.encoder_action_dim != self.actual_action_dim:
+                actions[:, :, self.actual_action_dim:] = 0.0
+
+        return BatchFeature(data={"action_pred": actions[:, :, : self.actual_action_dim]})
 
     @property
     def device(self):

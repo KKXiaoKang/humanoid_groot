@@ -169,6 +169,52 @@ class GrootPolicy(PreTrainedPolicy):
 
         return actions
 
+    def predict_action_chunk_rtc(
+        self,
+        batch: dict[str, Tensor],
+        *,
+        rtc_prev_actions: Tensor,
+        rtc_d: int,
+        rtc_s: int,
+        rtc_beta: float = 5.0,
+    ) -> Tensor:
+        """
+        RTC (Real-Time Chunking) guided action chunk prediction.
+
+        This is an inference-time only path that enables gradients w.r.t. the sampled actions (but not params),
+        so we intentionally do NOT wrap it in `torch.no_grad()`.
+
+        Args:
+            batch: preprocessed policy input dict (same as `predict_action_chunk`)
+            rtc_prev_actions: previous chunk in the *policy action space* (normalized), shape (B, H, action_dim)
+            rtc_d: estimated inference delay in steps
+            rtc_s: number of steps executed since last inference started (offset into prev chunk)
+            rtc_beta: guidance clipping β from the RTC paper (recommended ~5)
+        """
+        self.eval()
+
+        allowed_base = {"state", "state_mask", "embodiment_id"}
+        groot_inputs = {
+            k: v
+            for k, v in batch.items()
+            if (k in allowed_base or k.startswith("eagle_")) and not (k.startswith("next.") or k == "info")
+        }
+        groot_inputs["rtc_prev_actions"] = rtc_prev_actions
+        groot_inputs["rtc_d"] = int(rtc_d)
+        groot_inputs["rtc_s"] = int(rtc_s)
+        groot_inputs["rtc_beta"] = float(rtc_beta)
+
+        device = next(self.parameters()).device
+
+        # Keep bf16 autocast behavior, but allow autograd for RTC VJP.
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=self.config.use_bf16):
+            outputs = self._groot_model.get_action(groot_inputs)
+
+        actions = outputs.get("action_pred")
+        original_action_dim = self.config.output_features["action"].shape[0]
+        actions = actions[:, :, :original_action_dim]
+        return actions
+
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
         """Select single action from action queue."""
