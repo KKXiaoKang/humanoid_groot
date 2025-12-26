@@ -202,3 +202,13 @@ python -m lerobot.async_inference.policy_server \
 * 实时Sim推理
 - 动作准确度以及chunk和预期相符，推理时占用10GB VRAM
 * ![eval_real_time](./docs/IMG/image1.png)
+
+### t-SNE分析
+* ![t-SNE](./docs/IMG/t-SNE.png)
+```bash
+# 注意库的安装 plotly sklearn
+python scripts/visualize_task_tsne_3d.py \            
+    --dataset-path /home/lab/lerobot_groot/lerobot_data/v3_0_dataset/1215_5w_groot_4311_4322_4611_4633 \
+    --ckpt-path /home/lab/lerobot_groot/outputs/train/12_23_groot_random_mix_4_box_mix_dense_a100_one_gpu/checkpoints/080000/pretrained_model \
+    --output ./t-SNE/tsne_3d_visualization.png
+```

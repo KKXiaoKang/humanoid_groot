@@ -101,11 +101,21 @@ class LeRobotDatasetMetadata:
                 raise FileNotFoundError
             self.load_metadata()
         except (FileNotFoundError, NotADirectoryError):
-            if is_valid_version(self.revision):
-                self.revision = get_safe_version(self.repo_id, self.revision)
+            # Check if this is a local dataset (root specified and repo_id doesn't contain "/")
+            is_local_dataset = root is not None and "/" not in repo_id
+            if is_valid_version(self.revision) and not is_local_dataset:
+                try:
+                    self.revision = get_safe_version(self.repo_id, self.revision)
+                except Exception as e:
+                    # If version check fails (e.g., private repo or local dataset), use the revision as-is
+                    logging.warning(f"Could not verify version from Hub for {repo_id}: {e}. Using revision {self.revision} as-is.")
+            elif is_local_dataset:
+                # For local datasets, skip Hub version check and use the revision as-is
+                logging.info(f"Using local dataset {repo_id} at {self.root}, skipping Hub version check.")
 
             (self.root / "meta").mkdir(exist_ok=True, parents=True)
-            self.pull_from_repo(allow_patterns="meta/")
+            if not is_local_dataset:
+                self.pull_from_repo(allow_patterns="meta/")
             self.load_metadata()
 
     def _flush_metadata_buffer(self) -> None:
@@ -699,6 +709,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self._writer_closed_for_reading = False
 
         # Load actual data
+        # Check if this is a local dataset (root specified and repo_id doesn't contain "/")
+        is_local_dataset = root is not None and "/" not in repo_id
+        
         try:
             if force_cache_sync:
                 raise FileNotFoundError
@@ -707,9 +720,18 @@ class LeRobotDataset(torch.utils.data.Dataset):
             if not self._check_cached_episodes_sufficient():
                 raise FileNotFoundError("Cached dataset doesn't contain all requested episodes")
         except (AssertionError, FileNotFoundError, NotADirectoryError):
-            if is_valid_version(self.revision):
-                self.revision = get_safe_version(self.repo_id, self.revision)
-            self.download(download_videos)
+            if is_valid_version(self.revision) and not is_local_dataset:
+                try:
+                    self.revision = get_safe_version(self.repo_id, self.revision)
+                except Exception as e:
+                    # If version check fails (e.g., private repo or local dataset), use the revision as-is
+                    logging.warning(f"Could not verify version from Hub for {repo_id}: {e}. Using revision {self.revision} as-is.")
+            elif is_local_dataset:
+                # For local datasets, skip Hub version check and use the revision as-is
+                logging.info(f"Using local dataset {repo_id} at {self.root}, skipping Hub version check.")
+            
+            if not is_local_dataset:
+                self.download(download_videos)
             self.hf_dataset = self.load_hf_dataset()
 
         # Setup delta_indices
@@ -909,19 +931,37 @@ class LeRobotDataset(torch.utils.data.Dataset):
             return get_hf_features_from_features(self.features)
 
     def _get_query_indices(self, idx: int, ep_idx: int) -> tuple[dict[str, list[int | bool]]]:
+        # Ensure hf_dataset is loaded to get actual size
+        self._ensure_hf_dataset_loaded()
+        dataset_size = len(self.hf_dataset) if self.hf_dataset is not None else 0
+        
         ep = self.meta.episodes[ep_idx]
         ep_start = ep["dataset_from_index"]
         ep_end = ep["dataset_to_index"]
-        query_indices = {
-            key: [max(ep_start, min(ep_end - 1, idx + delta)) for delta in delta_idx]
-            for key, delta_idx in self.delta_indices.items()
-        }
+        
+        # Calculate padding based on original episode boundaries (for accurate padding flags)
         padding = {  # Pad values outside of current episode range
             f"{key}_is_pad": torch.BoolTensor(
                 [(idx + delta < ep_start) | (idx + delta >= ep_end) for delta in delta_idx]
             )
             for key, delta_idx in self.delta_indices.items()
         }
+        
+        # Clamp episode boundaries to actual dataset size for query indices calculation
+        # (e.g., after downsample operations where meta.total_frames may not match actual data)
+        # This prevents IndexError while preserving accurate padding flags
+        if dataset_size > 0:
+            ep_start_clamped = min(ep_start, dataset_size)
+            ep_end_clamped = min(ep_end, dataset_size)
+        else:
+            ep_start_clamped = ep_start
+            ep_end_clamped = ep_end
+        
+        query_indices = {
+            key: [max(ep_start_clamped, min(ep_end_clamped - 1, idx + delta)) for delta in delta_idx]
+            for key, delta_idx in self.delta_indices.items()
+        }
+        
         return query_indices, padding
 
     def _get_query_timestamps(
@@ -951,10 +991,20 @@ class LeRobotDataset(torch.utils.data.Dataset):
         Returns:
             Dict with stacked tensors of queried data (video keys excluded)
         """
+        # Ensure hf_dataset is loaded and get its actual size
+        self._ensure_hf_dataset_loaded()
+        dataset_size = len(self.hf_dataset) if self.hf_dataset is not None else 0
+        
         result: dict = {}
         for key, q_idx in query_indices.items():
             if key in self.meta.video_keys:
                 continue
+            
+            # Clamp indices to valid range to handle metadata inconsistencies
+            # (e.g., after downsample operations where meta.total_frames may not match actual data)
+            if dataset_size > 0:
+                q_idx = [min(max(0, idx), dataset_size - 1) for idx in q_idx]
+            
             try:
                 result[key] = torch.stack(self.hf_dataset[key][q_idx])
             except (KeyError, TypeError, IndexError):
@@ -1770,7 +1820,16 @@ class MultiLeRobotDataset(torch.utils.data.Dataset):
     @property
     def num_frames(self) -> int:
         """Number of samples/frames."""
-        return sum(d.num_frames for d in self._datasets)
+        # Ensure we use actual hf_dataset lengths, especially important after downsample operations
+        total = 0
+        for dataset in self._datasets:
+            dataset._ensure_hf_dataset_loaded()
+            # Use actual hf_dataset length if available, otherwise fall back to num_frames
+            if dataset.hf_dataset is not None:
+                total += len(dataset.hf_dataset)
+            else:
+                total += dataset.num_frames
+        return total
 
     @property
     def num_episodes(self) -> int:
@@ -1793,11 +1852,17 @@ class MultiLeRobotDataset(torch.utils.data.Dataset):
         if idx >= len(self):
             raise IndexError(f"Index {idx} out of bounds.")
         # Determine which dataset to get an item from based on the index.
+        # Ensure we use the actual hf_dataset length, not meta.total_frames,
+        # especially important after downsample operations.
         start_idx = 0
         dataset_idx = 0
         for dataset in self._datasets:
-            if idx >= start_idx + dataset.num_frames:
-                start_idx += dataset.num_frames
+            # Ensure hf_dataset is loaded to get accurate frame count
+            dataset._ensure_hf_dataset_loaded()
+            # Use actual hf_dataset length if available, otherwise fall back to num_frames
+            actual_num_frames = len(dataset.hf_dataset) if dataset.hf_dataset is not None else dataset.num_frames
+            if idx >= start_idx + actual_num_frames:
+                start_idx += actual_num_frames
                 dataset_idx += 1
                 continue
             break
