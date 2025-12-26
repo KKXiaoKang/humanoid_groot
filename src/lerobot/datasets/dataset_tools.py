@@ -133,6 +133,7 @@ def delete_episodes(
         image_transforms=dataset.image_transforms,
         delta_timestamps=dataset.delta_timestamps,
         tolerance_s=dataset.tolerance_s,
+        force_cache_sync=False,  # 避免从Hub下载，直接使用本地数据
     )
 
     logging.info(f"Created new dataset with {len(episodes_to_keep)} episodes")
@@ -550,12 +551,25 @@ def _copy_and_reindex_data(
         for ep_old_idx in episodes_to_keep:
             ep_new_idx = episode_mapping[ep_old_idx]
             ep_df = df[df["episode_index"] == ep_new_idx]
-            episode_data_metadata[ep_new_idx] = {
-                "data/chunk_index": chunk_idx,
-                "data/file_index": file_idx,
-                "dataset_from_index": int(ep_df["index"].min()),
-                "dataset_to_index": int(ep_df["index"].max() + 1),
-            }
+            # 只处理在当前数据文件中存在的episode
+            if len(ep_df) > 0:
+                episode_data_metadata[ep_new_idx] = {
+                    "data/chunk_index": chunk_idx,
+                    "data/file_index": file_idx,
+                    "dataset_from_index": int(ep_df["index"].min()),
+                    "dataset_to_index": int(ep_df["index"].max() + 1),
+                }
+            else:
+                # 如果episode不在当前文件中，从源数据集的metadata中获取信息
+                # 这通常不应该发生，但为了健壮性，我们处理这种情况
+                if ep_old_idx < len(src_dataset.meta.episodes):
+                    src_ep = src_dataset.meta.episodes[ep_old_idx]
+                    episode_data_metadata[ep_new_idx] = {
+                        "data/chunk_index": src_ep.get("data/chunk_index", chunk_idx),
+                        "data/file_index": src_ep.get("data/file_index", file_idx),
+                        "dataset_from_index": global_index,  # 使用当前全局索引作为占位符
+                        "dataset_to_index": global_index,  # 使用当前全局索引作为占位符
+                    }
 
         global_index += len(df)
 
@@ -830,7 +844,17 @@ def _copy_and_reindex_episodes_metadata(
 
         src_episode = src_dataset.meta.episodes[old_idx]
 
-        episode_meta = data_metadata[new_idx].copy()
+        # 如果data_metadata中没有该episode，从源数据集中获取
+        if new_idx not in data_metadata:
+            # 从源数据集的metadata中获取信息
+            episode_meta = {
+                "data/chunk_index": src_episode.get("data/chunk_index", 0),
+                "data/file_index": src_episode.get("data/file_index", 0),
+                "dataset_from_index": 0,  # 占位符，实际值应该在data_metadata中
+                "dataset_to_index": 0,  # 占位符，实际值应该在data_metadata中
+            }
+        else:
+            episode_meta = data_metadata[new_idx].copy()
 
         if video_metadata and new_idx in video_metadata:
             episode_meta.update(video_metadata[new_idx])
