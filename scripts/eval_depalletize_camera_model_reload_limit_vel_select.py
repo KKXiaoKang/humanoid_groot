@@ -10,7 +10,7 @@ from sensor_msgs.msg import JointState
 import json
 from std_srvs.srv import Trigger, TriggerRequest, SetBool, SetBoolRequest
 
-def resample_actions_with_speed_limit(actions: np.ndarray, dt: float, v_max, arm_dims: slice = slice(None)):
+def resample_actions_with_speed_limit(actions: np.ndarray, dt: float, v_max, arm_dims: slice = slice(None), constant_velocity: bool = False):
     '''
         resample actions (joint positions) which satisfy joint velocity limits
         Only applies speed limit to arm dimensions, other dimensions are interpolated normally
@@ -20,6 +20,7 @@ def resample_actions_with_speed_limit(actions: np.ndarray, dt: float, v_max, arm
             dt: Time interval between actions (seconds)
             v_max: Maximum velocity (rad/s). Can be scalar or array of shape (arm_dim,)
             arm_dims: Slice or indices specifying which dimensions are arm joints (to apply speed limit)
+            constant_velocity: If True, ensure each segment executes at constant velocity (within v_max limit)
         
         Returns:
             Array of shape (M, D) where M >= T, with speed-limited resampling
@@ -54,18 +55,87 @@ def resample_actions_with_speed_limit(actions: np.ndarray, dt: float, v_max, arm
         delta = arm_a1 - arm_a0
         v_required = np.abs(delta) / dt
 
-        # Calculate scale factor based on arm velocity limits
-        scale = np.max(v_required / v_max) if len(v_max) > 0 and np.any(v_max > 0) else 1.0
-        scale = max(scale, 1.0)
+        if constant_velocity:
+            # 匀速模式：确保所有关节以恒定速度执行，且不超过v_max限制
+            # 策略：找到所有关节中速度限制最严格的（即需要最长时间完成的），
+            # 然后所有关节都以相同的总时间完成，每个关节以恒定速度（受v_max限制）执行
+            # 但每个关节的最终位置必须等于目标位置（arm_a1）
+            
+            # 计算每个关节的所需速度
+            v_per_joint = np.abs(delta) / dt
+            
+            # 计算每个关节在v_max限制下所需的时间
+            # 如果某个关节的所需速度超过v_max，则需要更多时间
+            time_per_joint = np.where(
+                v_per_joint > v_max,
+                np.abs(delta) / v_max,  # 受速度限制，需要更长时间
+                dt  # 不受限制，使用原始时间
+            )
+            
+            # 找到最长的执行时间（瓶颈关节）
+            total_time = np.max(time_per_joint) if len(time_per_joint) > 0 and np.any(time_per_joint > 0) else dt
+            total_time = max(total_time, dt)  # 至少需要dt时间
+            
+            # 计算子步数
+            num_sub = max(1, int(np.ceil(total_time / dt)))
+            
+            # 计算每个关节在total_time内的实际速度
+            # 关键：每个关节必须完成原始位移delta，所以实际速度 = |delta| / total_time
+            # 由于total_time已经考虑了所有关节的速度限制，所以 |delta|/total_time <= v_max 应该总是成立
+            # 但为了安全起见，仍然应用v_max限制
+            actual_v_per_joint = np.minimum(np.abs(delta) / total_time, v_max)
+            
+            # 计算每个关节在total_time内的实际位移
+            # 关键：必须确保最终位置等于目标位置arm_a1
+            # 由于total_time已经足够长，使得所有关节都能在total_time内以不超过v_max的速度完成位移
+            # 理论上：actual_v_per_joint * total_time = |delta|，所以actual_delta = delta
+            # 但为了确保速度恒定，我们使用actual_v_per_joint * total_time来计算
+            actual_delta = np.sign(delta) * actual_v_per_joint * total_time
+            
+            # 验证：确保最终位置正确（理论上应该相等，允许小的数值误差）
+            # 由于total_time的计算方式，actual_delta应该等于delta（在数值精度范围内）
+            # 如果误差太大，说明逻辑有问题，使用delta作为后备方案
+            max_error = np.max(np.abs(actual_delta - delta))
+            if max_error > 1e-6:
+                # 这种情况理论上不应该发生，但为了安全，使用delta确保到达目标位置
+                # 注意：这里不使用rospy，因为这是通用函数，可能不在ROS环境中
+                print(f"⚠️  Constant velocity mode: actual_delta differs from delta by {max_error:.6f}, using delta to ensure target position")
+                actual_delta = delta
+            
+            # 生成匀速插值（所有关节同步完成，每个关节以恒定速度执行）
+            for s in range(1, num_sub + 1):
+                alpha = s / num_sub
+                # 对于手臂关节，使用匀速插值（基于实际位移）
+                # 这样每个关节以恒定速度执行：速度 = actual_delta / total_time = actual_v_per_joint
+                new_arm = arm_a0 + actual_delta * alpha
+                # 对于其他维度，使用线性插值
+                new_a = a0.copy()
+                if isinstance(arm_dims, slice):
+                    new_a[arm_dims] = new_arm
+                else:
+                    new_a[arm_dims] = new_arm
+                # 其他维度线性插值
+                other_dims = np.ones(D, dtype=bool)
+                if isinstance(arm_dims, slice):
+                    other_dims[arm_dims] = False
+                else:
+                    other_dims[arm_dims] = False
+                new_a[other_dims] = a0[other_dims] * (1 - alpha) + a1[other_dims] * alpha
+                new_actions.append(new_a)
+        else:
+            # 原有模式：只限制最大速度，不保证匀速
+            # Calculate scale factor based on arm velocity limits
+            scale = np.max(v_required / v_max) if len(v_max) > 0 and np.any(v_max > 0) else 1.0
+            scale = max(scale, 1.0)
 
-        # number of sub_steps
-        num_sub = int(np.ceil(scale))
+            # number of sub_steps
+            num_sub = int(np.ceil(scale))
 
-        # interpolate all dimensions
-        for s in range(1, num_sub + 1):
-            alpha = s / num_sub
-            new_a = a0 * (1 - alpha) + a1 * alpha
-            new_actions.append(new_a)
+            # interpolate all dimensions
+            for s in range(1, num_sub + 1):
+                alpha = s / num_sub
+                new_a = a0 * (1 - alpha) + a1 * alpha
+                new_actions.append(new_a)
 
     return np.stack(new_actions, axis=0)
 
@@ -682,7 +752,7 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
                        control_arm=True, control_claw=True, action_chunk_size=50, 
                        enable_gui=False, rotate_head_camera=False, state_zero=False,
                        is_first_inference=True, chunk_start=None, chunk_end=None, model_action_dt=None,
-                       sync_mode=False, max_joint_velocity=None):
+                       sync_mode=False, max_joint_velocity=None, constant_velocity=False):
     """
     运行推理循环（可以多次调用，每次调用开始新的推理会话）
     
@@ -705,6 +775,7 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
         model_action_dt: 模型动作时间间隔（秒），控制推理频率。如果为None，使用全局MODEL_ACTION_DT
         sync_mode: 是否使用同步推理模式。如果True，推理一个chunk -> 执行完整个chunk -> get_obs -> 再推理下一个chunk
         max_joint_velocity: 最大关节速度限制（rad/s）。如果提供，将对arm关节应用速度限制
+        constant_velocity: 是否启用匀速模式。如果True，确保动作执行时速度恒定（在max_joint_velocity限制内）
     
     Returns:
         bool: True表示正常退出（按q），False表示被中断（Ctrl+C）
@@ -740,6 +811,8 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
         print(f"⚡ Model action DT: {model_action_dt:.3f}s (inference frequency: {model_action_frequency:.1f} Hz)")
     if max_joint_velocity is not None:
         print(f"🚦 Max joint velocity limit: {max_joint_velocity:.2f} rad/s")
+    if constant_velocity and max_joint_velocity is not None:
+        print(f"⚙️  Constant velocity mode: Enabled (actions will execute at constant velocity within speed limit)")
     print(f"📝 Task description: '{task_description}'")
     print("="*80 + "\n")
     
@@ -1024,7 +1097,8 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
                                     chunk_with_transition_end,
                                     dt=control_dt,
                                     v_max=max_joint_velocity,
-                                    arm_dims=arm_dims
+                                    arm_dims=arm_dims,
+                                    constant_velocity=constant_velocity
                                 )[1:]  # 移除transition的最后一个action
                             
                             # 合并transition（不应用速度限制）和resampled chunk（已应用速度限制）
@@ -1045,7 +1119,8 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
                             action_chunk_with_bridge,
                             dt=control_dt,
                             v_max=max_joint_velocity,
-                            arm_dims=arm_dims
+                            arm_dims=arm_dims,
+                            constant_velocity=constant_velocity
                         )
                         # 移除桥接的action（如果添加了）
                         if last_executed_action is not None:
@@ -1392,7 +1467,8 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
                                     chunk_with_transition_end,
                                     dt=env.control_dt,
                                     v_max=max_joint_velocity,
-                                    arm_dims=arm_dims
+                                    arm_dims=arm_dims,
+                                    constant_velocity=constant_velocity
                                 )[1:]  # 移除transition的最后一个action
                             
                             # 合并transition（不应用速度限制）和resampled chunk（已应用速度限制）
@@ -1425,14 +1501,16 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
                                 chunk_with_prev,
                                 dt=env.control_dt,
                                 v_max=max_joint_velocity,
-                                arm_dims=arm_dims
+                                arm_dims=arm_dims,
+                                constant_velocity=constant_velocity
                             )[1:]  # 移除桥接的action
                         else:
                             resampled_chunk = resample_actions_with_speed_limit(
                                 resampled_chunk,
                                 dt=env.control_dt,
                                 v_max=max_joint_velocity,
-                                arm_dims=arm_dims
+                                arm_dims=arm_dims,
+                                constant_velocity=constant_velocity
                             )
                     
                     # 对夹爪应用zero-order hold（从原始chunk中提取）
@@ -1661,7 +1739,7 @@ def final_reset_arm(json_path, env, control_arm=True, control_claw=True):
     rospy.loginfo("Arm reset completed!")
 
 
-def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chunk_size=50, enable_gui=False, rotate_head_camera=False, state_zero=False, task_description=None, chunk_start=None, chunk_end=None, model_action_dt=None, sync_mode=False, max_joint_velocity=None):
+def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chunk_size=50, enable_gui=False, rotate_head_camera=False, state_zero=False, task_description=None, chunk_start=None, chunk_end=None, model_action_dt=None, sync_mode=False, max_joint_velocity=None, constant_velocity=False):
     """
     在这里和实机/仿真交互，做网络推理（depalletize任务）
     支持多次推理：按'q'退出当前推理，可以快速重新开始下一次推理而无需重新加载模型
@@ -1682,6 +1760,7 @@ def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chun
                         如果为None，使用默认值 0.1 秒（10 Hz）。在sync_mode下不使用此参数
         sync_mode: 是否使用同步推理模式。如果True，推理一个chunk -> 执行完整个chunk -> get_obs -> 再推理下一个chunk
         max_joint_velocity: 最大关节速度限制（rad/s）。如果提供，将对arm关节应用速度限制
+        constant_velocity: 是否启用匀速模式。如果True，确保动作执行时速度恒定（在max_joint_velocity限制内）
     """
     
     # 加载模型和环境（只执行一次）
@@ -1735,7 +1814,8 @@ def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chun
                 chunk_end=chunk_end,
                 model_action_dt=model_action_dt,
                 sync_mode=sync_mode,
-                max_joint_velocity=max_joint_velocity
+                max_joint_velocity=max_joint_velocity,
+                constant_velocity=constant_velocity
             )
             
             if normal_exit:
@@ -1828,6 +1908,9 @@ if __name__ == '__main__':
     parser.add_argument('--max-joint-velocity', type=float, default=None,
                         help='Maximum joint velocity limit in rad/s. If provided, will apply speed limiting to arm joints. '
                              'Example: 2.0 means max 2.0 rad/s per joint.')
+    parser.add_argument('--constant-velocity', action='store_true',
+                        help='Enable constant velocity mode. If set, ensures actions execute at constant velocity '
+                             '(within max_joint_velocity limit). Requires --max-joint-velocity to be set.')
     
     args = parser.parse_args()
     
@@ -1886,6 +1969,11 @@ if __name__ == '__main__':
         print(f"⚡ Model action DT: {args.model_action_dt:.3f}s (inference frequency: {1.0/args.model_action_dt:.1f} Hz)")
     if args.max_joint_velocity is not None:
         print(f"🚦 Max joint velocity limit: {args.max_joint_velocity:.2f} rad/s")
+    if args.constant_velocity:
+        if args.max_joint_velocity is None:
+            print("⚠️  Warning: --constant-velocity requires --max-joint-velocity to be set. Ignoring constant-velocity mode.")
+        else:
+            print(f"⚙️  Constant velocity mode: Enabled (actions will execute at constant velocity within speed limit)")
     print("="*80 + "\n")
 
     if args.eval:
@@ -1900,7 +1988,8 @@ if __name__ == '__main__':
              chunk_end=args.chunk_end,
              model_action_dt=args.model_action_dt,
              sync_mode=args.sync_mode,
-             max_joint_velocity=args.max_joint_velocity)
+             max_joint_velocity=args.max_joint_velocity,
+             constant_velocity=args.constant_velocity if args.max_joint_velocity is not None else False)
     elif args.replay:
         print("Replaying the model")
         lerobot_dataset_path = '/home/lab/kuavo-manip/lerobot_data/vel_wrend_box_613'
