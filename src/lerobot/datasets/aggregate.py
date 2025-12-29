@@ -205,7 +205,7 @@ def aggregate_datasets(
         [LeRobotDatasetMetadata(repo_id) for repo_id in repo_ids]
         if roots is None
         else [
-            LeRobotDatasetMetadata(repo_id, root=root) for repo_id, root in zip(repo_ids, roots, strict=False)
+            LeRobotDatasetMetadata(repo_id, root=root) for repo_id, root in zip(repo_ids, roots, strict=True)
         ]
     )
     fps, robot_type, features = validate_all_metadata(all_metadata)
@@ -291,6 +291,12 @@ def aggregate_videos(src_meta, dst_meta, videos_idx, video_files_size_in_mb, chu
                 file_index=src_file_idx,
             )
 
+            if not src_path.exists():
+                raise FileNotFoundError(
+                    f"Video file not found: {src_path}. "
+                    f"This may indicate a corrupted or incomplete dataset: {src_meta.repo_id}"
+                )
+
             dst_path = dst_meta.root / DEFAULT_VIDEO_PATH.format(
                 video_key=key,
                 chunk_index=chunk_idx,
@@ -370,6 +376,11 @@ def aggregate_data(src_meta, dst_meta, data_idx, data_files_size_in_mb, chunk_si
         src_path = src_meta.root / DEFAULT_DATA_PATH.format(
             chunk_index=src_chunk_idx, file_index=src_file_idx
         )
+        if not src_path.exists():
+            raise FileNotFoundError(
+                f"Data file not found: {src_path}. "
+                f"This may indicate a corrupted or incomplete dataset: {src_meta.repo_id}"
+            )
         df = pd.read_parquet(src_path)
         df = update_data_df(df, src_meta, dst_meta)
 
@@ -415,6 +426,11 @@ def aggregate_metadata(src_meta, dst_meta, meta_idx, data_idx, videos_idx):
     chunk_file_ids = sorted(chunk_file_ids)
     for chunk_idx, file_idx in chunk_file_ids:
         src_path = src_meta.root / DEFAULT_EPISODES_PATH.format(chunk_index=chunk_idx, file_index=file_idx)
+        if not src_path.exists():
+            raise FileNotFoundError(
+                f"Metadata file not found: {src_path}. "
+                f"This may indicate a corrupted or incomplete dataset: {src_meta.repo_id}"
+            )
         df = pd.read_parquet(src_path)
         df = update_meta_data(
             df,
