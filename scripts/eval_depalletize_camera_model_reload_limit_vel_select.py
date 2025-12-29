@@ -752,7 +752,7 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
                        control_arm=True, control_claw=True, action_chunk_size=50, 
                        enable_gui=False, rotate_head_camera=False, state_zero=False,
                        is_first_inference=True, chunk_start=None, chunk_end=None, model_action_dt=None,
-                       sync_mode=False, max_joint_velocity=None, constant_velocity=False):
+                       sync_mode=False, max_joint_velocity=None, constant_velocity=False, action_stride=1):
     """
     运行推理循环（可以多次调用，每次调用开始新的推理会话）
     
@@ -776,6 +776,9 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
         sync_mode: 是否使用同步推理模式。如果True，推理一个chunk -> 执行完整个chunk -> get_obs -> 再推理下一个chunk
         max_joint_velocity: 最大关节速度限制（rad/s）。如果提供，将对arm关节应用速度限制
         constant_velocity: 是否启用匀速模式。如果True，确保动作执行时速度恒定（在max_joint_velocity限制内）
+        action_stride: 动作采样间隔，用于加速执行。例如：action_stride=2表示每隔2个action执行一次，跳过中间的action。
+                       设置为1表示不跳过任何action（正常速度）。设置为N表示执行速度约为原来的N倍。
+                       注意：这不会改变速度限制，只是减少执行的action数量。
     
     Returns:
         bool: True表示正常退出（按q），False表示被中断（Ctrl+C）
@@ -813,6 +816,8 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
         print(f"🚦 Max joint velocity limit: {max_joint_velocity:.2f} rad/s")
     if constant_velocity and max_joint_velocity is not None:
         print(f"⚙️  Constant velocity mode: Enabled (actions will execute at constant velocity within speed limit)")
+    if action_stride > 1:
+        print(f"⚡ Action stride: {action_stride} (executing every {action_stride}-th action, ~{action_stride}x speedup)")
     print(f"📝 Task description: '{task_description}'")
     print("="*80 + "\n")
     
@@ -837,17 +842,6 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
     # Real-time environment evaluation loop
     robot_sdk.control.set_external_control_arm_mode()
     time.sleep(1)
-    
-    # 根据机器人版本切换手臂控制模式
-    if ROBOT_VERSION == "4_pro":
-        direct_to_wbc(1)
-        function_key = "direct_to_wbc"
-    elif ROBOT_VERSION == "5_wheel":
-        set_arm_quick_mode(True)
-        function_key = "set_arm_quick_mode"    
-    # 等待使能生效
-    input(f"当前机器人模式为: {ROBOT_VERSION} | 控制模式 {function_key} 结束, 按回车继续 ==== 切换手臂到wbc轨迹控制模式成功 ==== \n")
-    time.sleep(1.0)
     resampled_action_queue: deque[np.ndarray] = deque()
     last_executed_action: Optional[np.ndarray] = None
     
@@ -886,6 +880,16 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
         rospy.loginfo("✅ Observation data updated with post-bag-replay robot state")
     else:
         rospy.loginfo("Skipping bag file replay (not first inference). Using JSON reset instead.")
+
+    # 根据机器人版本切换手臂控制模式
+    if ROBOT_VERSION == "4_pro":
+        direct_to_wbc(1)
+        function_key = "direct_to_wbc"
+    elif ROBOT_VERSION == "5_wheel":
+        set_arm_quick_mode(True)
+        function_key = "set_arm_quick_mode"  
+    time.sleep(1)
+    input(f"当前机器人模式为: {ROBOT_VERSION} | 控制模式 {function_key} 结束, 按回车继续 ==== 切换手臂到wbc轨迹控制模式成功 ==== \n")
     
     print("\n" + "="*80)
     print("🚀 Starting inference loop...")
@@ -1185,6 +1189,57 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
                             arm_dims=arm_dims,
                             claw_dims=claw_dims
                         )
+                
+                # 应用action_stride：先选择每隔action_stride个action
+                if action_stride > 1:
+                    strided_chunk = action_chunk[::action_stride]
+                    rospy.loginfo(f"Applied action stride {action_stride}: {action_chunk.shape[0]} -> {strided_chunk.shape[0]} actions")
+                    
+                    # 重要：在应用stride后，需要重新应用速度限制
+                    # 因为跳过的action之间的时间间隔变大了（control_dt * stride）
+                    # 如果不重新限制，可能会违反速度限制
+                    if max_joint_velocity is not None:
+                        # 确保control_dt已定义
+                        control_dt = env.control_dt
+                        
+                        # 保存原始chunk的夹爪值
+                        original_strided_chunk_for_claw = strided_chunk.copy()
+                        
+                        # 重新应用速度限制，使用新的时间间隔（control_dt * stride）
+                        if last_executed_action is not None:
+                            strided_chunk_with_bridge = np.vstack([last_executed_action, strided_chunk])
+                        else:
+                            strided_chunk_with_bridge = strided_chunk
+                        
+                        strided_chunk_with_bridge = resample_actions_with_speed_limit(
+                            strided_chunk_with_bridge,
+                            dt=control_dt * action_stride,  # 使用新的时间间隔
+                            v_max=max_joint_velocity,
+                            arm_dims=arm_dims,
+                            constant_velocity=constant_velocity
+                        )
+                        
+                        # 移除桥接的action（如果添加了）
+                        if last_executed_action is not None:
+                            strided_chunk = strided_chunk_with_bridge[1:]
+                        else:
+                            strided_chunk = strided_chunk_with_bridge
+                        
+                        # 对夹爪应用zero-order hold（从原始strided chunk中提取）
+                        if strided_chunk.shape[0] > 0 and original_strided_chunk_for_claw.shape[0] > 0:
+                            if original_strided_chunk_for_claw.shape[0] > 1:
+                                source_times = np.linspace(0.0, (control_dt * action_stride) * (original_strided_chunk_for_claw.shape[0] - 1), 
+                                                          num=original_strided_chunk_for_claw.shape[0])
+                                target_times = np.linspace(0.0, control_dt * (strided_chunk.shape[0] - 1), num=strided_chunk.shape[0])
+                                hold_indices = np.searchsorted(source_times, target_times, side="right") - 1
+                                hold_indices = np.clip(hold_indices, 0, original_strided_chunk_for_claw.shape[0] - 1)
+                                strided_chunk[:, claw_dims] = original_strided_chunk_for_claw[hold_indices][:, claw_dims]
+                            else:
+                                strided_chunk[:, claw_dims] = original_strided_chunk_for_claw[0, claw_dims]
+                        
+                        rospy.loginfo(f"Re-applied velocity limit after stride: {strided_chunk.shape[0]} actions (dt={control_dt * action_stride:.4f}s)")
+                    
+                    action_chunk = strided_chunk
                 
                 # 执行整个chunk
                 rospy.loginfo(f"Executing chunk of size {action_chunk.shape[0]} in sync mode")
@@ -1595,6 +1650,55 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
                     target_frequency_hz=None
                 )
                 rospy.loginfo(f"Prepared resampled chunk of size {resampled_chunk.shape[0]} for execution")
+                
+                # 应用action_stride：只保留每隔action_stride个action
+                if action_stride > 1:
+                    # 使用切片选择每隔stride个action：[::stride]
+                    strided_chunk = resampled_chunk[::action_stride]
+                    rospy.loginfo(f"Applied action stride {action_stride}: {resampled_chunk.shape[0]} -> {strided_chunk.shape[0]} actions")
+                    
+                    # 重要：在应用stride后，需要重新应用速度限制
+                    # 因为跳过的action之间的时间间隔变大了（control_dt * stride）
+                    # 如果不重新限制，可能会违反速度限制
+                    if max_joint_velocity is not None:
+                        # 保存原始chunk的夹爪值
+                        original_strided_chunk_for_claw = strided_chunk.copy()
+                        
+                        # 重新应用速度限制，使用新的时间间隔（control_dt * stride）
+                        if last_executed_action is not None:
+                            strided_chunk_with_bridge = np.vstack([last_executed_action, strided_chunk])
+                        else:
+                            strided_chunk_with_bridge = strided_chunk
+                        
+                        strided_chunk_with_bridge = resample_actions_with_speed_limit(
+                            strided_chunk_with_bridge,
+                            dt=env.control_dt * action_stride,  # 使用新的时间间隔
+                            v_max=max_joint_velocity,
+                            arm_dims=arm_dims,
+                            constant_velocity=constant_velocity
+                        )
+                        
+                        # 移除桥接的action（如果添加了）
+                        if last_executed_action is not None:
+                            strided_chunk = strided_chunk_with_bridge[1:]
+                        else:
+                            strided_chunk = strided_chunk_with_bridge
+                        
+                        # 对夹爪应用zero-order hold（从原始strided chunk中提取）
+                        if strided_chunk.shape[0] > 0 and original_strided_chunk_for_claw.shape[0] > 0:
+                            if original_strided_chunk_for_claw.shape[0] > 1:
+                                source_times = np.linspace(0.0, (env.control_dt * action_stride) * (original_strided_chunk_for_claw.shape[0] - 1), 
+                                                          num=original_strided_chunk_for_claw.shape[0])
+                                target_times = np.linspace(0.0, env.control_dt * (strided_chunk.shape[0] - 1), num=strided_chunk.shape[0])
+                                hold_indices = np.searchsorted(source_times, target_times, side="right") - 1
+                                hold_indices = np.clip(hold_indices, 0, original_strided_chunk_for_claw.shape[0] - 1)
+                                strided_chunk[:, claw_dims] = original_strided_chunk_for_claw[hold_indices][:, claw_dims]
+                            else:
+                                strided_chunk[:, claw_dims] = original_strided_chunk_for_claw[0, claw_dims]
+                        
+                        rospy.loginfo(f"Re-applied velocity limit after stride: {strided_chunk.shape[0]} actions (dt={env.control_dt * action_stride:.4f}s)")
+                    
+                    resampled_chunk = strided_chunk
 
                 resampled_action_queue = deque(np.array(step, copy=True) for step in resampled_chunk)
 
@@ -1739,7 +1843,7 @@ def final_reset_arm(json_path, env, control_arm=True, control_claw=True):
     rospy.loginfo("Arm reset completed!")
 
 
-def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chunk_size=50, enable_gui=False, rotate_head_camera=False, state_zero=False, task_description=None, chunk_start=None, chunk_end=None, model_action_dt=None, sync_mode=False, max_joint_velocity=None, constant_velocity=False):
+def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chunk_size=50, enable_gui=False, rotate_head_camera=False, state_zero=False, task_description=None, chunk_start=None, chunk_end=None, model_action_dt=None, sync_mode=False, max_joint_velocity=None, constant_velocity=False, action_stride=1):
     """
     在这里和实机/仿真交互，做网络推理（depalletize任务）
     支持多次推理：按'q'退出当前推理，可以快速重新开始下一次推理而无需重新加载模型
@@ -1761,6 +1865,9 @@ def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chun
         sync_mode: 是否使用同步推理模式。如果True，推理一个chunk -> 执行完整个chunk -> get_obs -> 再推理下一个chunk
         max_joint_velocity: 最大关节速度限制（rad/s）。如果提供，将对arm关节应用速度限制
         constant_velocity: 是否启用匀速模式。如果True，确保动作执行时速度恒定（在max_joint_velocity限制内）
+        action_stride: 动作采样间隔，用于加速执行。例如：action_stride=2表示每隔2个action执行一次，跳过中间的action。
+                       设置为1表示不跳过任何action（正常速度）。设置为N表示执行速度约为原来的N倍。
+                       注意：这不会改变速度限制，只是减少执行的action数量。建议值：1-5。
     """
     
     # 加载模型和环境（只执行一次）
@@ -1815,7 +1922,8 @@ def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chun
                 model_action_dt=model_action_dt,
                 sync_mode=sync_mode,
                 max_joint_velocity=max_joint_velocity,
-                constant_velocity=constant_velocity
+                constant_velocity=constant_velocity,
+                action_stride=action_stride
             )
             
             if normal_exit:
@@ -1911,6 +2019,10 @@ if __name__ == '__main__':
     parser.add_argument('--constant-velocity', action='store_true',
                         help='Enable constant velocity mode. If set, ensures actions execute at constant velocity '
                              '(within max_joint_velocity limit). Requires --max-joint-velocity to be set.')
+    parser.add_argument('--action-stride', type=int, default=1,
+                        help='Action stride for speedup. If set to N, executes every N-th action, skipping intermediate ones. '
+                             'Example: --action-stride=2 means ~2x speedup. Default: 1 (no skipping). '
+                             'Note: This reduces the number of executed actions but does not change velocity limits.')
     
     args = parser.parse_args()
     
@@ -1921,6 +2033,10 @@ if __name__ == '__main__':
         parser.error(f"--chunk-end must be >= 0, got {args.chunk_end}")
     if args.chunk_start is not None and args.chunk_end is not None and args.chunk_start > args.chunk_end:
         parser.error(f"--chunk-start ({args.chunk_start}) must be <= --chunk-end ({args.chunk_end})")
+    
+    # 验证action_stride
+    if args.action_stride < 1:
+        parser.error(f"--action-stride must be >= 1, got {args.action_stride}")
     
     # 验证model_action_dt
     if args.model_action_dt is not None:
@@ -1974,6 +2090,8 @@ if __name__ == '__main__':
             print("⚠️  Warning: --constant-velocity requires --max-joint-velocity to be set. Ignoring constant-velocity mode.")
         else:
             print(f"⚙️  Constant velocity mode: Enabled (actions will execute at constant velocity within speed limit)")
+    if args.action_stride > 1:
+        print(f"⚡ Action stride: {args.action_stride} (executing every {args.action_stride}-th action, ~{args.action_stride}x speedup)")
     print("="*80 + "\n")
 
     if args.eval:
@@ -1989,7 +2107,8 @@ if __name__ == '__main__':
              model_action_dt=args.model_action_dt,
              sync_mode=args.sync_mode,
              max_joint_velocity=args.max_joint_velocity,
-             constant_velocity=args.constant_velocity if args.max_joint_velocity is not None else False)
+             constant_velocity=args.constant_velocity if args.max_joint_velocity is not None else False,
+             action_stride=args.action_stride)
     elif args.replay:
         print("Replaying the model")
         lerobot_dataset_path = '/home/lab/kuavo-manip/lerobot_data/vel_wrend_box_613'
