@@ -331,9 +331,13 @@ def eval_on_dataset(ckpt_path,
     print(f"\n📂 Loading dataset from {lerobot_dataset_path}")
     print(f"📹 Episode: {episode}")
     
+    # 对于本地数据集，repo_id应该是一个字符串标识符（不包含"/"）
+    # 使用数据集路径的最后一部分作为标识符，或者使用"local"
+    dataset_name = Path(lerobot_dataset_path).name if lerobot_dataset_path else "local"
+    
     # 注意：LeRobotDataset的episodes参数主要用于下载时选择文件
     # 但在加载后需要手动过滤数据，因为多个episodes可能存储在同一个parquet文件中
-    dataset = LeRobotDataset(repo_id=0, root=lerobot_dataset_path, episodes=[episode])
+    dataset = LeRobotDataset(repo_id=dataset_name, root=lerobot_dataset_path, episodes=[episode])
     
     # 使用episode的索引范围直接切片，比filter快得多
     # 这是必要的，因为v3.0格式中多个episodes可能存储在同一个文件中
