@@ -18,6 +18,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
+from typing_extensions import Unpack
+from lerobot.policies.pretrained import ActionSelectKwargs
+from lerobot.policies.rtc.configuration_rtc import RTCConfig
+from lerobot.policies.rtc.modeling_rtc import RTCProcessor
+
 import torch
 import torch.nn as nn
 from huggingface_hub import snapshot_download
@@ -203,6 +208,9 @@ class GR00TN15Config(PretrainedConfig):
     action_dim: int = field(init=False, metadata={"help": "Action dimension."})
     compute_dtype: str = field(default="float32", metadata={"help": "Compute dtype."})
 
+    # Real-Time Chunking (RTC) configuration
+    rtc_config: RTCConfig | None = None
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         for key, value in kwargs.items():
@@ -224,6 +232,7 @@ class GR00TN15(PreTrainedModel):
         self,
         config: GR00TN15Config,
         local_model_path: str,
+        # rtc_processor: RTCProcessor | None = None,
     ):
         assert isinstance(config.backbone_cfg, dict)
         assert isinstance(config.action_head_cfg, dict)
@@ -262,6 +271,10 @@ class GR00TN15(PreTrainedModel):
         # validate_data will use the correct dimension based on context
         self.action_dim = config.action_dim
         self.compute_dtype = config.compute_dtype
+        # self.rtc_processor = rtc_processor
+
+    def _rtc_enabled(self):
+        return self.config.rtc_config is not None and self.config.rtc_config.enabled
 
     def validate_inputs(self, inputs):
         # NOTE -- this should be handled internally by the model
@@ -365,11 +378,13 @@ class GR00TN15(PreTrainedModel):
     def get_action(
         self,
         inputs: dict,
+        **kwargs: Unpack[ActionSelectKwargs],
     ) -> BatchFeature:
         backbone_inputs, action_inputs = self.prepare_input(inputs)
         # Because the behavior of backbones remains the same for training and inference, we can use `forward` for backbones.
         backbone_outputs = self.backbone(backbone_inputs)
-        action_head_outputs = self.action_head.get_action(backbone_outputs, action_inputs)
+        action_head_outputs = self.action_head.get_action(backbone_outputs, action_inputs, rtc_enabled=self._rtc_enabled())
+            
         self.validate_data(action_head_outputs, backbone_outputs, is_training=False)
         return action_head_outputs
 

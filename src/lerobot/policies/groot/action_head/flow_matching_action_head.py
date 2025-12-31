@@ -37,6 +37,8 @@ from lerobot.policies.groot.action_head.action_encoder import (
 )
 
 from .cross_attention_dit import DiT, SelfAttentionTransformer
+from typing_extensions import Unpack
+from lerobot.policies.rtc.modeling_rtc import RTCProcessor
 
 
 class CategorySpecificLinear(nn.Module):
@@ -196,6 +198,7 @@ class FlowmatchingActionHead(nn.Module):
     def __init__(
         self,
         config: FlowmatchingActionHeadConfig,
+        rtc_processor: RTCProcessor | None = None,
     ):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -276,6 +279,8 @@ class FlowmatchingActionHead(nn.Module):
         self.num_timestep_buckets = config.num_timestep_buckets
         self.config = config
         self.set_trainable_parameters(config.tune_projector, config.tune_diffusion_model)
+        self.rtc_processor = rtc_processor
+
 
     def set_trainable_parameters(self, tune_projector: bool, tune_diffusion_model: bool):
         self.tune_projector = tune_projector
@@ -532,7 +537,7 @@ class FlowmatchingActionHead(nn.Module):
         return BatchFeature(data=output_dict)
 
     @torch.no_grad()
-    def get_action(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
+    def get_action(self, backbone_output: BatchFeature, action_input: BatchFeature, rtc_enabled: bool, **kwargs) -> BatchFeature:
         backbone_output = self.process_backbone_output(backbone_output)
 
         # Get vision and language embeddings.
@@ -556,71 +561,104 @@ class FlowmatchingActionHead(nn.Module):
         if self.encoder_action_dim != self.actual_action_dim:
             actions[:, :, self.actual_action_dim:] = 0.0
 
+        x_t = actions
+
         num_steps = self.num_inference_timesteps
         dt = 1.0 / num_steps
 
-        # Run denoising steps.
         for t in range(num_steps):
             t_cont = t / float(num_steps)  # e.g. goes 0, 1/N, 2/N, ...
             t_discretized = int(t_cont * self.num_timestep_buckets)
 
-            # Embed noised action trajectory.
-            timesteps_tensor = torch.full(size=(batch_size,), fill_value=t_discretized, device=device)
+            def denoise_step_partial_call(input_x_t, current_timestep=t_discretized, state_features=state_features, vl_embs=vl_embs, embodiment_id=embodiment_id):
+                return self.denoise_step(x_t=input_x_t, timestep=current_timestep, vl_embs=vl_embs, state_features=state_features, embodiment_id=embodiment_id)
+
+            if rtc_enabled:
+                inference_delay = kwargs.get("inference_delay")
+                prev_chunk_left_over = kwargs.get("prev_chunk_left_over")
+                execution_horizon = kwargs.get("execution_horizon")
+
+                v_t = self.rtc_processor.denoise_step(
+                    x_t=x_t,
+                    prev_chunk_left_over=prev_chunk_left_over,
+                    inference_delay=inference_delay,
+                    time=t_discretized,
+                    original_denoise_step_partial=denoise_step_partial_call,
+                    execution_horizon=execution_horizon,
+                )
+            else:
+                v_t = denoise_step_partial_call(x_t)
+            # v_t = denoise_step_partial_call(x_t)
+
+            x_t = x_t + dt * v_t
+
+            if self.encoder_action_dim != self.actual_action_dim:
+                x_t[:, :, self.actual_action_dim:] = 0.0
+
+            # # Record x_t and v_t after Euler step
+            # if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
+            #     self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
+
+        actions_output = x_t[:, :, :self.actual_action_dim]
+        return BatchFeature(data={"action_pred": actions_output})
+
+    def denoise_step(self, x_t: torch.Tensor, timestep, vl_embs, state_features, embodiment_id) -> torch.Tensor:
+        """
+        单步预测 velocity
+        """
+        # 单步调用 _predict_velocity
+        batch_size = x_t.shape[0]
+        # timesteps_tensor = torch.full(size=(batch_size,), fill_value=timestep.item(), device=x_t.device)
+        timesteps_tensor = torch.full(size=(batch_size,), fill_value=timestep, device=x_t.device)
+        v_t = self._predict_velocity(vl_embs, state_features, x_t, timesteps_tensor, embodiment_id)
+        return v_t
+
+    def _predict_velocity(
+            self,
+            vl_embs: torch.Tensor,
+            state_features: torch.Tensor,
+            actions: torch.Tensor,
+            timesteps_tensor: torch.Tensor,
+            embodiment_id: torch.Tensor,
+        ) -> torch.Tensor:
+            """v_pi(A, o, tau) in the RTC paper: predicts velocity field for the current action chunk."""
             action_features = self.action_encoder(actions, timesteps_tensor, embodiment_id)
-            # Maybe add position embedding.
             if self.config.add_pos_embed:
-                pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
+                pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=actions.device)
                 pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
                 action_features = action_features + pos_embs
 
-            # Join vision, language, state and action embedding along sequence dimension.
             future_tokens = self.future_tokens.weight.unsqueeze(0).expand(vl_embs.shape[0], -1, -1)
             sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1)
 
-            # Run model forward.
             model_output = self.model(
                 hidden_states=sa_embs,
                 encoder_hidden_states=vl_embs,
                 timestep=timesteps_tensor,
             )
-            
-            # Slice out only the action portion of model output
             model_output_actions = model_output[:, -self.action_horizon :]
-            
-            # Multi-head action prediction
+
             if self.config.use_multi_action_heads:
                 pred_arm = self.action_arm_decoder(model_output_actions, embodiment_id)
                 pred_claw = self.action_claw_decoder(model_output_actions, embodiment_id)
-                pred_velocity = torch.cat([pred_arm, pred_claw], dim=-1)  # (B, T, action_dim)
+                pred_velocity = torch.cat([pred_arm, pred_claw], dim=-1)  # (B, T, actual_action_dim)
             else:
-                pred = self.action_decoder(model_output_actions, embodiment_id)
-                pred_velocity = pred
+                pred_velocity = self.action_decoder(model_output_actions, embodiment_id)  # (B, T, action_dim)
 
-            # Update actions using euler integration.
-            # If using multi-head, pred_velocity is actual_action_dim, but actions is encoder_action_dim
+            # Pad/truncate to encoder_action_dim so the action_encoder input format stays consistent.
             if self.encoder_action_dim != self.actual_action_dim:
-                # Pad pred_velocity to match encoder_action_dim
                 if self.encoder_action_dim > self.actual_action_dim:
                     pad_size = self.encoder_action_dim - self.actual_action_dim
                     padding = torch.zeros(
                         (pred_velocity.shape[0], pred_velocity.shape[1], pad_size),
                         device=pred_velocity.device,
-                        dtype=pred_velocity.dtype
+                        dtype=pred_velocity.dtype,
                     )
-                    pred_velocity_padded = torch.cat([pred_velocity, padding], dim=-1)
+                    pred_velocity = torch.cat([pred_velocity, padding], dim=-1)
                 else:
-                    pred_velocity_padded = pred_velocity[:, :, :self.encoder_action_dim]
-                actions = actions + dt * pred_velocity_padded
-                # Zero out the padded dimensions to match training behavior
-                # In training, the padded dimensions (after actual_action_dim) are always 0
-                # This ensures action_encoder receives consistent input format
-                actions[:, :, self.actual_action_dim:] = 0.0
-            else:
-                actions = actions + dt * pred_velocity
-        
-        # Return only the actual action dimensions
-        actions_output = actions[:, :, :self.actual_action_dim]
-        return BatchFeature(data={"action_pred": actions_output})
+                    pred_velocity = pred_velocity[:, :, : self.encoder_action_dim]
+
+            return pred_velocity
 
     @property
     def device(self):
