@@ -1946,6 +1946,12 @@ def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chun
                 # 正常退出（按q），准备下一次推理
                 print(f"\n{'='*80}")
                 print(f"✅ Inference session #{inference_count} stopped by user (q pressed)")
+                
+                # 立即重置policy状态，确保策略状态干净
+                rospy.loginfo("Resetting policy state after inference stop...")
+                policy.reset()
+                rospy.loginfo("   ✅ Policy reset complete")
+                
                 cur_dir = os.path.dirname(os.path.abspath(__file__))
                 # 每次退出时都使用JSON文件重置手臂位置
                 # 第一次推理开始时使用bag文件，后续推理开始时跳过bag文件（在run_inference_loop中处理）
