@@ -158,8 +158,15 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
     action_arm_dim: int = field(default=14, metadata={"help": "Arm joint dimensions (0-13) - absolute actions"})
     action_claw_dim: int = field(default=2, metadata={"help": "Claw position dimensions (14-15) - absolute actions"})
     
+    # Split arm into left and right hands
+    split_arm_heads: bool = field(default=True, metadata={"help": "Whether to split arm head into left and right arm heads"})
+    action_left_arm_dim: int = field(default=7, metadata={"help": "Left arm joint dimensions (0-6) - absolute actions"})
+    action_right_arm_dim: int = field(default=7, metadata={"help": "Right arm joint dimensions (7-13) - absolute actions"})
+    
     # Loss weights for different action heads
     arm_loss_weight: float = field(default=1.0, metadata={"help": "Arm absolute position loss weight"})
+    left_arm_loss_weight: float = field(default=1.0, metadata={"help": "Left arm absolute position loss weight"})
+    right_arm_loss_weight: float = field(default=1.0, metadata={"help": "Right arm absolute position loss weight"})
     claw_loss_weight: float = field(default=1.0, metadata={"help": "Claw position loss weight"})
     
     # Learnable uncertainty weights (参考 https://arxiv.org/pdf/1705.07115)
@@ -175,13 +182,25 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
         
         # Validate multi-head configuration
         if self.use_multi_action_heads:
-            expected_action_dim = self.action_arm_dim + self.action_claw_dim
+            if self.split_arm_heads:
+                # When splitting arms, validate left + right = total arm dim
+                # Note: action_arm_dim should be set to left+right in groot_n1.py
+                expected_arm_dim = self.action_left_arm_dim + self.action_right_arm_dim
+                if self.action_arm_dim != expected_arm_dim:
+                    raise ValueError(
+                        f"When split_arm_heads=True, action_arm_dim ({self.action_arm_dim}) must equal "
+                        f"action_left_arm_dim ({self.action_left_arm_dim}) + action_right_arm_dim ({self.action_right_arm_dim}) = {expected_arm_dim}"
+                    )
+                expected_action_dim = self.action_left_arm_dim + self.action_right_arm_dim + self.action_claw_dim
+            else:
+                expected_action_dim = self.action_arm_dim + self.action_claw_dim
+            
             if self.action_dim is not None and self.action_dim != expected_action_dim:
                 # If pretrained_action_dim is set, allow mismatch (we'll pad/truncate)
                 if self.pretrained_action_dim is None:
                     raise ValueError(
                         f"When using multi-action heads, action_dim ({self.action_dim}) must equal "
-                        f"action_arm_dim ({self.action_arm_dim}) + action_claw_dim ({self.action_claw_dim}) = {expected_action_dim}"
+                        f"{'left_arm + right_arm + claw' if self.split_arm_heads else 'arm + claw'} = {expected_action_dim}"
                     )
                 # If pretrained_action_dim is set, use it for action_encoder
                 if self.pretrained_action_dim != expected_action_dim:
@@ -226,12 +245,32 @@ class FlowmatchingActionHead(nn.Module):
         
         # Multi-head action prediction
         if config.use_multi_action_heads:
-            self.action_arm_decoder = CategorySpecificMLP(
-                num_categories=config.max_num_embodiments,
-                input_dim=self.hidden_size,
-                hidden_dim=self.hidden_size,
-                output_dim=config.action_arm_dim,
-            )
+            if config.split_arm_heads:
+                # Split arm into left and right
+                self.action_left_arm_decoder = CategorySpecificMLP(
+                    num_categories=config.max_num_embodiments,
+                    input_dim=self.hidden_size,
+                    hidden_dim=self.hidden_size,
+                    output_dim=config.action_left_arm_dim,
+                )
+                self.action_right_arm_decoder = CategorySpecificMLP(
+                    num_categories=config.max_num_embodiments,
+                    input_dim=self.hidden_size,
+                    hidden_dim=self.hidden_size,
+                    output_dim=config.action_right_arm_dim,
+                )
+                self.action_arm_decoder = None  # Not used when split
+            else:
+                # Single arm head
+                self.action_arm_decoder = CategorySpecificMLP(
+                    num_categories=config.max_num_embodiments,
+                    input_dim=self.hidden_size,
+                    hidden_dim=self.hidden_size,
+                    output_dim=config.action_arm_dim,
+                )
+                self.action_left_arm_decoder = None
+                self.action_right_arm_decoder = None
+            
             self.action_claw_decoder = CategorySpecificMLP(
                 num_categories=config.max_num_embodiments,
                 input_dim=self.hidden_size,
@@ -239,7 +278,15 @@ class FlowmatchingActionHead(nn.Module):
                 output_dim=config.action_claw_dim,
             )
             self.action_decoder = None  # Not used in multi-head mode
-            print(f"📊 Multi-head action: arm({config.action_arm_dim}D) + claw({config.action_claw_dim}D) = {config.action_arm_dim + config.action_claw_dim}D")
+            
+            if config.split_arm_heads:
+                total_dim = config.action_left_arm_dim + config.action_right_arm_dim + config.action_claw_dim
+                print(f"📊 Multi-head action: left_arm({config.action_left_arm_dim}D, indices 0-{config.action_left_arm_dim-1}) + "
+                      f"right_arm({config.action_right_arm_dim}D, indices {config.action_left_arm_dim}-{config.action_left_arm_dim + config.action_right_arm_dim-1}) + "
+                      f"claw({config.action_claw_dim}D, indices {config.action_arm_dim}-{config.action_arm_dim + config.action_claw_dim-1}) = {total_dim}D")
+                print(f"   action_arm_dim={config.action_arm_dim} (left+right), actual_action_dim={config.action_dim}")
+            else:
+                print(f"📊 Multi-head action: arm({config.action_arm_dim}D) + claw({config.action_claw_dim}D) = {config.action_arm_dim + config.action_claw_dim}D")
         else:
             self.action_decoder = CategorySpecificMLP(
                 num_categories=config.max_num_embodiments,
@@ -248,15 +295,25 @@ class FlowmatchingActionHead(nn.Module):
                 output_dim=self.action_dim,
             )
             self.action_arm_decoder = None
+            self.action_left_arm_decoder = None
+            self.action_right_arm_decoder = None
             self.action_claw_decoder = None
         
         # Learnable loss weights (参考 https://arxiv.org/pdf/1705.07115)
         if config.use_learnable_loss_weights and config.use_multi_action_heads:
-            self.task_log_sigma = nn.ParameterDict({
-                "arm": nn.Parameter(torch.zeros(())),    # log(σ_arm)
-                "claw": nn.Parameter(torch.zeros(())),  # log(σ_claw)
-            })
-            print(f"🎯 Learnable loss weights enabled: arm, claw")
+            if config.split_arm_heads:
+                self.task_log_sigma = nn.ParameterDict({
+                    "left_arm": nn.Parameter(torch.zeros(())),    # log(σ_left_arm)
+                    "right_arm": nn.Parameter(torch.zeros(())),   # log(σ_right_arm)
+                    "claw": nn.Parameter(torch.zeros(())),        # log(σ_claw)
+                })
+                print(f"🎯 Learnable loss weights enabled: left_arm, right_arm, claw")
+            else:
+                self.task_log_sigma = nn.ParameterDict({
+                    "arm": nn.Parameter(torch.zeros(())),    # log(σ_arm)
+                    "claw": nn.Parameter(torch.zeros(())),  # log(σ_claw)
+                })
+                print(f"🎯 Learnable loss weights enabled: arm, claw")
             print(f"   Using uncertainty-based weighting from https://arxiv.org/pdf/1705.07115")
         else:
             self.task_log_sigma = None
@@ -286,10 +343,19 @@ class FlowmatchingActionHead(nn.Module):
             self.state_encoder.requires_grad_(False)
             self.action_encoder.requires_grad_(False)
             if self.config.use_multi_action_heads:
-                self.action_arm_decoder.requires_grad_(False)
-                self.action_claw_decoder.requires_grad_(False)
+                if self.config.split_arm_heads:
+                    if self.action_left_arm_decoder is not None:
+                        self.action_left_arm_decoder.requires_grad_(False)
+                    if self.action_right_arm_decoder is not None:
+                        self.action_right_arm_decoder.requires_grad_(False)
+                else:
+                    if self.action_arm_decoder is not None:
+                        self.action_arm_decoder.requires_grad_(False)
+                if self.action_claw_decoder is not None:
+                    self.action_claw_decoder.requires_grad_(False)
             else:
-                self.action_decoder.requires_grad_(False)
+                if self.action_decoder is not None:
+                    self.action_decoder.requires_grad_(False)
             if self.config.add_pos_embed:
                 self.position_embedding.requires_grad_(False)
         if not tune_diffusion_model:
@@ -315,10 +381,19 @@ class FlowmatchingActionHead(nn.Module):
                 self.state_encoder.eval()
                 self.action_encoder.eval()
                 if self.config.use_multi_action_heads:
-                    self.action_arm_decoder.eval()
-                    self.action_claw_decoder.eval()
+                    if self.config.split_arm_heads:
+                        if self.action_left_arm_decoder is not None:
+                            self.action_left_arm_decoder.eval()
+                        if self.action_right_arm_decoder is not None:
+                            self.action_right_arm_decoder.eval()
+                    else:
+                        if self.action_arm_decoder is not None:
+                            self.action_arm_decoder.eval()
+                    if self.action_claw_decoder is not None:
+                        self.action_claw_decoder.eval()
                 else:
-                    self.action_decoder.eval()
+                    if self.action_decoder is not None:
+                        self.action_decoder.eval()
                 if self.config.add_pos_embed:
                     self.position_embedding.eval()
             if not self.tune_diffusion_model:
@@ -463,59 +538,123 @@ class FlowmatchingActionHead(nn.Module):
         
         # Multi-head action prediction
         if self.config.use_multi_action_heads:
-            pred_arm = self.action_arm_decoder(model_output_actions, embodiment_id)
-            pred_claw = self.action_claw_decoder(model_output_actions, embodiment_id)
-            pred_actions = torch.cat([pred_arm, pred_claw], dim=-1)  # (B, T, action_dim)
-            
-            # Split ground truth velocity into corresponding parts
-            velocity_arm = velocity[:, :, :self.config.action_arm_dim]  # (B, T, action_arm_dim)
-            velocity_claw = velocity[:, :, self.config.action_arm_dim:]  # (B, T, action_claw_dim)
-            
-            # Compute loss for each head
-            # action_mask is (B, T, encoder_action_dim), but we only need the first actual_action_dim
-            # Since velocity is already extracted from first actual_action_dim, we use the corresponding mask
-            action_mask = action_input.action_mask[:, :, :self.actual_action_dim]  # (B, T, actual_action_dim)
-            # Split mask for arm and claw
-            action_mask_arm = action_mask[:, :, :self.config.action_arm_dim]  # (B, T, action_arm_dim)
-            action_mask_claw = action_mask[:, :, self.config.action_arm_dim:]  # (B, T, action_claw_dim)
-            
-            loss_arm = F.mse_loss(pred_arm, velocity_arm, reduction="none") * action_mask_arm
-            loss_claw = F.mse_loss(pred_claw, velocity_claw, reduction="none") * action_mask_claw
-            
-            # Use learnable weights or fixed weights
-            if self.config.use_learnable_loss_weights and self.task_log_sigma is not None:
-                # Loss = Σ [1/(2σ²) * L_i + log(σ)]
-                # 这里使用 log(σ) 作为可学习参数，避免 σ 为负
-                loss_arm_mean = loss_arm.sum() / action_mask_arm.sum()
-                loss_claw_mean = loss_claw.sum() / action_mask_claw.sum()
+            if self.config.split_arm_heads:
+                # Split arm into left and right
+                pred_left_arm = self.action_left_arm_decoder(model_output_actions, embodiment_id)
+                pred_right_arm = self.action_right_arm_decoder(model_output_actions, embodiment_id)
+                pred_claw = self.action_claw_decoder(model_output_actions, embodiment_id)
+                pred_actions = torch.cat([pred_left_arm, pred_right_arm, pred_claw], dim=-1)  # (B, T, action_dim)
                 
-                s_arm = self.task_log_sigma["arm"]
-                s_claw = self.task_log_sigma["claw"]
-                precision_arm = torch.exp(-2.0 * s_arm)  # 1 / σ²
-                precision_claw = torch.exp(-2.0 * s_claw)
+                # Split ground truth velocity into corresponding parts
+                # velocity shape: (B, T, actual_action_dim=16)
+                # Structure: [left_arm(0-6, 7D), right_arm(7-13, 7D), claw(14-15, 2D)]
+                velocity_left_arm = velocity[:, :, :self.config.action_left_arm_dim]  # (B, T, 7) - indices 0-6
+                velocity_right_arm = velocity[:, :, self.config.action_left_arm_dim:self.config.action_left_arm_dim + self.config.action_right_arm_dim]  # (B, T, 7) - indices 7-13
+                velocity_claw = velocity[:, :, self.config.action_arm_dim:]  # (B, T, 2) - indices 14-15
                 
-                loss = precision_arm * loss_arm_mean + precision_claw * loss_claw_mean + s_arm + s_claw
+                # Compute loss for each head
+                # action_mask shape: (B, T, encoder_action_dim), extract only actual_action_dim
+                action_mask = action_input.action_mask[:, :, :self.actual_action_dim]  # (B, T, 16)
+                # Split mask for left_arm, right_arm and claw (same structure as velocity)
+                action_mask_left_arm = action_mask[:, :, :self.config.action_left_arm_dim]  # (B, T, 7) - indices 0-6
+                action_mask_right_arm = action_mask[:, :, self.config.action_left_arm_dim:self.config.action_left_arm_dim + self.config.action_right_arm_dim]  # (B, T, 7) - indices 7-13
+                action_mask_claw = action_mask[:, :, self.config.action_arm_dim:]  # (B, T, 2) - indices 14-15
                 
-                output_dict = {
-                    "loss": loss,
-                    "arm_loss": loss_arm_mean.item(),
-                    "claw_loss": loss_claw_mean.item(),
-                    "sigma_arm": torch.exp(s_arm).item(),
-                    "sigma_claw": torch.exp(s_claw).item(),
-                    "weight_arm": precision_arm.item(),
-                    "weight_claw": precision_claw.item(),
-                }
+                loss_left_arm = F.mse_loss(pred_left_arm, velocity_left_arm, reduction="none") * action_mask_left_arm
+                loss_right_arm = F.mse_loss(pred_right_arm, velocity_right_arm, reduction="none") * action_mask_right_arm
+                loss_claw = F.mse_loss(pred_claw, velocity_claw, reduction="none") * action_mask_claw
+                
+                # Use learnable weights or fixed weights
+                if self.config.use_learnable_loss_weights and self.task_log_sigma is not None:
+                    loss_left_arm_mean = loss_left_arm.sum() / action_mask_left_arm.sum()
+                    loss_right_arm_mean = loss_right_arm.sum() / action_mask_right_arm.sum()
+                    loss_claw_mean = loss_claw.sum() / action_mask_claw.sum()
+                    
+                    s_left_arm = self.task_log_sigma["left_arm"]
+                    s_right_arm = self.task_log_sigma["right_arm"]
+                    s_claw = self.task_log_sigma["claw"]
+                    precision_left_arm = torch.exp(-2.0 * s_left_arm)
+                    precision_right_arm = torch.exp(-2.0 * s_right_arm)
+                    precision_claw = torch.exp(-2.0 * s_claw)
+                    
+                    loss = precision_left_arm * loss_left_arm_mean + precision_right_arm * loss_right_arm_mean + precision_claw * loss_claw_mean + s_left_arm + s_right_arm + s_claw
+                    
+                    output_dict = {
+                        "loss": loss,
+                        "left_arm_loss": loss_left_arm_mean.item(),
+                        "right_arm_loss": loss_right_arm_mean.item(),
+                        "claw_loss": loss_claw_mean.item(),
+                        "sigma_left_arm": torch.exp(s_left_arm).item(),
+                        "sigma_right_arm": torch.exp(s_right_arm).item(),
+                        "sigma_claw": torch.exp(s_claw).item(),
+                        "weight_left_arm": precision_left_arm.item(),
+                        "weight_right_arm": precision_right_arm.item(),
+                        "weight_claw": precision_claw.item(),
+                    }
+                else:
+                    # Use fixed weights
+                    loss_left_arm_mean = loss_left_arm.sum() / action_mask_left_arm.sum()
+                    loss_right_arm_mean = loss_right_arm.sum() / action_mask_right_arm.sum()
+                    loss_claw_mean = loss_claw.sum() / action_mask_claw.sum()
+                    loss = self.config.left_arm_loss_weight * loss_left_arm_mean + self.config.right_arm_loss_weight * loss_right_arm_mean + self.config.claw_loss_weight * loss_claw_mean
+                    
+                    output_dict = {
+                        "loss": loss,
+                        "left_arm_loss": loss_left_arm_mean.item(),
+                        "right_arm_loss": loss_right_arm_mean.item(),
+                        "claw_loss": loss_claw_mean.item(),
+                    }
             else:
-                # Use fixed weights
-                loss_arm_mean = loss_arm.sum() / action_mask_arm.sum()
-                loss_claw_mean = loss_claw.sum() / action_mask_claw.sum()
-                loss = self.config.arm_loss_weight * loss_arm_mean + self.config.claw_loss_weight * loss_claw_mean
+                # Single arm head (original behavior)
+                pred_arm = self.action_arm_decoder(model_output_actions, embodiment_id)
+                pred_claw = self.action_claw_decoder(model_output_actions, embodiment_id)
+                pred_actions = torch.cat([pred_arm, pred_claw], dim=-1)  # (B, T, action_dim)
                 
-                output_dict = {
-                    "loss": loss,
-                    "arm_loss": loss_arm_mean.item(),
-                    "claw_loss": loss_claw_mean.item(),
-                }
+                # Split ground truth velocity into corresponding parts
+                velocity_arm = velocity[:, :, :self.config.action_arm_dim]  # (B, T, action_arm_dim)
+                velocity_claw = velocity[:, :, self.config.action_arm_dim:]  # (B, T, action_claw_dim)
+                
+                # Compute loss for each head
+                action_mask = action_input.action_mask[:, :, :self.actual_action_dim]  # (B, T, actual_action_dim)
+                # Split mask for arm and claw
+                action_mask_arm = action_mask[:, :, :self.config.action_arm_dim]  # (B, T, action_arm_dim)
+                action_mask_claw = action_mask[:, :, self.config.action_arm_dim:]  # (B, T, action_claw_dim)
+                
+                loss_arm = F.mse_loss(pred_arm, velocity_arm, reduction="none") * action_mask_arm
+                loss_claw = F.mse_loss(pred_claw, velocity_claw, reduction="none") * action_mask_claw
+                
+                # Use learnable weights or fixed weights
+                if self.config.use_learnable_loss_weights and self.task_log_sigma is not None:
+                    loss_arm_mean = loss_arm.sum() / action_mask_arm.sum()
+                    loss_claw_mean = loss_claw.sum() / action_mask_claw.sum()
+                    
+                    s_arm = self.task_log_sigma["arm"]
+                    s_claw = self.task_log_sigma["claw"]
+                    precision_arm = torch.exp(-2.0 * s_arm)  # 1 / σ²
+                    precision_claw = torch.exp(-2.0 * s_claw)
+                    
+                    loss = precision_arm * loss_arm_mean + precision_claw * loss_claw_mean + s_arm + s_claw
+                    
+                    output_dict = {
+                        "loss": loss,
+                        "arm_loss": loss_arm_mean.item(),
+                        "claw_loss": loss_claw_mean.item(),
+                        "sigma_arm": torch.exp(s_arm).item(),
+                        "sigma_claw": torch.exp(s_claw).item(),
+                        "weight_arm": precision_arm.item(),
+                        "weight_claw": precision_claw.item(),
+                    }
+                else:
+                    # Use fixed weights
+                    loss_arm_mean = loss_arm.sum() / action_mask_arm.sum()
+                    loss_claw_mean = loss_claw.sum() / action_mask_claw.sum()
+                    loss = self.config.arm_loss_weight * loss_arm_mean + self.config.claw_loss_weight * loss_claw_mean
+                    
+                    output_dict = {
+                        "loss": loss,
+                        "arm_loss": loss_arm_mean.item(),
+                        "claw_loss": loss_claw_mean.item(),
+                    }
         else:
             # Single head (original behavior)
             pred = self.action_decoder(model_output_actions, embodiment_id)
@@ -589,9 +728,17 @@ class FlowmatchingActionHead(nn.Module):
             
             # Multi-head action prediction
             if self.config.use_multi_action_heads:
-                pred_arm = self.action_arm_decoder(model_output_actions, embodiment_id)
-                pred_claw = self.action_claw_decoder(model_output_actions, embodiment_id)
-                pred_velocity = torch.cat([pred_arm, pred_claw], dim=-1)  # (B, T, action_dim)
+                if self.config.split_arm_heads:
+                    # Split arm into left and right
+                    pred_left_arm = self.action_left_arm_decoder(model_output_actions, embodiment_id)
+                    pred_right_arm = self.action_right_arm_decoder(model_output_actions, embodiment_id)
+                    pred_claw = self.action_claw_decoder(model_output_actions, embodiment_id)
+                    pred_velocity = torch.cat([pred_left_arm, pred_right_arm, pred_claw], dim=-1)  # (B, T, action_dim)
+                else:
+                    # Single arm head
+                    pred_arm = self.action_arm_decoder(model_output_actions, embodiment_id)
+                    pred_claw = self.action_claw_decoder(model_output_actions, embodiment_id)
+                    pred_velocity = torch.cat([pred_arm, pred_claw], dim=-1)  # (B, T, action_dim)
             else:
                 pred = self.action_decoder(model_output_actions, embodiment_id)
                 pred_velocity = pred
