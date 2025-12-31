@@ -637,6 +637,10 @@ def reset_inference_state(policy, env):
     policy.reset()
     rospy.loginfo("   ✅ Policy reset")
     
+    # 重置夹爪锁定状态
+    env.reset_claw_lock()
+    rospy.loginfo("   ✅ Claw lock reset")
+    
     # 等待buffer重新ready（buffer会自动保持最新数据，但确保数据充足）
     rospy.loginfo("   ⏳ Waiting for buffer to be ready...")
     env.obs_buffer.wait_buffer_ready()
@@ -645,7 +649,7 @@ def reset_inference_state(policy, env):
     rospy.loginfo("✅ Inference state reset complete")
 
 
-def load_model_and_env(ckpt_path, model_type, action_chunk_size=50, enable_gui=False, rotate_head_camera=False, state_zero=False, task_description=None):
+def load_model_and_env(ckpt_path, model_type, action_chunk_size=50, enable_gui=False, rotate_head_camera=False, state_zero=False, task_description=None, claw_lock_threshold=50.0, claw_lock_count_threshold=5, claw_locked_value=90.0):
     """
     加载模型和环境（只执行一次，避免重复加载）
     
@@ -722,7 +726,11 @@ def load_model_and_env(ckpt_path, model_type, action_chunk_size=50, enable_gui=F
     policy.reset()
     
     # Initialize real-time environment
-    env = GrabBoxMpcEnv()
+    env = GrabBoxMpcEnv(
+        claw_lock_threshold=claw_lock_threshold,
+        claw_lock_count_threshold=claw_lock_count_threshold,
+        claw_locked_value=claw_locked_value
+    )
     print(f"🤖 Environment initialized for depalletize task")
     print(" ======================  Waiting for buffer ready ====================== ")
     env.obs_buffer.wait_buffer_ready()
@@ -1761,6 +1769,11 @@ def final_reset_arm(json_path, env, control_arm=True, control_claw=True):
         control_arm: 是否控制手臂
         control_claw: 是否控制夹爪
     """
+    # 先重置夹爪锁定状态，确保可以正常打开夹爪
+    rospy.loginfo("Resetting claw lock state before opening claws...")
+    env.reset_claw_lock()
+    rospy.loginfo("✅ Claw lock reset complete")
+    
     # 先打开夹爪
     rospy.loginfo("Opening claws before reset...")
     # 获取当前状态
@@ -1843,7 +1856,7 @@ def final_reset_arm(json_path, env, control_arm=True, control_claw=True):
     rospy.loginfo("Arm reset completed!")
 
 
-def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chunk_size=50, enable_gui=False, rotate_head_camera=False, state_zero=False, task_description=None, chunk_start=None, chunk_end=None, model_action_dt=None, sync_mode=False, max_joint_velocity=None, constant_velocity=False, action_stride=1):
+def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chunk_size=50, enable_gui=False, rotate_head_camera=False, state_zero=False, task_description=None, chunk_start=None, chunk_end=None, model_action_dt=None, sync_mode=False, max_joint_velocity=None, constant_velocity=False, action_stride=1, claw_lock_threshold=50.0, claw_lock_count_threshold=5, claw_locked_value=90.0):
     """
     在这里和实机/仿真交互，做网络推理（depalletize任务）
     支持多次推理：按'q'退出当前推理，可以快速重新开始下一次推理而无需重新加载模型
@@ -1878,7 +1891,10 @@ def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chun
         enable_gui=enable_gui,
         rotate_head_camera=rotate_head_camera,
         state_zero=state_zero,
-        task_description=task_description
+        task_description=task_description,
+        claw_lock_threshold=claw_lock_threshold,
+        claw_lock_count_threshold=claw_lock_count_threshold,
+        claw_locked_value=claw_locked_value
     )
     
     # 主循环：支持多次推理
@@ -2023,6 +2039,14 @@ if __name__ == '__main__':
                         help='Action stride for speedup. If set to N, executes every N-th action, skipping intermediate ones. '
                              'Example: --action-stride=2 means ~2x speedup. Default: 1 (no skipping). '
                              'Note: This reduces the number of executed actions but does not change velocity limits.')
+    parser.add_argument('--claw-lock-threshold', type=float, default=50.0,
+                        help='Claw value threshold to trigger lock mechanism. If claw command exceeds this value '
+                             'continuously, it will trigger locking. Default: 50.0')
+    parser.add_argument('--claw-lock-count-threshold', type=int, default=1,
+                        help='Number of consecutive high claw values (>= threshold) required to lock the claw. '
+                             'Default: 1')
+    parser.add_argument('--claw-locked-value', type=float, default=80.0,
+                        help='Claw value to use when locked (fully closed). Default: 80.0')
     
     args = parser.parse_args()
     
@@ -2092,6 +2116,7 @@ if __name__ == '__main__':
             print(f"⚙️  Constant velocity mode: Enabled (actions will execute at constant velocity within speed limit)")
     if args.action_stride > 1:
         print(f"⚡ Action stride: {args.action_stride} (executing every {args.action_stride}-th action, ~{args.action_stride}x speedup)")
+    print(f"🔒 Claw lock mechanism: threshold={args.claw_lock_threshold}, count_threshold={args.claw_lock_count_threshold}, locked_value={args.claw_locked_value}")
     print("="*80 + "\n")
 
     if args.eval:
@@ -2108,7 +2133,10 @@ if __name__ == '__main__':
              sync_mode=args.sync_mode,
              max_joint_velocity=args.max_joint_velocity,
              constant_velocity=args.constant_velocity if args.max_joint_velocity is not None else False,
-             action_stride=args.action_stride)
+             action_stride=args.action_stride,
+             claw_lock_threshold=args.claw_lock_threshold,
+             claw_lock_count_threshold=args.claw_lock_count_threshold,
+             claw_locked_value=args.claw_locked_value)
     elif args.replay:
         print("Replaying the model")
         lerobot_dataset_path = '/home/lab/kuavo-manip/lerobot_data/vel_wrend_box_613'
