@@ -62,6 +62,7 @@ class ActionQueue:
         self.original_queue = None  # Original actions for RTC
         self.lock = Lock()
         self.last_index = 0
+        self.original_last_index = 0
         self.cfg = cfg
 
     def get(self) -> Tensor | None:
@@ -77,6 +78,10 @@ class ActionQueue:
 
             action = self.queue[self.last_index]
             self.last_index += 1
+
+            if self.last_index % 10 == 0:
+                self.original_last_index = self.last_index // 10
+
             return action.clone()
 
     def qsize(self) -> int:
@@ -108,7 +113,8 @@ class ActionQueue:
         Returns:
             int: Index of the next action to be consumed.
         """
-        return self.last_index
+        # return self.last_index
+        return self.original_last_index
 
     def get_left_over(self) -> Tensor | None:
         """Get leftover original actions for RTC prev_chunk_left_over.
@@ -123,7 +129,8 @@ class ActionQueue:
         with self.lock:
             if self.original_queue is None:
                 return None
-            return self.original_queue[self.last_index :]
+            # return self.original_queue[self.last_index :]
+            return self.original_queue[self.original_last_index :]
 
     def merge(
         self,
@@ -165,7 +172,7 @@ class ActionQueue:
         """
 
         self.original_queue = original_actions[real_delay:].clone()
-        self.queue = processed_actions[real_delay:].clone()
+        self.queue = processed_actions[real_delay*10:].clone()
 
         logger.info(f"original_actions shape: {self.original_queue.shape}")
         logger.info(f"processed_actions shape: {self.queue.shape}")

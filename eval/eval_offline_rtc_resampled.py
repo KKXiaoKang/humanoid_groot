@@ -27,7 +27,7 @@ For simulation environments, see eval_with_simulation.py
 
 Usage:
     # Run eval on dataset with RTC
-    uv run eval/eval_online_rtc.py \
+    python eval/eval_offline_rtc_resampled.py \
         --policy.path=/path/to/checkpoint \
         --policy.device=cuda \
         --rtc.enabled=true \
@@ -78,8 +78,127 @@ import numpy as np
 from torch.utils.data import DataLoader
 import numpy as np
 import time
+from typing import Optional
 
-from eval_online import final_reset_arm
+
+class FakeObsStream:
+    """
+    用 LeRobotDataset / DataLoader 伪造 env.get_obs() 的数据流。
+    每次 get_obs() 返回一帧（T=1）观测，格式严格对齐 GrabBoxMpcEnv.get_obs()，
+    后续仍由 _convert_obs_to_lerobot_format 做 LeRobot 化。
+    """
+
+    def __init__(
+        self,
+        dataset_path: str,
+        fps: float,
+        camera_components,
+        shuffle: bool = False,
+        loop: bool = False,
+        num_workers: int = 0,
+        pin_memory: bool = False,
+        episodes: list[int] | None = None,
+    ):
+        self.dataset = LeRobotDataset(
+            repo_id=0,
+            root=dataset_path,
+            episodes=episodes,
+        )
+
+        self.dataloader = DataLoader(
+            self.dataset,
+            batch_size=1,
+            shuffle=shuffle,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            drop_last=False,
+        )
+
+        self.it = iter(self.dataloader)
+        self.loop = loop
+
+        self.dt = 1.0 / float(fps)
+        self.last_ts = time.time()
+
+        self.camera_names = get_camera_names(camera_components)
+
+    def _next_batch(self):
+        try:
+            batch = next(self.it)
+        except StopIteration:
+            if not self.loop:
+                raise
+            self.it = iter(self.dataloader)
+            batch = next(self.it)
+        return batch
+
+    def get_obs(self):
+        """
+        返回签名对齐 GrabBoxMpcEnv.get_obs():
+
+          obs_data, camera_obs, camera_obs_ts, robot_obs, robot_obs_ts
+
+        obs_data:
+          - state: (T=1, D)
+          - image keys: (T=1, H, W, C), uint8 0..255
+        """
+        batch = self._next_batch()
+
+        obs_data = {}
+
+        # ------------------------------------------------------------------
+        # state: (1, D)
+        # ------------------------------------------------------------------
+        state = (
+            batch["observation.state"][0]
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(np.float32)
+        )  # (D,)
+
+        obs_data["state"] = state[None, :]  # (1, D)
+
+        # ------------------------------------------------------------------
+        # images: (1, H, W, C), uint8
+        # ------------------------------------------------------------------
+        for cam in self.camera_names:
+            obs_key = get_camera_observation_key(cam, use_image_features=False)
+
+            if obs_key in batch:
+                img_chw = batch[obs_key][0].detach().cpu().numpy()
+            else:
+                fallback_key = f"observation.images.{cam}"
+                if fallback_key in batch:
+                    img_chw = batch[fallback_key][0].detach().cpu().numpy()
+                else:
+                    continue
+
+            # img_chw: (C, H, W)
+            if img_chw.dtype == np.uint8:
+                img_uint8 = img_chw
+            else:
+                # 通常是 float32 0..1
+                img_uint8 = np.clip(img_chw, 0.0, 1.0)
+                img_uint8 = (img_uint8 * 255.0).astype(np.uint8)
+
+            img_hwc = np.transpose(img_uint8, (1, 2, 0))  # (H, W, C)
+            obs_data[cam] = img_hwc[None, ...]            # (1, H, W, C)
+
+        # ------------------------------------------------------------------
+        # timestamps（占位即可）
+        # ------------------------------------------------------------------
+        now = time.time()
+        if now - self.last_ts < self.dt:
+            pass
+        self.last_ts = now
+
+        camera_obs = None
+        camera_obs_ts = now
+        robot_obs = None
+        robot_obs_ts = now
+
+        return obs_data, camera_obs, camera_obs_ts, robot_obs, robot_obs_ts
 
 
 @dataclass
@@ -107,7 +226,7 @@ class RTCDemoConfig(HubMixin):
 
     # Get new actions horizon. The amount of executed steps after which will be requested new actions.
     # It should be higher than inference delay + execution horizon.
-    action_queue_size_to_get_new_actions: int = 2
+    action_queue_size_to_get_new_actions: int = 15
 
     # Task to execute
     task: str = field(default="Depalletize the box", metadata={"help": "Task to execute"})
@@ -155,9 +274,95 @@ class RTCDemoConfig(HubMixin):
 def is_image_key(k: str) -> bool:
     return k.startswith(OBS_IMAGES)
 
+def resample_action_chunk(action_chunk: np.ndarray,
+                          source_dt: float = 0.1,
+                          target_dt: float = 0.01) -> np.ndarray:
+    """
+    Resample an action chunk predicted at a lower frequency to a higher control frequency.
+
+    Args:
+        action_chunk: Array of shape (N, action_dim) predicted at intervals of source_dt.
+        source_dt: Time interval between successive actions in the chunk.
+        target_dt: Desired time interval for control commands.
+
+    Returns:
+        Array of shape (M, action_dim) where M approximates (N-1)*source_dt/target_dt + 1,
+        interpolated with linear interpolation along time.
+    """
+    action_chunk = np.asarray(action_chunk)
+    if action_chunk.ndim == 1:
+        action_chunk = action_chunk.reshape(1, -1)
+
+    if action_chunk.shape[0] <= 1 or np.isclose(source_dt, target_dt):
+        # Nothing to resample, either single action or already at target frequency
+        return action_chunk
+
+    total_duration = source_dt * (action_chunk.shape[0] - 1)
+    if total_duration <= 0:
+        repeat_factor = max(int(round(source_dt / target_dt)), 1)
+        return np.repeat(action_chunk, repeats=repeat_factor, axis=0)
+
+    num_target_steps = int(round(total_duration / target_dt)) + 1
+    source_times = np.linspace(0.0, total_duration, num=action_chunk.shape[0])
+    target_times = np.linspace(0.0, total_duration, num=num_target_steps)
+
+    interpolated = np.empty((num_target_steps, action_chunk.shape[1]), dtype=action_chunk.dtype)
+    for dim in range(action_chunk.shape[1]):
+        interpolated[:, dim] = np.interp(target_times, source_times, action_chunk[:, dim])
+
+    return interpolated
+
+def resample_chunk_with_claw_hold(action_chunk: np.ndarray,
+                                  previous_action: Optional[np.ndarray],
+                                  control_frequency: float,
+                                  source_dt: float = 0.1,
+                                  arm_dims: slice = slice(0, 14),
+                                  claw_dims: slice = slice(14, 16),
+                                  device: torch.device = torch.device('cuda:0')) -> np.ndarray:
+    """
+    Resample an action chunk so that arm joints are interpolated to the control frequency
+    while claw positions are held at the original (low) frequency.
+    """
+    # print(f"[RESAMPLE_CHUNK_WITH_CLAW_HOLD] previous_action: {previous_action.shape}")
+    # print(f"[RESAMPLE_CHUNK_WITH_CLAW_HOLD] action_chunk: {action_chunk.shape}")
+    action_chunk = np.asarray(action_chunk)
+    if action_chunk.ndim == 1:
+        action_chunk = action_chunk.reshape(1, -1)
+
+    if previous_action is not None:
+        chunk_with_bridge = np.vstack([previous_action, action_chunk])
+        resampled = resample_action_chunk(
+            chunk_with_bridge,
+            source_dt=source_dt,
+            target_dt=1.0 / control_frequency
+        )[1:]
+        source_array = chunk_with_bridge
+    else:
+        resampled = resample_action_chunk(
+            action_chunk,
+            source_dt=source_dt,
+            target_dt=1.0 / control_frequency
+        )
+        source_array = action_chunk
+
+    # Zero-order hold for claw dimensions (keep 10Hz updates)
+    if source_array.shape[0] > 0 and resampled.shape[0] > 0:
+        total_duration = source_dt * max(source_array.shape[0] - 1, 1)
+        if total_duration <= 0:
+            hold_indices = np.zeros(resampled.shape[0], dtype=int)
+        else:
+            target_times = np.linspace(0.0, total_duration, num=resampled.shape[0], endpoint=True)
+            source_times = np.linspace(0.0, total_duration, num=source_array.shape[0], endpoint=True)
+            hold_indices = np.searchsorted(source_times, target_times, side="right") - 1
+            hold_indices = np.clip(hold_indices, 0, source_array.shape[0] - 1)
+        resampled[:, claw_dims] = source_array[hold_indices][:, claw_dims]
+
+    return torch.from_numpy(resampled).to(device)
+
+
 def get_actions(
     policy,
-    env: GrabBoxMpcEnv,
+    obs_stream: FakeObsStream,
     action_queue: ActionQueue,
     shutdown_event: Event,
     cfg: RTCDemoConfig,
@@ -194,6 +399,8 @@ def get_actions(
         if not cfg.rtc.enabled:
             get_actions_threshold = 0
 
+        last_executed_action = None
+
         while not shutdown_event.is_set():
             print(f"[GET_ACTIONS] action_queue.qsize(): {action_queue.qsize()}")
             print(f"[GET_ACTIONS] get_actions_threshold: {get_actions_threshold}")
@@ -205,7 +412,10 @@ def get_actions(
                 inference_latency = latency_tracker.max()
                 inference_delay = math.ceil(inference_latency / time_per_chunk)
 
-                obs_data, *_ = env.get_obs()
+                # obs_data, camera_obs, camera_obs_ts, robot_obs, robot_obs_ts = env.get_obs()
+                obs_data, *_ = obs_stream.get_obs()
+                for _ in range(10):
+                    obs_mask, *_ = obs_stream.get_obs()
 
                 state = torch.from_numpy(obs_data["state"]).float()
                 observation = {}
@@ -234,7 +444,7 @@ def get_actions(
                 )
 
                 original_actions = actions.squeeze(0).clone()
-                postprocessed_actions = original_actions.clone()
+                print(f"[GET_ACTIONS] original_actions: {original_actions.shape}")
 
                 _, chunk_size, _ = actions.shape
                 processed_actions = []
@@ -247,7 +457,6 @@ def get_actions(
                 
                 # 堆叠回 (B, chunk_size, action_dim)，然后转换为 numpy
                 pred_actions_unnorm = torch.stack(processed_actions, dim=1)  # (B, chunk_size, action_dim)
-                # postprocessed_actions = pred_actions_unnorm[0].cpu().numpy()  # (chunk_size, action_dim)
                 postprocessed_actions = pred_actions_unnorm[0].clone()
 
                 new_latency = time.perf_counter() - current_time
@@ -258,19 +467,40 @@ def get_actions(
                     logger.warning(
                         "[GET_ACTIONS] cfg.action_queue_size_to_get_new_actions Too small, It should be higher than inference delay + execution horizon."
                     )
+
+                # action_queue.merge(
+                #     original_actions, postprocessed_actions, new_delay, action_index_before_inference
+                # )
+
+                postprocessed_resampled = resample_chunk_with_claw_hold(
+                    postprocessed_actions.cpu().numpy(),
+                    previous_action=last_executed_action.cpu().numpy() if last_executed_action is not None else None,
+                    control_frequency=100.0,
+                    source_dt=0.1,
+                    arm_dims=slice(0, 14),
+                    claw_dims=slice(14, 16),
+                    device=postprocessed_actions.device,
+                )
+                # postprocessed_resampled_torch = torch.from_numpy(postprocessed_resampled).to(postprocessed_actions.device)
+                print(f"[GET_ACTIONS] postprocessed_resampled: {postprocessed_resampled.shape}")
+                last_executed_action = postprocessed_resampled[-get_actions_threshold].clone()
+                print(f"[GET_ACTIONS] last_executed_action: {last_executed_action.shape}")
                 action_queue.merge(
-                    original_actions, postprocessed_actions, new_delay, action_index_before_inference
+                    original_actions, postprocessed_resampled, new_delay, action_index_before_inference
                 )
             else:
                 # Small sleep to prevent busy waiting
-                print(f"[GET_ACTIONS] action_queue.qsize() > get_actions_threshold, sleep 0.1s")
-                time.sleep(0.1)
+                print(f"[GET_ACTIONS] action_queue.qsize() > get_actions_threshold, sleep 0.01s")
+                time.sleep(0.01)
 
         logger.info("[GET_ACTIONS] get actions thread shutting down")
     except Exception as e:
-        logger.error(f"[GET_ACTIONS] Fatal exception in get_actions thread: {e}")
-        logger.error(traceback.format_exc())
-        sys.exit(1)
+        print("\n" + "="*80, file=sys.stderr, flush=True)
+        print("[GET_ACTIONS] FATAL EXCEPTION", file=sys.stderr, flush=True)
+        traceback.print_exc()
+        print("="*80 + "\n", file=sys.stderr, flush=True)
+        shutdown_event.set()
+        return
 
 
 def actor_control(
@@ -291,7 +521,8 @@ def actor_control(
         logger.info("[ACTOR] Starting actor thread")
 
         action_count = 0
-        action_interval = 1.0 / cfg.fps
+        # action_interval = 1.0 / cfg.fps
+        action_interval = 1.0 / 100
 
         while not shutdown_event.is_set():
             start_time = time.perf_counter()
@@ -318,9 +549,12 @@ def actor_control(
 
         logger.info(f"[ACTOR] Actor thread shutting down. Total actions executed: {action_count}")
     except Exception as e:
-        logger.error(f"[ACTOR] Fatal exception in actor_control thread: {e}")
-        logger.error(traceback.format_exc())
-        sys.exit(1)
+        print("\n" + "="*80, file=sys.stderr, flush=True)
+        print("[ACTOR] FATAL EXCEPTION", file=sys.stderr, flush=True)
+        traceback.print_exc()
+        print("="*80 + "\n", file=sys.stderr, flush=True)
+        shutdown_event.set()
+        return
 
 
 def _apply_torch_compile(policy, cfg: RTCDemoConfig):
@@ -391,6 +625,17 @@ def demo_cli(cfg: RTCDemoConfig):
     env = GrabBoxMpcEnv()
     robot_sdk = RobotSDK()
 
+    # 初始化 FakeObsStream (offline 数据)
+    lerobot_dataset_path = "/home/wuzr/lab/benchmark/5w_four_box_random"
+    obs_stream = FakeObsStream(
+        dataset_path=lerobot_dataset_path,
+        fps=cfg.fps,
+        camera_components=CAMERA_COMPONENTS,
+        shuffle=False,
+        loop=True,
+    )
+    logger.info("[MAIN] FakeObsStream initialized")
+
     # 加载 policy
     policy_class = get_policy_class(cfg.policy.type)
     config = PreTrainedConfig.from_pretrained(cfg.policy.pretrained_path)
@@ -415,21 +660,16 @@ def demo_cli(cfg: RTCDemoConfig):
 
     # 初始化手臂位置
     robot_sdk.control.set_external_control_arm_mode()
-    cur_dir = os.path.dirname(os.path.abspath(__file__))
-    final_reset_arm(
-        json_path=os.path.join(cur_dir, 'utils/initial_arm_traj.json'), 
-        env=env,
-        control_arm=True,
-        control_claw=True
-    )
+    robot_sdk.control.control_arm_joint_positions([
+        -0.13108279410748547, 0.8129094913924698, -0.24350018506614143, -2.417029590409915, 1.3373353902132268, 0.40744714341534344, 0.9697406158372316,
+        -0.13080062822719687, -0.8167237074915805, 0.2473180179648636, -2.410544954816824, -1.3350419244819163,-0.40477685656131995, 0.9716470019773075
+    ])
     robot_sdk.control.set_arm_quick_mode(True)
-
-    env.obs_buffer.wait_buffer_ready()
 
     # input(f"轨迹回放结束, 按回车继续 ==== \n")
 
     # 启动线程
-    get_actions_thread = Thread(target=get_actions, args=(policy, env, action_queue, shutdown_event, cfg), daemon=True, name="GetActions")
+    get_actions_thread = Thread(target=get_actions, args=(policy, obs_stream, action_queue, shutdown_event, cfg), daemon=True, name="GetActions")
     actor_thread = Thread(target=actor_control, args=(env, action_queue, shutdown_event, cfg), daemon=True, name="Actor")
     get_actions_thread.start()
     actor_thread.start()

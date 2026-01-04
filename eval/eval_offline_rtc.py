@@ -67,7 +67,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-from kuavo_env.kuavo_depalletize_env import GrabBoxMpcEnv
+from robot_envs.kuavo_depalletize_env import GrabBoxMpcEnv
 from kuavo_humanoid_sdk.kuavo_strategy_pytree.common.robot_sdk import RobotSDK
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 

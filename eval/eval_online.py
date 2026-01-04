@@ -70,7 +70,7 @@ from collections import deque
 from typing import Optional
 import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "kuavo_env")))
-from kuavo_env.kuavo_depalletize_env import GrabBoxMpcEnv
+from robot_envs.kuavo_depalletize_env import GrabBoxMpcEnv
 from configs.config import get_camera_observation_key, get_camera_names, CAMERA_COMPONENTS, ACTION_COMPONENTS
 from configs.config import ROBOT_VERSION
 # 使用GrootPolicy模型

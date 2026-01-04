@@ -26,8 +26,8 @@ This script demonstrates:
 For simulation environments, see eval_with_simulation.py
 
 Usage:
-    # Run eval on dataset with RTC
-    uv run eval/eval_online_rtc.py \
+    # Run eval online with RTC and resampled actions
+    uv run eval/eval_online_rtc_resampled.py \
         --policy.path=/path/to/checkpoint \
         --policy.device=cuda \
         --rtc.enabled=true \
@@ -69,18 +69,17 @@ logger = logging.getLogger(__name__)
 
 from robot_envs.kuavo_depalletize_env import GrabBoxMpcEnv
 from kuavo_humanoid_sdk.kuavo_strategy_pytree.common.robot_sdk import RobotSDK
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 import rospy
 import numpy as np
 
-
-from torch.utils.data import DataLoader
+from typing import Optional
 import numpy as np
 import time
 
 from eval_online import final_reset_arm
 
+FIRST_MODEL_INFERENCE = True
 
 @dataclass
 class RTCDemoConfig(HubMixin):
@@ -107,7 +106,7 @@ class RTCDemoConfig(HubMixin):
 
     # Get new actions horizon. The amount of executed steps after which will be requested new actions.
     # It should be higher than inference delay + execution horizon.
-    action_queue_size_to_get_new_actions: int = 2
+    action_queue_size_to_get_new_actions: int = 50
 
     # Task to execute
     task: str = field(default="Depalletize the box", metadata={"help": "Task to execute"})
@@ -155,6 +154,164 @@ class RTCDemoConfig(HubMixin):
 def is_image_key(k: str) -> bool:
     return k.startswith(OBS_IMAGES)
 
+def resample_action_chunk(action_chunk: np.ndarray,
+                          source_dt: float = 0.1,
+                          target_dt: float = 0.01) -> np.ndarray:
+    """
+    Resample an action chunk predicted at a lower frequency to a higher control frequency.
+
+    Args:
+        action_chunk: Array of shape (N, action_dim) predicted at intervals of source_dt.
+        source_dt: Time interval between successive actions in the chunk.
+        target_dt: Desired time interval for control commands.
+
+    Returns:
+        Array of shape (M, action_dim) where M approximates (N-1)*source_dt/target_dt + 1,
+        interpolated with linear interpolation along time.
+    """
+    action_chunk = np.asarray(action_chunk)
+    if action_chunk.ndim == 1:
+        action_chunk = action_chunk.reshape(1, -1)
+
+    if action_chunk.shape[0] <= 1 or np.isclose(source_dt, target_dt):
+        # Nothing to resample, either single action or already at target frequency
+        return action_chunk
+
+    total_duration = source_dt * (action_chunk.shape[0] - 1)
+    if total_duration <= 0:
+        repeat_factor = max(int(round(source_dt / target_dt)), 1)
+        return np.repeat(action_chunk, repeats=repeat_factor, axis=0)
+
+    num_target_steps = int(round(total_duration / target_dt)) + 1
+    source_times = np.linspace(0.0, total_duration, num=action_chunk.shape[0])
+    target_times = np.linspace(0.0, total_duration, num=num_target_steps)
+
+    interpolated = np.empty((num_target_steps, action_chunk.shape[1]), dtype=action_chunk.dtype)
+    for dim in range(action_chunk.shape[1]):
+        interpolated[:, dim] = np.interp(target_times, source_times, action_chunk[:, dim])
+
+    return interpolated
+
+def resample_chunk_with_claw_hold(action_chunk: np.ndarray,
+                                  previous_action: Optional[np.ndarray],
+                                  control_frequency: float,
+                                  source_dt: float = 0.1,
+                                  arm_dims: slice = slice(0, 14),
+                                  claw_dims: slice = slice(14, 16),
+                                  device: torch.device = torch.device('cuda:0')) -> np.ndarray:
+    """
+    Resample an action chunk so that arm joints are interpolated to the control frequency
+    while claw positions are held at the original (low) frequency.
+    """
+    # print(f"[RESAMPLE_CHUNK_WITH_CLAW_HOLD] previous_action: {previous_action.shape}")
+    # print(f"[RESAMPLE_CHUNK_WITH_CLAW_HOLD] action_chunk: {action_chunk.shape}")
+    action_chunk = np.asarray(action_chunk)
+    if action_chunk.ndim == 1:
+        action_chunk = action_chunk.reshape(1, -1)
+
+    if previous_action is not None:
+        chunk_with_bridge = np.vstack([previous_action, action_chunk])
+        resampled = resample_action_chunk(
+            chunk_with_bridge,
+            source_dt=source_dt,
+            target_dt=1.0 / control_frequency
+        )[1:]
+        source_array = chunk_with_bridge
+    else:
+        resampled = resample_action_chunk(
+            action_chunk,
+            source_dt=source_dt,
+            target_dt=1.0 / control_frequency
+        )
+        source_array = action_chunk
+
+    # Zero-order hold for claw dimensions (keep 10Hz updates)
+    if source_array.shape[0] > 0 and resampled.shape[0] > 0:
+        total_duration = source_dt * max(source_array.shape[0] - 1, 1)
+        if total_duration <= 0:
+            hold_indices = np.zeros(resampled.shape[0], dtype=int)
+        else:
+            target_times = np.linspace(0.0, total_duration, num=resampled.shape[0], endpoint=True)
+            source_times = np.linspace(0.0, total_duration, num=source_array.shape[0], endpoint=True)
+            hold_indices = np.searchsorted(source_times, target_times, side="right") - 1
+            hold_indices = np.clip(hold_indices, 0, source_array.shape[0] - 1)
+        resampled[:, claw_dims] = source_array[hold_indices][:, claw_dims]
+
+    return torch.from_numpy(resampled).to(device)
+
+def apply_first_chunk_smooth(action_chunk: torch.Tensor, obs_data: dict, env: GrabBoxMpcEnv):
+    """
+    Apply smooth to the first chunk of actions.
+    """
+    action_dim = action_chunk.cpu().numpy().shape[1]
+    if action_dim == 16:
+        arm_dims = slice(0, 14)
+        claw_dims = slice(14, 16)
+    elif action_dim == 18:
+        arm_dims = slice(0, 14)
+        claw_dims = slice(14, 16)
+    else:
+        arm_dims = slice(0, 14)
+        claw_dims = slice(14, min(16, action_dim))
+
+    current_arm_state = obs_data["state"][0][arm_dims]
+    current_claw_state = np.array([0.0, 0.0])
+
+    if action_chunk.shape[0] > 0:
+        first_action = action_chunk[0].cpu().numpy().copy()
+        target_arm_state = first_action[arm_dims]  # 目标手臂关节位置
+        target_claw_state = first_action[claw_dims]  # 目标夹爪位置
+        
+        # 检查是否需要cmd_pose
+        has_cmd_pose = ("Cmd_pose_z" in ACTION_COMPONENTS or "Cmd_pose_pitch" in ACTION_COMPONENTS)
+        if has_cmd_pose and action_dim >= 18:
+            target_cmd_pose = first_action[16:18]
+            current_cmd_pose = np.array([0.0, 0.0])  # 默认cmd_pose
+        else:
+            target_cmd_pose = None
+            current_cmd_pose = None
+        
+        # 计算插值参数
+        transition_duration = 0.2  # 过渡时间（秒），第一次推理时快速过渡到第一个action
+        num_interp_steps = int(round(transition_duration / env.control_dt))
+        num_interp_steps = max(1, num_interp_steps)  # 至少1步
+        
+        rospy.loginfo(f"   Current arm state: {current_arm_state}... (showing first 3 joints)")
+        rospy.loginfo(f"   Target arm state: {target_arm_state}... (showing first 3 joints)")
+        rospy.loginfo(f"   Generating {num_interp_steps} interpolation steps over {transition_duration:.2f}s")
+        
+        # 生成插值动作序列（作为过渡chunk，不立即执行）
+        interp_actions = []
+        for i in range(num_interp_steps):
+            alpha = (i + 1) / num_interp_steps  # 从1/num_steps到1.0
+            
+            # 线性插值手臂关节
+            interp_arm = current_arm_state + (target_arm_state - current_arm_state) * alpha
+            
+            # 线性插值夹爪
+            interp_claw = current_claw_state + (target_claw_state - current_claw_state) * alpha
+            
+            # 构建完整的action
+            if has_cmd_pose and target_cmd_pose is not None:
+                # 18维格式：插值cmd_pose
+                interp_cmd_pose = current_cmd_pose + (target_cmd_pose - current_cmd_pose) * alpha
+                interp_action = np.concatenate([interp_arm, interp_claw, interp_cmd_pose])
+            else:
+                # 16维格式
+                interp_action = np.concatenate([interp_arm, interp_claw])
+            
+            interp_actions.append(interp_action)
+        
+        # 将插值动作序列转换为numpy数组（作为过渡chunk）
+        transition_chunk = np.array(interp_actions)  # shape: (num_interp_steps, action_dim)
+        action_chunk_smoothed = np.vstack([transition_chunk, action_chunk])
+        rospy.loginfo(f"   Generated smoothed action chunk of size {action_chunk_smoothed.shape[0]}")
+
+    global FIRST_MODEL_INFERENCE
+    FIRST_MODEL_INFERENCE = False
+    
+    return torch.from_numpy(action_chunk_smoothed).to(action_chunk.device)
+
 def get_actions(
     policy,
     env: GrabBoxMpcEnv,
@@ -171,6 +328,9 @@ def get_actions(
         shutdown_event: Event to signal shutdown
         cfg: Demo configuration
     """
+
+    global FIRST_MODEL_INFERENCE
+
     try:
         logger.info("[GET_ACTIONS] Starting get actions thread")
 
@@ -194,9 +354,11 @@ def get_actions(
         if not cfg.rtc.enabled:
             get_actions_threshold = 0
 
+        last_executed_action = None
+
         while not shutdown_event.is_set():
-            print(f"[GET_ACTIONS] action_queue.qsize(): {action_queue.qsize()}")
-            print(f"[GET_ACTIONS] get_actions_threshold: {get_actions_threshold}")
+            # print(f"[GET_ACTIONS] action_queue.qsize(): {action_queue.qsize()}")
+            # print(f"[GET_ACTIONS] get_actions_threshold: {get_actions_threshold}")
             if action_queue.qsize() <= get_actions_threshold:
                 current_time = time.perf_counter()
                 action_index_before_inference = action_queue.get_action_index()
@@ -234,7 +396,7 @@ def get_actions(
                 )
 
                 original_actions = actions.squeeze(0).clone()
-                postprocessed_actions = original_actions.clone()
+                # print(f"[GET_ACTIONS] original_actions: {original_actions.shape}")
 
                 _, chunk_size, _ = actions.shape
                 processed_actions = []
@@ -247,7 +409,6 @@ def get_actions(
                 
                 # 堆叠回 (B, chunk_size, action_dim)，然后转换为 numpy
                 pred_actions_unnorm = torch.stack(processed_actions, dim=1)  # (B, chunk_size, action_dim)
-                # postprocessed_actions = pred_actions_unnorm[0].cpu().numpy()  # (chunk_size, action_dim)
                 postprocessed_actions = pred_actions_unnorm[0].clone()
 
                 new_latency = time.perf_counter() - current_time
@@ -258,19 +419,39 @@ def get_actions(
                     logger.warning(
                         "[GET_ACTIONS] cfg.action_queue_size_to_get_new_actions Too small, It should be higher than inference delay + execution horizon."
                     )
+
+                if FIRST_MODEL_INFERENCE:
+                    postprocessed_actions = apply_first_chunk_smooth(postprocessed_actions, obs_data, env)
+
+                postprocessed_resampled = resample_chunk_with_claw_hold(
+                    postprocessed_actions.cpu().numpy(),
+                    previous_action=last_executed_action.cpu().numpy() if last_executed_action is not None else None,
+                    control_frequency=100.0,
+                    source_dt=0.1,
+                    arm_dims=slice(0, 14),
+                    claw_dims=slice(14, 16),
+                    device=postprocessed_actions.device,
+                )
+
+                # print(f"[GET_ACTIONS] postprocessed_resampled: {postprocessed_resampled.shape}")
+                last_executed_action = postprocessed_resampled[-get_actions_threshold].clone()
+                # print(f"[GET_ACTIONS] last_executed_action: {last_executed_action.shape}")
                 action_queue.merge(
-                    original_actions, postprocessed_actions, new_delay, action_index_before_inference
+                    original_actions, postprocessed_resampled, new_delay, action_index_before_inference
                 )
             else:
                 # Small sleep to prevent busy waiting
-                print(f"[GET_ACTIONS] action_queue.qsize() > get_actions_threshold, sleep 0.1s")
-                time.sleep(0.1)
+                # print(f"[GET_ACTIONS] action_queue.qsize() > get_actions_threshold, sleep 0.01s")
+                time.sleep(0.01)
 
         logger.info("[GET_ACTIONS] get actions thread shutting down")
     except Exception as e:
-        logger.error(f"[GET_ACTIONS] Fatal exception in get_actions thread: {e}")
-        logger.error(traceback.format_exc())
-        sys.exit(1)
+        print("\n" + "="*80, file=sys.stderr, flush=True)
+        print("[GET_ACTIONS] FATAL EXCEPTION", file=sys.stderr, flush=True)
+        traceback.print_exc()
+        print("="*80 + "\n", file=sys.stderr, flush=True)
+        shutdown_event.set()
+        return
 
 
 def actor_control(
@@ -291,7 +472,8 @@ def actor_control(
         logger.info("[ACTOR] Starting actor thread")
 
         action_count = 0
-        action_interval = 1.0 / cfg.fps
+        # action_interval = 1.0 / cfg.fps
+        action_interval = 1.0 / 100
 
         while not shutdown_event.is_set():
             start_time = time.perf_counter()
@@ -318,9 +500,12 @@ def actor_control(
 
         logger.info(f"[ACTOR] Actor thread shutting down. Total actions executed: {action_count}")
     except Exception as e:
-        logger.error(f"[ACTOR] Fatal exception in actor_control thread: {e}")
-        logger.error(traceback.format_exc())
-        sys.exit(1)
+        print("\n" + "="*80, file=sys.stderr, flush=True)
+        print("[ACTOR] FATAL EXCEPTION", file=sys.stderr, flush=True)
+        traceback.print_exc()
+        print("="*80 + "\n", file=sys.stderr, flush=True)
+        shutdown_event.set()
+        return
 
 
 def _apply_torch_compile(policy, cfg: RTCDemoConfig):
@@ -391,6 +576,18 @@ def demo_cli(cfg: RTCDemoConfig):
     env = GrabBoxMpcEnv()
     robot_sdk = RobotSDK()
 
+    # 初始化手臂位置
+    robot_sdk.control.set_external_control_arm_mode()
+    robot_sdk.control.control_head(0, np.deg2rad(20))
+    cur_dir = os.path.dirname(os.path.abspath(__file__))
+    final_reset_arm(
+        json_path=os.path.join(cur_dir, 'utils/initial_arm_traj.json'), 
+        env=env,
+        control_arm=True,
+        control_claw=True
+    )
+    robot_sdk.control.set_arm_quick_mode(True)
+
     # 加载 policy
     policy_class = get_policy_class(cfg.policy.type)
     config = PreTrainedConfig.from_pretrained(cfg.policy.pretrained_path)
@@ -413,20 +610,21 @@ def demo_cli(cfg: RTCDemoConfig):
     action_queue = ActionQueue(cfg.rtc)
     logger.info("[MAIN] ActionQueue created")
 
-    # 初始化手臂位置
-    robot_sdk.control.set_external_control_arm_mode()
-    cur_dir = os.path.dirname(os.path.abspath(__file__))
-    final_reset_arm(
-        json_path=os.path.join(cur_dir, 'utils/initial_arm_traj.json'), 
-        env=env,
-        control_arm=True,
-        control_claw=True
-    )
-    robot_sdk.control.set_arm_quick_mode(True)
+    # # 初始化手臂位置
+    # robot_sdk.control.set_external_control_arm_mode()
+    # robot_sdk.control.control_head(0, np.deg2rad(20))
+    # cur_dir = os.path.dirname(os.path.abspath(__file__))
+    # final_reset_arm(
+    #     json_path=os.path.join(cur_dir, 'utils/initial_arm_traj.json'), 
+    #     env=env,
+    #     control_arm=True,
+    #     control_claw=True
+    # )
+    # robot_sdk.control.set_arm_quick_mode(True)
 
     env.obs_buffer.wait_buffer_ready()
 
-    # input(f"轨迹回放结束, 按回车继续 ==== \n")
+    input(f"轨迹回放结束, 按回车继续 ==== \n")
 
     # 启动线程
     get_actions_thread = Thread(target=get_actions, args=(policy, env, action_queue, shutdown_event, cfg), daemon=True, name="GetActions")
