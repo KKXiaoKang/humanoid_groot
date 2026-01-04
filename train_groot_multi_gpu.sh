@@ -19,7 +19,7 @@
 # ============================================================================
 
 # 设置输出目录
-OUTPUT_DIR="./outputs/12_30_multi_gpu_groot_no_down_sample"
+OUTPUT_DIR="./outputs/01_03_h100x4_groot_no_down_sample_multi_arm_head_share_features_cross_attention_mix_3x2"
 JOB_NAME="groot_depalletize"
 
 # 数据集配置
@@ -41,7 +41,7 @@ JOB_NAME="groot_depalletize"
 
 # 多数据集配置（使用两个数据集）
 DATASET_ROOT="/home/kangkk/humanoid_groot/lerobot_data/v3_0_dataset"
-DATASET_REPO_ID="1223_dense,1225_mix,1229_4322,1215_four,1221_random"
+DATASET_REPO_ID="1223_dense,1225_mix,1229_4322,1215_four,1221_random,3X2"
 
 
 # GPU选择配置
@@ -108,23 +108,44 @@ NUM_WORKERS=8          # 数据加载器工作进程数（每个GPU）
 # 重要: LeRobot不会自动缩放学习率，需要手动根据GPU数量缩放
 # 
 # 学习率缩放策略:
-#   - 线性缩放 (推荐): BASE_LR × NUM_GPUS (适用于大batch size)
-#   - 平方根缩放: BASE_LR × √NUM_GPUS (更保守，适用于中等batch size)
+#   - linear: BASE_LR × NUM_GPUS (线性缩放，适用于大batch size)
+#   - sqrt: BASE_LR × √NUM_GPUS (平方根缩放，适用于中等batch size)
+#   - conservative: BASE_LR × NUM_GPUS^0.4 (更保守，比sqrt更小)
+#   - very_conservative: BASE_LR × NUM_GPUS^0.3 (非常保守，适合训练不稳定时)
+#   - fixed_scale: BASE_LR × FIXED_SCALE_FACTOR (固定缩放因子，手动控制)
 # 
-# 对于8卡训练，有效batch size = 16 × 8 = 128，建议使用线性缩放
+# 对于3卡训练，有效batch size = 16 × 3 = 48
+# 如果出现loss震荡，建议使用 conservative 或 very_conservative
 # ============================================================================
 BASE_LR=1e-4           # 单卡时的基础学习率
-LR_SCALING_MODE="sqrt"  # "linear" 或 "sqrt" (线性缩放或平方根缩放)
+LR_SCALING_MODE="conservative"  # "linear", "sqrt", "conservative", "very_conservative", "fixed_scale"
+FIXED_SCALE_FACTOR=1.3  # 仅在 LR_SCALING_MODE="fixed_scale" 时使用
 
 # 根据GPU数量自动计算缩放后的学习率
-if [ "$LR_SCALING_MODE" = "sqrt" ]; then
-    # 平方根缩放: lr = base_lr × √num_gpus
-    SCALED_LR=$(python3 -c "import math; print('{:.6f}'.format($BASE_LR * math.sqrt($NUM_GPUS)))")
-    echo "使用平方根缩放: lr = ${BASE_LR} × √${NUM_GPUS} = ${SCALED_LR}"
-else
+if [ "$LR_SCALING_MODE" = "linear" ]; then
     # 线性缩放: lr = base_lr × num_gpus
     SCALED_LR=$(python3 -c "print('{:.6f}'.format($BASE_LR * $NUM_GPUS))")
     echo "使用线性缩放: lr = ${BASE_LR} × ${NUM_GPUS} = ${SCALED_LR}"
+elif [ "$LR_SCALING_MODE" = "sqrt" ]; then
+    # 平方根缩放: lr = base_lr × √num_gpus
+    SCALED_LR=$(python3 -c "import math; print('{:.6f}'.format($BASE_LR * math.sqrt($NUM_GPUS)))")
+    echo "使用平方根缩放: lr = ${BASE_LR} × √${NUM_GPUS} = ${SCALED_LR}"
+elif [ "$LR_SCALING_MODE" = "conservative" ]; then
+    # 保守缩放: lr = base_lr × num_gpus^0.4 (比sqrt更保守)
+    SCALED_LR=$(python3 -c "import math; print('{:.6f}'.format($BASE_LR * math.pow($NUM_GPUS, 0.4)))")
+    echo "使用保守缩放: lr = ${BASE_LR} × ${NUM_GPUS}^0.4 = ${SCALED_LR}"
+elif [ "$LR_SCALING_MODE" = "very_conservative" ]; then
+    # 非常保守缩放: lr = base_lr × num_gpus^0.3 (非常保守，适合训练不稳定时)
+    SCALED_LR=$(python3 -c "import math; print('{:.6f}'.format($BASE_LR * math.pow($NUM_GPUS, 0.3)))")
+    echo "使用非常保守缩放: lr = ${BASE_LR} × ${NUM_GPUS}^0.3 = ${SCALED_LR}"
+elif [ "$LR_SCALING_MODE" = "fixed_scale" ]; then
+    # 固定缩放: lr = base_lr × fixed_scale_factor
+    SCALED_LR=$(python3 -c "print('{:.6f}'.format($BASE_LR * $FIXED_SCALE_FACTOR))")
+    echo "使用固定缩放: lr = ${BASE_LR} × ${FIXED_SCALE_FACTOR} = ${SCALED_LR}"
+else
+    echo "错误: 未知的学习率缩放模式: ${LR_SCALING_MODE}"
+    echo "支持的模式: linear, sqrt, conservative, very_conservative, fixed_scale"
+    exit 1
 fi
 
 # 是否从checkpoint继续训练
@@ -163,7 +184,7 @@ accelerate launch \
   --policy.max_state_dim=64 \
   --policy.max_action_dim=32 \
   --policy.optimizer_lr=${SCALED_LR} \
-  --policy.warmup_ratio=0.05 \
+  --policy.warmup_ratio=0.10 \
   --policy.chunk_size=32 \
   --policy.n_action_steps=32 \
   \
