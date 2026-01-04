@@ -14,7 +14,7 @@
 # ============================================================================
 
 # 设置输出目录
-OUTPUT_DIR="./outputs/11_27_groot_full_tune_depalletize_3orb_green_grey_mix"
+OUTPUT_DIR="./outputs/12_29_groot_no_down_sample_pick_1203_h100_one_gpu_mix_four_4322"
 JOB_NAME="groot_depalletize"
 
 # 数据集配置
@@ -35,8 +35,8 @@ JOB_NAME="groot_depalletize"
 # DATASET_REPO_ID="1125_groot_train_data_with_task_filtered"
 
 # 多数据集配置（使用两个数据集）
-DATASET_ROOT="/home/lab/lerobot_groot/lerobot_data/v3_0_dataset"
-DATASET_REPO_ID="1212_5w_groot_train_data_with_task,1215_5w_groot_4311_4322_4611_4633"
+DATASET_ROOT="/home/kangkk/humanoid_groot/lerobot_data/v3_0_dataset"
+DATASET_REPO_ID="1223_dense,1225_mix,1229_4322,1215_four,1221_random"
 
 # GPU选择配置
 # 方式1: 通过命令行参数指定 (推荐，会覆盖下面的默认值)

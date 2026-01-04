@@ -251,9 +251,24 @@ class GR00TN15(PreTrainedModel):
         pretrained_action_dim = action_head_cfg_dict.get("action_dim", 32)
         
         if use_multi_action_heads:
-            action_arm_dim = action_head_cfg_dict.get("action_arm_dim", 14)
-            action_claw_dim = action_head_cfg_dict.get("action_claw_dim", 2)
-            actual_action_dim = action_arm_dim + action_claw_dim
+            split_arm_heads = action_head_cfg_dict.get("split_arm_heads", False)
+            if split_arm_heads:
+                # Split arm into left and right
+                action_left_arm_dim = action_head_cfg_dict.get("action_left_arm_dim", 7)
+                action_right_arm_dim = action_head_cfg_dict.get("action_right_arm_dim", 7)
+                action_claw_dim = action_head_cfg_dict.get("action_claw_dim", 2)
+                actual_action_dim = action_left_arm_dim + action_right_arm_dim + action_claw_dim
+                # Set action_arm_dim for compatibility (left + right)
+                action_head_cfg_dict["action_arm_dim"] = action_left_arm_dim + action_right_arm_dim
+                # Ensure split_arm_heads is set in the dict
+                action_head_cfg_dict["split_arm_heads"] = True
+                print(f"✅ Split arm heads enabled: left_arm({action_left_arm_dim}D) + right_arm({action_right_arm_dim}D) + claw({action_claw_dim}D) = {actual_action_dim}D")
+            else:
+                # Single arm head
+                action_arm_dim = action_head_cfg_dict.get("action_arm_dim", 14)
+                action_claw_dim = action_head_cfg_dict.get("action_claw_dim", 2)
+                actual_action_dim = action_arm_dim + action_claw_dim
+            
             action_head_cfg_dict["action_dim"] = actual_action_dim
             # Set pretrained_action_dim for compatibility with pretrained encoder
             action_head_cfg_dict["pretrained_action_dim"] = pretrained_action_dim

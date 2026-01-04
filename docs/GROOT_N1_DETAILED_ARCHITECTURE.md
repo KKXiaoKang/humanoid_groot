@@ -62,13 +62,31 @@ graph TB
         end
         
         subgraph Decoders["解码器 tune_projector控制"]
-            ArmDec["Action Arm Decoder<br/>CategorySpecificMLP<br/>1024 to 1024 to 14"]
-            ClawDec["Action Claw Decoder<br/>CategorySpecificMLP<br/>1024 to 1024 to 2"]
+            subgraph ArmDecoder["Arm Decoder (可选架构)"]
+                SharedLayer["共享底层特征提取<br/>CategorySpecificLinear<br/>1024 to 1024<br/>ReLU激活"]
+                
+                subgraph CrossAttn["交叉注意力机制 (可选)<br/>use_cross_attention_arms"]
+                    LayerNormL["LayerNorm Left<br/>归一化左手特征"]
+                    LayerNormR["LayerNorm Right<br/>归一化右手特征"]
+                    CrossAttnL["Cross-Attn Left<br/>MultiheadAttention<br/>query: left_features<br/>key/value: right_features"]
+                    CrossAttnR["Cross-Attn Right<br/>MultiheadAttention<br/>query: right_features<br/>key/value: left_features"]
+                    ResidualL["残差连接<br/>left + left_attended"]
+                    ResidualR["残差连接<br/>right + right_attended"]
+                end
+                
+                LeftOut["Left Output Layer<br/>CategorySpecificLinear<br/>1024 to 7<br/>左手动作 (0-6)"]
+                RightOut["Right Output Layer<br/>CategorySpecificLinear<br/>1024 to 7<br/>右手动作 (7-13)"]
+            end
+            
+            ClawDec["Action Claw Decoder<br/>CategorySpecificMLP<br/>1024 to 1024 to 2<br/>爪子动作 (14-15)"]
         end
     end
 
     subgraph Output["输出 Output"]
-        ACTIONS["动作预测<br/>B x T x 16<br/>arm: 14D + claw: 2D"]
+        LeftArmOut["左手动作<br/>B x T x 7<br/>indices 0-6"]
+        RightArmOut["右手动作<br/>B x T x 7<br/>indices 7-13"]
+        ClawOut["爪子动作<br/>B x T x 2<br/>indices 14-15"]
+        ACTIONS["最终动作预测<br/>B x T x 16<br/>concat([left, right, claw])"]
     end
 
     IMG --> SigLip
@@ -104,10 +122,27 @@ graph TB
     DiTDots --> DiT16
     DiT16 --> DiTOut
     
-    DiTOut --> ArmDec
+    DiTOut --> SharedLayer
+    SharedLayer --> LayerNormL
+    SharedLayer --> LayerNormR
+    LayerNormL -->|query| CrossAttnL
+    LayerNormR -->|key/value| CrossAttnL
+    LayerNormR -->|query| CrossAttnR
+    LayerNormL -->|key/value| CrossAttnR
+    LayerNormL --> ResidualL
+    CrossAttnL --> ResidualL
+    LayerNormR --> ResidualR
+    CrossAttnR --> ResidualR
+    ResidualL --> LeftOut
+    ResidualR --> RightOut
     DiTOut --> ClawDec
-    ArmDec --> ACTIONS
-    ClawDec --> ACTIONS
+    
+    LeftOut --> LeftArmOut
+    RightOut --> RightArmOut
+    ClawDec --> ClawOut
+    LeftArmOut --> ACTIONS
+    RightArmOut --> ACTIONS
+    ClawOut --> ACTIONS
 
     classDef frozen fill:#e1f5ff,stroke:#01579b,stroke-width:2px
     classDef trainable fill:#fff4e1,stroke:#e65100,stroke-width:2px
@@ -116,7 +151,7 @@ graph TB
     
     class SigLip,MLP1,Tokenizer,LLM,SelectLayer frozen
     class EagleLinear trainable
-    class VLSA,StateEnc,ActionEnc,PosEmb,FutureTok,ArmDec,ClawDec projector
+    class VLSA,StateEnc,ActionEnc,PosEmb,FutureTok,SharedLayer,LayerNormL,LayerNormR,CrossAttnL,CrossAttnR,ResidualL,ResidualR,LeftOut,RightOut,ClawDec projector
     class ActionFeat,ActionFeatWithPos projector
     class DiT1,DiT2,DiT3,DiT16,DiTOut diffusion
 ```
@@ -142,7 +177,11 @@ graph TB
 | DiT Self-Attn | Attention | B×S×1536 | B×S×1536 | 自注意力 |
 | DiT Output | proj_out_2 | B×S×1536 | B×S×1024 | 输出投影(inner_dim→output_dim) |
 | Model Output Actions | Slice | B×S×1024 | B×T×1024 | 只取action部分 |
-| Action Decoders | CategoryMLP | B×T×1024 | B×T×14/2 | 动作解码 |
+| Shared Layer | CategoryLinear | B×T×1024 | B×T×1024 | 共享底层特征提取 |
+| Cross-Attention | MultiheadAttn | left: B×T×1024<br/>right: B×T×1024 | left: B×T×1024<br/>right: B×T×1024 | 左右手特征相互关注 |
+| Left/Right Output | CategoryLinear | B×T×1024 | B×T×7 | 左右手动作解码 |
+| Claw Decoder | CategoryMLP | B×T×1024 | B×T×2 | 爪子动作解码 |
+| Final Output | Concat | left: B×T×7<br/>right: B×T×7<br/>claw: B×T×2 | B×T×16 | 拼接最终动作 |
 
 ## 微调参数控制
 
@@ -159,7 +198,11 @@ graph TB
 - ✅ `state_encoder` (CategorySpecificMLP)
 - ✅ `action_encoder` (MultiEmbodimentActionEncoder)
 - ✅ `position_embedding` (如果启用)
-- ✅ `action_arm_decoder` / `action_claw_decoder` (或 `action_decoder`)
+- ✅ `shared_arm_decoder` (SharedBottomArmDecoder，包含共享层、交叉注意力、输出层)
+  - ✅ `shared_layer` (共享底层特征提取)
+  - ✅ `cross_attn_left` / `cross_attn_right` (交叉注意力，如果启用)
+  - ✅ `left_output_layer` / `right_output_layer` (左右手输出层)
+- ✅ `action_claw_decoder` (CategorySpecificMLP)
 
 ### tune_diffusion_model (Action Head)
 - ✅ `model` (DiT, 16层)
@@ -225,6 +268,89 @@ DiT Block:
   └─ Self-Attention
       └─ Query, Key, Value: hidden_states (1536维)
 ```
+
+### 4. Decoder中的Cross-Attention机制（左右手协调）
+
+当启用 `split_arm_heads=True` 和 `use_shared_arm_features=True` 时，使用 `SharedBottomArmDecoder`：
+
+```108:149:src/lerobot/policies/groot/action_head/flow_matching_action_head.py
+    def forward(self, x, cat_ids):
+        """
+        x: (B, T, input_dim)
+        cat_ids: (B,)
+        returns: (left_features, right_features) 或 (left_output, right_output)
+        """
+        # 共享底层特征提取
+        shared_features = F.relu(self.shared_layer(x, cat_ids))  # (B, T, hidden_dim)
+        
+        if self.use_cross_attention:
+            # 交叉注意力：左右手特征相互关注
+            # 这是真正的价值：让左右手能够感知对方的状态
+            # 这是"合成一个MLP然后split"无法实现的
+            # 使用对称的交叉注意力，确保信息交换的一致性
+            left_features = self.layer_norm_left(shared_features)
+            right_features = self.layer_norm_right(shared_features)
+            
+            # 对称的交叉注意力：同时计算，避免信息不对称
+            # 左手的query关注右手的key/value（使用原始right_features）
+            left_attended, _ = self.cross_attn_left(
+                left_features, right_features, right_features
+            )
+            # 右手的query关注左手的key/value（使用原始left_features）
+            right_attended, _ = self.cross_attn_right(
+                right_features, left_features, left_features
+            )
+            
+            # 残差连接：保持原始特征，只添加注意力信息
+            left_features = left_features + left_attended
+            right_features = right_features + right_attended
+            
+            # 输出层
+            left_output = self.left_output_layer(left_features, cat_ids)
+            right_output = self.right_output_layer(right_features, cat_ids)
+        else:
+            # 不使用交叉注意力，直接输出
+            # 注意：这种情况下，确实和"合成一个MLP然后split"类似
+            # 主要区别是输出层分离，可以分别控制损失权重
+            left_output = self.left_output_layer(shared_features, cat_ids)
+            right_output = self.right_output_layer(shared_features, cat_ids)
+        
+        return left_output, right_output
+```
+
+**关键机制**：
+
+1. **共享底层特征提取**：
+   - 使用 `shared_layer` 从 DiT 输出中提取共享特征
+   - 维度：`B × T × 1024 → B × T × 1024`
+   - 这确保了左右手特征来自同一个底层表示
+
+2. **对称交叉注意力**（如果 `use_cross_attention_arms=True`）：
+   ```
+   Left Cross-Attention:
+     Query: left_features (B×T×1024)
+     Key/Value: right_features (B×T×1024)
+     → 左手特征关注右手特征
+   
+   Right Cross-Attention:
+     Query: right_features (B×T×1024)
+     Key/Value: left_features (B×T×1024)
+     → 右手特征关注左手特征
+   ```
+   - 使用 `MultiheadAttention`，默认 4 个头
+   - 通过 LayerNorm 归一化后再进行注意力计算
+   - 使用残差连接保持原始特征
+
+3. **分离输出层**：
+   - `left_output_layer`: 1024 → 7 (左手动作，indices 0-6)
+   - `right_output_layer`: 1024 → 7 (右手动作，indices 7-13)
+   - 允许分别控制左右手的损失权重
+
+**优势**：
+- ✅ **协调性**：交叉注意力让左右手能够感知对方的状态，提升双手协调
+- ✅ **独立性**：分离的输出层允许左右手学习不同的映射
+- ✅ **灵活性**：可以通过 `use_cross_attention_arms` 控制是否启用交叉注意力
+- ✅ **可训练性**：所有组件由 `tune_projector` 控制，可以灵活微调
 
 ## 多模态融合机制详解
 
@@ -430,6 +556,17 @@ GROOT N1.5使用了以下多模态融合技巧：
 - **方法**：`action_features + position_embedding`
 - **优势**：为序列中的不同位置提供位置信息
 
+#### 8. **Decoder层面的交叉注意力（左右手协调）**
+- **位置**：SharedBottomArmDecoder中
+- **方法**：左右手特征通过对称的交叉注意力相互关注
+  - 左手的query关注右手的key/value
+  - 右手的query关注左手的key/value
+  - 使用残差连接保持原始特征
+- **优势**：
+  - 提升双手协调性，让左右手能够感知对方状态
+  - 在动作分解阶段进行协调，比在特征提取阶段更直接
+  - 可选的机制，可以通过配置控制是否启用
+
 ### 融合流程图
 
 ```
@@ -470,7 +607,16 @@ State-Action序列 (B×(1+32+T)×1536)
   ↓ Key/Value: VL特征 (2048→1536维投影)
   ↓ 16层DiT Blocks (Cross-Attn + Self-Attn)
 融合后的动作特征 (B×T×1024)
-  ↓ Action Decoders
+  ↓ SharedBottomArmDecoder
+  ├─ 共享底层特征提取 (B×T×1024)
+  ├─ 交叉注意力 (可选)
+  │   ├─ 左手关注右手特征
+  │   └─ 右手关注左手特征
+  ├─ 左手输出层 → 左手动作 (B×T×7)
+  └─ 右手输出层 → 右手动作 (B×T×7)
+  ↓ Claw Decoder
+爪子动作 (B×T×2)
+  ↓ Concat
 预测动作 (B×T×16)
 ```
 
@@ -520,7 +666,17 @@ FlowmatchingActionHead
 │   ├─ proj_out_1: Linear(1536→3072)
 │   └─ proj_out_2: Linear(1536→1024)
 └─ Decoders (tune_projector)
-    ├─ action_arm_decoder: CategorySpecificMLP
+    ├─ shared_arm_decoder: SharedBottomArmDecoder (如果 split_arm_heads=True)
+    │   ├─ shared_layer: CategorySpecificLinear(1024→1024) + ReLU
+    │   ├─ cross_attn_left: MultiheadAttention (如果 use_cross_attention_arms=True)
+    │   │   └─ query: left_features, key/value: right_features
+    │   ├─ cross_attn_right: MultiheadAttention (如果 use_cross_attention_arms=True)
+    │   │   └─ query: right_features, key/value: left_features
+    │   ├─ layer_norm_left: LayerNorm(1024)
+    │   ├─ layer_norm_right: LayerNorm(1024)
+    │   ├─ left_output_layer: CategorySpecificLinear(1024→7)
+    │   └─ right_output_layer: CategorySpecificLinear(1024→7)
+    ├─ action_arm_decoder: CategorySpecificMLP (如果 split_arm_heads=False)
     │   └─ Layer1: Linear(1024→1024) + ReLU
     │   └─ Layer2: Linear(1024→14)
     └─ action_claw_decoder: CategorySpecificMLP
