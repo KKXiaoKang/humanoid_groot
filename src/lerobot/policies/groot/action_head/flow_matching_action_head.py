@@ -237,7 +237,8 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
     use_vlln: bool = field(default=True)
 
     vl_self_attention_cfg: dict = field(default=None)
-    num_target_vision_tokens: int = field(default=32, metadata={"help": "Number of target vision tokens."})
+    # num_target_vision_tokens: int = field(default=32, metadata={"help": "Number of target vision tokens."})
+    num_target_vision_tokens: int = field(default=64, metadata={"help": "Number of target vision tokens."})
 
     # Multi-head action prediction
     use_multi_action_heads: bool = field(default=True, metadata={"help": "Whether to use multi-head action prediction"})
