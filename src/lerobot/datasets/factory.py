@@ -81,6 +81,36 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
     image_transforms = (
         ImageTransforms(cfg.dataset.image_transforms) if cfg.dataset.image_transforms.enable else None
     )
+    
+    # Print image transforms configuration
+    if image_transforms is not None:
+        print("=" * 80)
+        print("图像增强功能已启用 (Image Transforms ENABLED)")
+        print("=" * 80)
+        print(f"  最大变换数量 (max_num_transforms): {cfg.dataset.image_transforms.max_num_transforms}")
+        print(f"  随机顺序 (random_order): {cfg.dataset.image_transforms.random_order}")
+        enabled_tfs = [
+            (name, tf_cfg.weight, tf_cfg.kwargs)
+            for name, tf_cfg in cfg.dataset.image_transforms.tfs.items()
+            if tf_cfg.weight > 0.0
+        ]
+        print(f"  启用的变换 (enabled transforms): {len(enabled_tfs)}")
+        for name, weight, kwargs in enabled_tfs:
+            print(f"    - {name}: weight={weight}, kwargs={kwargs}")
+        print("=" * 80)
+        # Also log to logging for log files
+        logging.info("=" * 80)
+        logging.info("图像增强功能已启用 (Image Transforms ENABLED)")
+        logging.info("=" * 80)
+        logging.info(f"  最大变换数量 (max_num_transforms): {cfg.dataset.image_transforms.max_num_transforms}")
+        logging.info(f"  随机顺序 (random_order): {cfg.dataset.image_transforms.random_order}")
+        logging.info(f"  启用的变换 (enabled transforms): {len(enabled_tfs)}")
+        for name, weight, kwargs in enabled_tfs:
+            logging.info(f"    - {name}: weight={weight}, kwargs={kwargs}")
+        logging.info("=" * 80)
+    else:
+        print("图像增强功能未启用 (Image Transforms DISABLED)")
+        logging.info("图像增强功能未启用 (Image Transforms DISABLED)")
 
     # Handle comma-separated repo_id string (from command line) by converting to list
     repo_id = cfg.dataset.repo_id

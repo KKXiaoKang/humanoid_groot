@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import collections
+import logging
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -247,6 +248,12 @@ class ImageTransforms(Transform):
         n_subset = min(len(self.transforms), cfg.max_num_transforms)
         if n_subset == 0 or not cfg.enable:
             self.tf = v2.Identity()
+            warning_msg = (
+                f"ImageTransforms: 未启用或没有可用变换 (enabled={cfg.enable}, "
+                f"available_transforms={len(self.transforms)}, max_num_transforms={cfg.max_num_transforms})"
+            )
+            print(warning_msg)
+            logging.warning(warning_msg)
         else:
             self.tf = RandomSubsetApply(
                 transforms=list(self.transforms.values()),
@@ -254,6 +261,12 @@ class ImageTransforms(Transform):
                 n_subset=n_subset,
                 random_order=cfg.random_order,
             )
+            info_msg = (
+                f"ImageTransforms: 已初始化，将应用 {n_subset} 个变换 "
+                f"(共 {len(self.transforms)} 个可用变换，随机顺序={cfg.random_order})"
+            )
+            print(info_msg)
+            logging.info(info_msg)
 
     def forward(self, *inputs: Any) -> Any:
         return self.tf(*inputs)
