@@ -18,6 +18,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
+from typing_extensions import Unpack
+from lerobot.policies.pretrained import ActionSelectKwargs
+from lerobot.policies.rtc.configuration_rtc import RTCConfig
+from lerobot.policies.rtc.modeling_rtc import RTCProcessor
+
 import torch
 import torch.nn as nn
 from huggingface_hub import snapshot_download
@@ -203,6 +208,9 @@ class GR00TN15Config(PretrainedConfig):
     action_dim: int = field(init=False, metadata={"help": "Action dimension."})
     compute_dtype: str = field(default="float32", metadata={"help": "Compute dtype."})
 
+    # Real-Time Chunking (RTC) configuration
+    rtc_config: RTCConfig | None = None
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         for key, value in kwargs.items():
@@ -224,6 +232,7 @@ class GR00TN15(PreTrainedModel):
         self,
         config: GR00TN15Config,
         local_model_path: str,
+        # rtc_processor: RTCProcessor | None = None,
     ):
         assert isinstance(config.backbone_cfg, dict)
         assert isinstance(config.action_head_cfg, dict)
@@ -242,9 +251,24 @@ class GR00TN15(PreTrainedModel):
         pretrained_action_dim = action_head_cfg_dict.get("action_dim", 32)
         
         if use_multi_action_heads:
-            action_arm_dim = action_head_cfg_dict.get("action_arm_dim", 14)
-            action_claw_dim = action_head_cfg_dict.get("action_claw_dim", 2)
-            actual_action_dim = action_arm_dim + action_claw_dim
+            split_arm_heads = action_head_cfg_dict.get("split_arm_heads", False)
+            if split_arm_heads:
+                # Split arm into left and right
+                action_left_arm_dim = action_head_cfg_dict.get("action_left_arm_dim", 7)
+                action_right_arm_dim = action_head_cfg_dict.get("action_right_arm_dim", 7)
+                action_claw_dim = action_head_cfg_dict.get("action_claw_dim", 2)
+                actual_action_dim = action_left_arm_dim + action_right_arm_dim + action_claw_dim
+                # Set action_arm_dim for compatibility (left + right)
+                action_head_cfg_dict["action_arm_dim"] = action_left_arm_dim + action_right_arm_dim
+                # Ensure split_arm_heads is set in the dict
+                action_head_cfg_dict["split_arm_heads"] = True
+                print(f"✅ Split arm heads enabled: left_arm({action_left_arm_dim}D) + right_arm({action_right_arm_dim}D) + claw({action_claw_dim}D) = {actual_action_dim}D")
+            else:
+                # Single arm head
+                action_arm_dim = action_head_cfg_dict.get("action_arm_dim", 14)
+                action_claw_dim = action_head_cfg_dict.get("action_claw_dim", 2)
+                actual_action_dim = action_arm_dim + action_claw_dim
+            
             action_head_cfg_dict["action_dim"] = actual_action_dim
             # Set pretrained_action_dim for compatibility with pretrained encoder
             action_head_cfg_dict["pretrained_action_dim"] = pretrained_action_dim
@@ -262,6 +286,10 @@ class GR00TN15(PreTrainedModel):
         # validate_data will use the correct dimension based on context
         self.action_dim = config.action_dim
         self.compute_dtype = config.compute_dtype
+        # self.rtc_processor = rtc_processor
+
+    def _rtc_enabled(self):
+        return self.config.rtc_config is not None and self.config.rtc_config.enabled
 
     def validate_inputs(self, inputs):
         # NOTE -- this should be handled internally by the model
@@ -365,11 +393,13 @@ class GR00TN15(PreTrainedModel):
     def get_action(
         self,
         inputs: dict,
+        **kwargs: Unpack[ActionSelectKwargs],
     ) -> BatchFeature:
         backbone_inputs, action_inputs = self.prepare_input(inputs)
         # Because the behavior of backbones remains the same for training and inference, we can use `forward` for backbones.
         backbone_outputs = self.backbone(backbone_inputs)
-        action_head_outputs = self.action_head.get_action(backbone_outputs, action_inputs)
+        action_head_outputs = self.action_head.get_action(backbone_outputs, action_inputs, rtc_enabled=self._rtc_enabled())
+            
         self.validate_data(action_head_outputs, backbone_outputs, is_training=False)
         return action_head_outputs
 

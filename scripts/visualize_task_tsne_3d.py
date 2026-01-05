@@ -170,28 +170,11 @@ def extract_backbone_features(policy, preprocessor, sample, device):
     return None
 
 
-def collect_features(
-    dataset_path,
-    ckpt_path,
-    num_samples_per_task=0,
-    max_episodes=None,
-    device="cuda:0"
-):
-    """收集所有三个任务类别的特征"""
-    
+def load_model_and_preprocessor(ckpt_path, device="cuda:0"):
+    """加载模型和预处理器（只加载一次，可重复使用）"""
     print("=" * 80)
-    print("加载数据集和模型")
+    print("加载模型和预处理器")
     print("=" * 80)
-    
-    # 加载数据集
-    # 对于本地数据集，repo_id 应该是字符串（使用数据集目录名）
-    dataset_name = Path(dataset_path).name
-    dataset = LeRobotDataset(
-        repo_id=dataset_name,
-        root=dataset_path,
-        force_cache_sync=False
-    )
-    print(f"✅ 数据集加载完成: {dataset.meta.total_episodes} 个 episodes")
     
     # 加载模型
     policy = GrootPolicy.from_pretrained(Path(ckpt_path), strict=False)
@@ -205,6 +188,33 @@ def collect_features(
         pretrained_path=ckpt_path,
     )
     print(f"✅ 预处理器加载完成")
+    
+    return policy, preprocessor
+
+
+def collect_features(
+    dataset_path,
+    policy,
+    preprocessor,
+    num_samples_per_task=0,
+    max_episodes=None,
+    device="cuda:0"
+):
+    """收集所有三个任务类别的特征"""
+    
+    print("=" * 80)
+    print(f"加载数据集: {dataset_path}")
+    print("=" * 80)
+    
+    # 加载数据集
+    # 对于本地数据集，repo_id 应该是字符串（使用数据集目录名）
+    dataset_name = Path(dataset_path).name
+    dataset = LeRobotDataset(
+        repo_id=dataset_name,
+        root=dataset_path,
+        force_cache_sync=False
+    )
+    print(f"✅ 数据集加载完成: {dataset.meta.total_episodes} 个 episodes")
     
     # 统计每个任务类别的 episode
     task_episodes = defaultdict(list)
@@ -446,7 +456,8 @@ def visualize_tsne_3d(features, labels, episode_indices=None, output_path=None, 
         
         # 保存为 HTML 文件（可交互）
         if output_path:
-            html_path = output_path.replace('.png', '.html')
+            # 更健壮的路径替换：将文件扩展名替换为 .html
+            html_path = str(Path(output_path).with_suffix('.html'))
             fig.write_html(html_path)
             print(f"✅ 交互式 HTML 已保存到: {html_path}")
         
@@ -542,8 +553,9 @@ def main():
     parser.add_argument(
         '--dataset-path',
         type=str,
+        nargs='+',
         required=True,
-        help='数据集路径'
+        help='数据集路径（可以指定多个，用空格分隔）'
     )
     parser.add_argument(
         '--ckpt-path',
@@ -566,8 +578,9 @@ def main():
     parser.add_argument(
         '--output',
         type=str,
-        default='tsne_3d_visualization.png',
-        help='输出图像路径（默认：tsne_3d_visualization.png）'
+        nargs='+',
+        default=None,
+        help='输出图像路径（可以指定多个，与数据集路径一一对应。如果只指定一个，将自动为其他数据集生成文件名。如果未指定，将使用数据集名称自动生成）'
     )
     parser.add_argument(
         '--perplexity',
@@ -595,43 +608,134 @@ def main():
     
     args = parser.parse_args()
     
-    # 收集特征
-    features, labels, episode_indices = collect_features(
-        dataset_path=args.dataset_path,
+    # 从 checkpoint 路径中提取标识符
+    ckpt_path = Path(args.ckpt_path)
+    # 尝试从路径中提取训练目录名（通常在 outputs/train/xxxx/checkpoints/ 中）
+    identifier = None
+    if "checkpoints" in ckpt_path.parts:
+        # 找到 checkpoints 的父目录（训练目录名）
+        checkpoints_idx = ckpt_path.parts.index("checkpoints")
+        if checkpoints_idx > 0:
+            identifier = ckpt_path.parts[checkpoints_idx - 1]
+    elif "train" in ckpt_path.parts:
+        # 如果路径中有 train，尝试获取 train 后面的目录名
+        train_idx = ckpt_path.parts.index("train")
+        if train_idx + 1 < len(ckpt_path.parts):
+            identifier = ckpt_path.parts[train_idx + 1]
+    
+    # 如果无法从路径提取，使用 checkpoint 目录名
+    if identifier is None:
+        identifier = ckpt_path.parent.name if ckpt_path.parent.name else "default"
+    
+    # 清理标识符，移除特殊字符
+    identifier = re.sub(r'[^\w\-_]', '_', identifier)
+    
+    # 创建输出目录：./t-SNE/{identifier}/
+    base_output_dir = Path("t-SNE") / identifier
+    base_output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 确保 dataset_path 是列表
+    dataset_paths = args.dataset_path if isinstance(args.dataset_path, list) else [args.dataset_path]
+    
+    # 处理输出路径
+    output_paths = args.output if args.output is not None else []
+    if isinstance(output_paths, str):
+        output_paths = [output_paths]
+    
+    # 如果输出路径数量少于数据集数量，自动生成缺失的输出路径
+    if len(output_paths) < len(dataset_paths):
+        # 如果提供了至少一个输出路径，使用其目录作为基础（但会覆盖为新的 base_output_dir）
+        if len(output_paths) > 0:
+            base_output_name = Path(output_paths[0]).stem
+            base_output_ext = Path(output_paths[0]).suffix
+        else:
+            # 如果没有提供输出路径，使用默认名称
+            base_output_name = "tsne_3d_visualization"
+            base_output_ext = ".png"
+        
+        # 为每个数据集生成输出路径
+        for i, dataset_path in enumerate(dataset_paths):
+            if i < len(output_paths):
+                # 如果用户提供了输出路径，确保它在正确的目录下
+                user_output = Path(output_paths[i])
+                if not user_output.is_absolute() or str(user_output.parent) == str(Path(".").resolve()):
+                    # 相对路径或当前目录，移动到新的输出目录
+                    output_paths[i] = str(base_output_dir / user_output.name)
+                continue  # 已存在，跳过
+            
+            # 使用数据集名称生成输出文件名
+            dataset_name = Path(dataset_path).name
+            # 清理数据集名称，移除特殊字符
+            safe_dataset_name = re.sub(r'[^\w\-_]', '_', dataset_name)
+            output_path = base_output_dir / f"{base_output_name}_{safe_dataset_name}{base_output_ext}"
+            output_paths.append(str(output_path))
+    
+    # 只保留与数据集数量相同的输出路径
+    output_paths = output_paths[:len(dataset_paths)]
+    
+    print("=" * 80)
+    print("处理配置")
+    print("=" * 80)
+    print(f"Checkpoint 标识符: {identifier}")
+    print(f"输出目录: {base_output_dir}")
+    print(f"数据集数量: {len(dataset_paths)}")
+    for i, (dataset_path, output_path) in enumerate(zip(dataset_paths, output_paths), 1):
+        print(f"  {i}. 数据集: {dataset_path}")
+        print(f"     输出: {output_path}")
+    
+    # 只加载一次模型和预处理器
+    policy, preprocessor = load_model_and_preprocessor(
         ckpt_path=args.ckpt_path,
-        num_samples_per_task=args.num_samples_per_task,
-        max_episodes=args.max_episodes,
         device=args.device
     )
     
-    if len(features) == 0:
-        print("❌ 错误: 没有提取到任何特征")
-        return
+    # 遍历每个数据集，生成 t-SNE 可视化
+    for dataset_idx, (dataset_path, output_path) in enumerate(zip(dataset_paths, output_paths), 1):
+        print("\n" + "=" * 80)
+        print(f"处理数据集 {dataset_idx}/{len(dataset_paths)}: {dataset_path}")
+        print("=" * 80)
+        
+        # 收集特征
+        features, labels, episode_indices = collect_features(
+            dataset_path=dataset_path,
+            policy=policy,
+            preprocessor=preprocessor,
+            num_samples_per_task=args.num_samples_per_task,
+            max_episodes=args.max_episodes,
+            device=args.device
+        )
+        
+        if len(features) == 0:
+            print(f"❌ 警告: 数据集 {dataset_path} 没有提取到任何特征，跳过")
+            continue
+        
+        # 打印统计信息
+        print("\n" + "=" * 80)
+        print("样本统计")
+        print("=" * 80)
+        unique_labels, counts = np.unique(labels, return_counts=True)
+        for label, count in zip(unique_labels, counts):
+            print(f"  {label}: {count} 个样本")
+        
+        # 可视化
+        features_3d = visualize_tsne_3d(
+            features=features,
+            labels=labels,
+            episode_indices=episode_indices,
+            output_path=output_path,
+            perplexity=args.perplexity,
+            max_iter=args.max_iter,
+            interactive=not args.no_interactive
+        )
+        
+        print(f"\n✅ 数据集 {dataset_idx}/{len(dataset_paths)} 完成")
+        print(f"   特征维度: {features.shape[1]} -> 3D")
+        print(f"   可视化已保存到: {output_path}")
     
-    # 打印统计信息
     print("\n" + "=" * 80)
-    print("样本统计")
+    print("所有数据集处理完成！")
     print("=" * 80)
-    unique_labels, counts = np.unique(labels, return_counts=True)
-    for label, count in zip(unique_labels, counts):
-        print(f"  {label}: {count} 个样本")
-    
-    # 可视化
-    features_3d = visualize_tsne_3d(
-        features=features,
-        labels=labels,
-        episode_indices=episode_indices,
-        output_path=args.output,
-        perplexity=args.perplexity,
-        max_iter=args.max_iter,
-        interactive=not args.no_interactive
-    )
-    
-    print("\n" + "=" * 80)
-    print("完成！")
-    print("=" * 80)
-    print(f"特征维度: {features.shape[1]} -> 3D")
-    print(f"可视化已保存到: {args.output}")
+    print(f"共处理 {len(dataset_paths)} 个数据集")
 
 
 if __name__ == '__main__':

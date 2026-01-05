@@ -8,7 +8,7 @@ from typing import List, Optional, Union, Dict, Callable
 import rospy
 
 from sensor_msgs.msg import Image
-from ocs2_msgs.msg import mpc_observation
+from kuavo_humanoid_sdk.ocs2_msgs.msg import mpc_observation
 from sensor_msgs.msg import JointState
 from geometry_msgs.msg import Twist, Pose, PoseStamped
 from std_msgs.msg import Float64MultiArray
@@ -356,7 +356,7 @@ class GrabBoxMpcEnv:
     """
     和mujoco里的机器人交互
     """
-    def __init__(self):
+    def __init__(self, claw_lock_threshold=50.0, claw_lock_count_threshold=5, claw_locked_value=90.0):
         # 在这里直接 init node
         # rospy.init_node('manip', anonymous=True)
         self.target_publisher = TargetPublisher()
@@ -369,6 +369,17 @@ class GrabBoxMpcEnv:
         self.last_action_exec_time = time.time()
 
         self.n_obs_steps = 1 # 每次获取obs的历史跨越多少个控制帧
+        
+        # 夹爪锁定机制参数（左右爪分开跟踪）
+        self.claw_lock_threshold = claw_lock_threshold  # 触发锁定的夹爪值阈值
+        self.claw_lock_count_threshold = claw_lock_count_threshold  # 连续多少次达到阈值后锁定
+        self.claw_locked_value = claw_locked_value  # 锁定时的夹爪值（完全合上）
+        # 左右爪分别跟踪计数和锁定状态
+        self.left_claw_high_count = 0  # 左爪当前连续高值计数
+        self.right_claw_high_count = 0  # 右爪当前连续高值计数
+        self.left_claw_locked = False  # 左爪是否已锁定
+        self.right_claw_locked = False  # 右爪是否已锁定
+        rospy.loginfo(f"🔒 Claw lock mechanism initialized: threshold={claw_lock_threshold}, count_threshold={claw_lock_count_threshold}, locked_value={claw_locked_value}")
 
     def get_obs(self):
         """
@@ -579,6 +590,10 @@ class GrabBoxMpcEnv:
             claw_action = np.array([0.0, right_claw_action])
         else:
             claw_action = None
+        
+        # 应用夹爪锁定机制
+        if claw_action is not None:
+            claw_action = self._apply_claw_lock(claw_action)
 
         # 提取cmd_pose_z（1维）
         if "Cmd_pose_z" in ACTION_COMPONENTS:
@@ -625,5 +640,79 @@ class GrabBoxMpcEnv:
         time_to_sleep = max(0, dt - duration)
         time.sleep(time_to_sleep)
         self.last_action_exec_time = time.time()
+    
+    def _apply_claw_lock(self, claw_action: np.ndarray) -> np.ndarray:
+        """
+        应用夹爪锁定机制：当连续多次夹爪命令超过阈值时，锁定为合上状态
+        左右爪分开进行锁定判断和状态保存
+        
+        Args:
+            claw_action: 原始夹爪动作 [left_claw, right_claw]
+        
+        Returns:
+            处理后的夹爪动作（如果已锁定，则返回锁定值）
+        """
+        if claw_action is None or len(claw_action) < 2:
+            return claw_action
+        
+        claw_action = np.asarray(claw_action).copy()
+        left_claw_value = claw_action[0]
+        right_claw_value = claw_action[1]
+        
+        # 处理左爪
+        if self.left_claw_locked:
+            # 如果已锁定，直接使用锁定值
+            claw_action[0] = self.claw_locked_value
+        else:
+            # 检查左爪值是否超过阈值
+            if left_claw_value >= self.claw_lock_threshold:
+                self.left_claw_high_count += 1
+                # 如果连续次数达到阈值，锁定左爪
+                if self.left_claw_high_count >= self.claw_lock_count_threshold:
+                    self.left_claw_locked = True
+                    claw_action[0] = self.claw_locked_value
+                    rospy.loginfo(f"🔒 Left claw locked (count: {self.left_claw_high_count}, value: {left_claw_value:.2f})")
+            else:
+                # 如果值低于阈值，重置计数
+                self.left_claw_high_count = 0
+        
+        # 处理右爪
+        if self.right_claw_locked:
+            # 如果已锁定，直接使用锁定值
+            claw_action[1] = self.claw_locked_value
+        else:
+            # 检查右爪值是否超过阈值
+            if right_claw_value >= self.claw_lock_threshold:
+                self.right_claw_high_count += 1
+                # 如果连续次数达到阈值，锁定右爪
+                if self.right_claw_high_count >= self.claw_lock_count_threshold:
+                    self.right_claw_locked = True
+                    claw_action[1] = self.claw_locked_value
+                    rospy.loginfo(f"🔒 Right claw locked (count: {self.right_claw_high_count}, value: {right_claw_value:.2f})")
+            else:
+                # 如果值低于阈值，重置计数
+                self.right_claw_high_count = 0
+        
+        return claw_action
+    
+    def reset_claw_lock(self):
+        """
+        重置夹爪锁定状态（用于新的推理会话开始时）
+        分别重置左右爪的锁定状态和计数
+        """
+        was_locked = self.left_claw_locked or self.right_claw_locked
+        if was_locked:
+            lock_info = []
+            if self.left_claw_locked:
+                lock_info.append("left")
+            if self.right_claw_locked:
+                lock_info.append("right")
+            rospy.loginfo(f"🔓 Resetting claw lock state (was locked: {', '.join(lock_info)})")
+        
+        # 重置左右爪的锁定状态和计数
+        self.left_claw_locked = False
+        self.right_claw_locked = False
+        self.left_claw_high_count = 0
+        self.right_claw_high_count = 0
 
 
