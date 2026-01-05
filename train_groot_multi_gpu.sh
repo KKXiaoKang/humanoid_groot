@@ -19,7 +19,7 @@
 # ============================================================================
 
 # 设置输出目录
-OUTPUT_DIR="./outputs/01_03_h100x4_groot_no_down_sample_multi_arm_head_share_features_cross_attention_mix_3x2"
+OUTPUT_DIR="./outputs/0105_h100x4_groot_cross_attention_mix_3x2_vision_token_64_image_enhancement"
 JOB_NAME="groot_depalletize"
 
 # 数据集配置
@@ -156,6 +156,8 @@ RESUME=false
 # --num_processes: 进程数量（等于GPU数量）
 # --mixed_precision=bf16: 使用bf16混合精度训练（匹配policy.use_bf16=true）
 # 注意: 使用 $(which lerobot-train) 确保使用正确的命令路径
+# 图像增强配置（保守设置，用于光照鲁棒性）
+# 注意：draccus支持嵌套配置，使用点号分隔；元组值需要用引号包裹，例如："(0.7,1.3)"
 accelerate launch \
   --multi_gpu \
   --num_processes=${NUM_GPUS} \
@@ -191,7 +193,13 @@ accelerate launch \
   --dataset.repo_id=${DATASET_REPO_ID} \
   --dataset.root=${DATASET_ROOT} \
   --dataset.video_backend="decord" \
-  \
+  --dataset.image_transforms.enable=True \
+  --dataset.image_transforms.max_num_transforms=2 \
+  --dataset.image_transforms.random_order=False \
+  --dataset.image_transforms.tfs.brightness.weight=1.0 \
+  --dataset.image_transforms.tfs.brightness.kwargs.brightness="(0.7,1.3)" \
+  --dataset.image_transforms.tfs.contrast.weight=0.5 \
+  --dataset.image_transforms.tfs.contrast.kwargs.contrast="(0.8,1.2)" \
   --wandb.enable=true \
   --wandb.disable_artifact=true \
   --wandb.project="groot-depalletize"
