@@ -72,7 +72,11 @@ from std_msgs.msg import Float64MultiArray
 from kuavo_humanoid_sdk.kuavo_strategy_pytree.common.robot_sdk import RobotSDK
 from kuavo_humanoid_sdk.msg.kuavo_msgs.srv import (changeArmCtrlMode, changeArmCtrlModeRequest)
 
-MODEL_ACTION_DT = 0.1  # seconds between predicted actions during training
+# Default MODEL_ACTION_DT - can be overridden by command line argument
+# This represents the time interval between predicted actions during training
+# Smaller values = higher inference frequency (e.g., 0.1 = 10 Hz, 0.05 = 20 Hz, 0.033 = 30 Hz)
+DEFAULT_MODEL_ACTION_DT = 0.1
+MODEL_ACTION_DT = DEFAULT_MODEL_ACTION_DT  # Will be updated by command line argument if provided
 MODEL_ACTION_FREQUENCY = 1.0 / MODEL_ACTION_DT
 TARGET_CONTROL_FREQUENCY = 100.0
 TARGET_CONTROL_DT = 1.0 / TARGET_CONTROL_FREQUENCY
@@ -216,6 +220,19 @@ def resample_chunk_with_claw_hold(action_chunk: np.ndarray,
 
     return resampled
 
+def change_arm_ctrl_mode(control_mode):
+    rospy.wait_for_service('/humanoid_change_arm_ctrl_mode')
+    try:
+        change_mode = rospy.ServiceProxy('/humanoid_change_arm_ctrl_mode', changeArmCtrlMode)
+        req = changeArmCtrlModeRequest()
+        req.control_mode = control_mode
+        res = change_mode(req)
+        if res.result:
+            rospy.loginfo("手臂控制模式已更改为 %d", control_mode)
+        else:
+            rospy.logerr("无法将手臂控制模式更改为 %d", control_mode)
+    except rospy.ServiceException as e:
+        rospy.logerr("服务调用失败: %s", e)
 
 def direct_to_wbc(control_mode):
     """
@@ -614,7 +631,7 @@ def set_arm_quick_mode(enable: bool) -> bool:
 def run_inference_loop(policy, preprocessor, env, dataset_stats, task_description, device, 
                        control_arm=True, control_claw=True, action_chunk_size=50, 
                        enable_gui=False, rotate_head_camera=False, state_zero=False,
-                       is_first_inference=True):
+                       is_first_inference=True, skip_chunk_ratio=0.0, model_action_dt=None):
     """
     运行推理循环（可以多次调用，每次调用开始新的推理会话）
     
@@ -632,10 +649,16 @@ def run_inference_loop(policy, preprocessor, env, dataset_stats, task_descriptio
         rotate_head_camera: 是否旋转头部相机
         state_zero: 是否将状态置零
         is_first_inference: 是否是第一次推理（第一次会加载bag文件，后续使用json文件重置）
+        skip_chunk_ratio: 跳过chunk的前百分之多少
+        model_action_dt: 模型动作时间间隔（秒），控制推理频率。如果为None，使用全局MODEL_ACTION_DT
     
     Returns:
         bool: True表示正常退出（按q），False表示被中断（Ctrl+C）
     """
+    # 使用传入的model_action_dt或全局MODEL_ACTION_DT
+    if model_action_dt is None:
+        model_action_dt = MODEL_ACTION_DT
+    model_action_frequency = 1.0 / model_action_dt
     # Print action mode configuration
     print("\n" + "="*80)
     print("🎯 DEPALLETIZE TASK CONFIGURATION (GrootPolicy)")
@@ -652,6 +675,9 @@ def run_inference_loop(policy, preprocessor, env, dataset_stats, task_descriptio
         print(f"🔄 Head camera rotation enabled: images from 'image' camera will be rotated 180 degrees")
     if state_zero:
         print(f"⚠️  STATE ZERO MODE: All state inputs will be set to zero (for dependency testing)")
+    if skip_chunk_ratio > 0.0:
+        print(f"⏭️  Skip chunk ratio: {skip_chunk_ratio*100:.1f}% (will skip first {skip_chunk_ratio*100:.1f}% of each predicted chunk)")
+    print(f"⚡ Model action DT: {model_action_dt:.3f}s (inference frequency: {model_action_frequency:.1f} Hz)")
     print(f"📝 Task description: '{task_description}'")
     print("="*80 + "\n")
     
@@ -709,6 +735,11 @@ def run_inference_loop(policy, preprocessor, env, dataset_stats, task_descriptio
         
         input(f"轨迹回放 结束, 按回车继续 ==== 轨迹回放成功 ==== \n")
         time.sleep(1.0)
+        # 重要：在bag回放完成后，重新获取最新的观测数据
+        # 这样才能获取到bag回放后的真实手臂位置
+        rospy.loginfo("🔄 Updating observation data after bag replay...")
+        obs_data, camera_obs, camera_obs_ts, robot_obs, robot_obs_ts = env.get_obs()
+        rospy.loginfo("✅ Observation data updated with post-bag-replay robot state")
     else:
         rospy.loginfo("Skipping bag file replay (not first inference). Using JSON reset instead.")
     
@@ -822,6 +853,18 @@ def run_inference_loop(policy, preprocessor, env, dataset_stats, task_descriptio
                     action_chunk = pred_actions[0].cpu().numpy()  # (chunk_size, action_dim)
                     rospy.logwarn("⚠️ Warning: No dataset stats found. Using raw predictions (may be normalized).")
 
+                # 根据skip_chunk_ratio跳过chunk的前百分之多少
+                if skip_chunk_ratio > 0.0:
+                    chunk_size = action_chunk.shape[0]
+                    skip_steps = int(np.round(chunk_size * skip_chunk_ratio))
+                    if skip_steps >= chunk_size:
+                        rospy.logwarn(f"⚠️ Warning: skip_chunk_ratio {skip_chunk_ratio*100:.1f}% results in skipping all {chunk_size} steps. Using last step only.")
+                        action_chunk = action_chunk[-1:].copy()  # 至少保留最后一步
+                    elif skip_steps > 0:
+                        original_size = chunk_size
+                        action_chunk = action_chunk[skip_steps:].copy()
+                        rospy.loginfo(f"⏭️  Skipped first {skip_steps}/{original_size} steps ({skip_chunk_ratio*100:.1f}%) of chunk. Remaining: {action_chunk.shape[0]} steps")
+
                 # 根据动作维度动态确定claw维度
                 action_dim = action_chunk.shape[1]
                 if action_dim == 16:
@@ -842,7 +885,7 @@ def run_inference_loop(policy, preprocessor, env, dataset_stats, task_descriptio
                     action_chunk,
                     previous_action=last_executed_action,
                     control_frequency=env.control_frequency,
-                    source_dt=MODEL_ACTION_DT,
+                    source_dt=model_action_dt,
                     arm_dims=arm_dims,
                     claw_dims=claw_dims
                 )
@@ -1014,7 +1057,7 @@ def final_reset_arm(json_path, env, control_arm=True, control_claw=True):
     rospy.loginfo("Arm reset completed!")
 
 
-def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chunk_size=50, lerobot_dataset_path=None, enable_gui=False, rotate_head_camera=False, state_zero=False, task_description=None):
+def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chunk_size=50, lerobot_dataset_path=None, enable_gui=False, rotate_head_camera=False, state_zero=False, task_description=None, skip_chunk_ratio=0.0, model_action_dt=None):
     """
     在这里和实机/仿真交互，做网络推理（depalletize任务）
     支持多次推理：按'q'退出当前推理，可以快速重新开始下一次推理而无需重新加载模型
@@ -1030,6 +1073,9 @@ def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chun
         rotate_head_camera: 是否旋转头部相机图像180度
         state_zero: 是否将状态输入置零（用于验证模型对状态的依赖性）
         task_description: 任务描述字符串（language instruction），如果为None则从数据集加载或使用默认值
+        skip_chunk_ratio: 跳过chunk的前百分之多少（0.0-1.0），例如0.2表示跳过前20%
+        model_action_dt: 模型动作时间间隔（秒），控制推理频率。例如：0.1 = 10 Hz, 0.05 = 20 Hz, 0.033 = 30 Hz
+                        如果为None，使用默认值 0.1 秒（10 Hz）
     """
     
     # 加载模型和环境（只执行一次）
@@ -1079,7 +1125,9 @@ def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chun
                 enable_gui=enable_gui,
                 rotate_head_camera=rotate_head_camera,
                 state_zero=state_zero,
-                is_first_inference=is_first_inference
+                is_first_inference=is_first_inference,
+                skip_chunk_ratio=skip_chunk_ratio,
+                model_action_dt=model_action_dt
             )
             
             if normal_exit:
@@ -1159,8 +1207,28 @@ if __name__ == '__main__':
                         help='If set, set all state inputs to zero (for testing model dependency on state)')
     parser.add_argument('--task-description', type=str, default=None,
                         help='Task description (language instruction) for the model. If not provided, will use the first task from dataset or a default value.')
+    parser.add_argument('--skip-chunk-ratio', type=float, default=0.0,
+                        help='Skip the first percentage of each predicted chunk (0.0-1.0). For example, 0.2 means skip the first 20%% of the chunk. Default: 0.0 (no skipping)')
+    parser.add_argument('--model-action-dt', type=float, default=None,
+                        help='Time interval between predicted actions in seconds (controls inference frequency). '
+                             'Smaller values = higher frequency. Examples: 0.1 = 10 Hz, 0.05 = 20 Hz, 0.033 = 30 Hz. '
+                             'Default: 0.1 (10 Hz). Note: Model was trained with 0.1s interval.')
     
     args = parser.parse_args()
+    
+    # 验证skip_chunk_ratio范围
+    if args.skip_chunk_ratio < 0.0 or args.skip_chunk_ratio >= 1.0:
+        parser.error(f"--skip-chunk-ratio must be in range [0.0, 1.0), got {args.skip_chunk_ratio}")
+    
+    # 验证model_action_dt
+    if args.model_action_dt is not None:
+        if args.model_action_dt <= 0.0:
+            parser.error(f"--model-action-dt must be positive, got {args.model_action_dt}")
+        if args.model_action_dt > 1.0:
+            parser.error(f"--model-action-dt seems too large (> 1.0s), got {args.model_action_dt}")
+        print(f"⚡ Using custom MODEL_ACTION_DT: {args.model_action_dt:.3f}s (inference frequency: {1.0/args.model_action_dt:.1f} Hz)")
+    else:
+        print(f"⚡ Using default MODEL_ACTION_DT: {DEFAULT_MODEL_ACTION_DT:.3f}s (inference frequency: {1.0/DEFAULT_MODEL_ACTION_DT:.1f} Hz)")
     
     # 根据命令行参数和相机配置初始化GUI窗口
     camera_config = {name: info for name, info in topic_info.items() if 'image' in name}
@@ -1191,6 +1259,10 @@ if __name__ == '__main__':
         print(f"📁 Dataset path (for stats): {args.lerobot_dataset_path}")
     if args.task_description:
         print(f"📝 Task description: '{args.task_description}'")
+    if args.skip_chunk_ratio > 0.0:
+        print(f"⏭️  Skip chunk ratio: {args.skip_chunk_ratio*100:.1f}% (will skip first {args.skip_chunk_ratio*100:.1f}% of each predicted chunk)")
+    if args.model_action_dt is not None:
+        print(f"⚡ Model action DT: {args.model_action_dt:.3f}s (inference frequency: {1.0/args.model_action_dt:.1f} Hz)")
     print("="*80 + "\n")
 
     if args.eval:
@@ -1201,7 +1273,9 @@ if __name__ == '__main__':
              enable_gui=args.enable_gui,
              rotate_head_camera=args.rotate_head_camera,
              state_zero=args.state_zero,
-             task_description=args.task_description)
+             task_description=args.task_description,
+             skip_chunk_ratio=args.skip_chunk_ratio,
+             model_action_dt=args.model_action_dt)
     elif args.replay:
         print("Replaying the model")
         lerobot_dataset_path = '/home/lab/kuavo-manip/lerobot_data/vel_wrend_box_613'

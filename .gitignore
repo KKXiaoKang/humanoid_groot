@@ -177,3 +177,5 @@ outputs/
 *.urdf
 *.xml
 *.part
+
+attention_study_pipeline/

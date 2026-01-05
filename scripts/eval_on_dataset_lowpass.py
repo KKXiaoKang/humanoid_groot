@@ -30,7 +30,9 @@ from tqdm import tqdm
 # 使用GrootPolicy模型
 from lerobot.policies.groot.modeling_groot import GrootPolicy
 from lerobot.policies.groot.processor_groot import make_groot_pre_post_processors
+from lerobot.policies.factory import make_pre_post_processors
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.processor.converters import policy_action_to_transition
 
 # 导入配置模块（如果存在）
 try:
@@ -235,44 +237,6 @@ def eval_on_dataset(ckpt_path,
     mse_per_action_dim = OrderedDict() # 记录每个动作维度的MSE
     mae_per_action_dim = OrderedDict() # 记录每个动作维度的MAE
     infer_per_frame = max(1, infer_per_frame)  # 至少每帧推理一次
-    
-    # 辅助函数：反归一化预测动作
-    def denormalize_actions(pred_actions, action_dim, dataset_stats):
-        """反归一化预测动作"""
-        if dataset_stats and 'action' in dataset_stats:
-            action_stats = dataset_stats['action']
-            if 'min' in action_stats and 'max' in action_stats:
-                action_min = torch.as_tensor(action_stats['min'], dtype=torch.float32, device=pred_actions.device)
-                action_max = torch.as_tensor(action_stats['max'], dtype=torch.float32, device=pred_actions.device)
-                
-                # 确保维度匹配
-                if action_min.numel() < action_dim:
-                    action_min = torch.nn.functional.pad(action_min.flatten()[:action_dim], (0, max(0, action_dim - action_min.numel())))
-                if action_max.numel() < action_dim:
-                    action_max = torch.nn.functional.pad(action_max.flatten()[:action_dim], (0, max(0, action_dim - action_max.numel())))
-                
-                action_min = action_min[:action_dim]
-                action_max = action_max[:action_dim]
-                
-                # 反归一化公式：x = (y + 1) / 2 * (max - min) + min
-                denom = action_max - action_min
-                mask = denom != 0
-                safe_denom = torch.where(mask, denom, torch.ones_like(denom))
-                
-                pred_actions_unnorm = (pred_actions + 1.0) * 0.5 * safe_denom + action_min
-                pred_actions_unnorm = torch.where(mask, pred_actions_unnorm, action_min)
-                
-                pred_action_single = pred_actions_unnorm[0, -1, :].cpu().numpy()
-                pred_chunk = pred_actions_unnorm[0].cpu().numpy()
-                return pred_action_single, pred_chunk
-            else:
-                pred_action_single = pred_actions[0, -1, :].cpu().numpy()
-                pred_chunk = pred_actions[0].cpu().numpy()
-                return pred_action_single, pred_chunk
-        else:
-            pred_action_single = pred_actions[0, -1, :].cpu().numpy()
-            pred_chunk = pred_actions[0].cpu().numpy()
-            return pred_action_single, pred_chunk
 
     # ------------- 初始化visualizer (可选) -------------
     if RERUN_AVAILABLE:
@@ -310,19 +274,42 @@ def eval_on_dataset(ckpt_path,
     
     policy.eval().to(device)
     
-    # Load dataset statistics for normalization
-    print(f"\n📂 Loading dataset for statistics...")
-    dataset_for_stats = LeRobotDataset(repo_id=0, root=lerobot_dataset_path)
-    dataset_stats = dataset_for_stats.meta.stats if hasattr(dataset_for_stats.meta, 'stats') else None
-    print(f"✅ Dataset statistics loaded: {list(dataset_stats.keys()) if dataset_stats else 'None'}")
-    
-    # Create preprocessor and postprocessor
-    print(f"\n🔧 Creating preprocessor and postprocessor...")
-    preprocessor, postprocessor = make_groot_pre_post_processors(
-        config=policy.config,
-        dataset_stats=dataset_stats,
-    )
-    print("✅ Preprocessor and postprocessor created")
+    # 从 checkpoint 加载 preprocessor 和 postprocessor（必须包含 dataset_stats）
+    print(f"\n🔧 Loading preprocessor and postprocessor from checkpoint...")
+    try:
+        # 从 checkpoint 加载，不提供 dataset_stats，让它从 checkpoint 中加载
+        preprocessor, postprocessor = make_pre_post_processors(
+            policy_cfg=policy.config,
+            pretrained_path=ckpt_path,
+        )
+        print("✅ Preprocessor and postprocessor loaded from checkpoint")
+        
+        # 检查 postprocessor 中是否有 stats
+        # 从 postprocessor 的步骤中提取 stats（如果存在）
+        dataset_stats = None
+        for step in postprocessor.steps:
+            if hasattr(step, 'stats') and step.stats is not None:
+                dataset_stats = step.stats
+                print(f"✅ Found dataset_stats in checkpoint postprocessor")
+                break
+        
+        if dataset_stats is None:
+            raise ValueError(
+                "❌ ERROR: No dataset_stats found in checkpoint postprocessor. "
+                "The checkpoint must contain dataset_stats for normalization. "
+                "Please ensure the checkpoint was saved with proper statistics."
+            )
+        
+        print(f"✅ Using dataset_stats from checkpoint: {list(dataset_stats.keys()) if dataset_stats else 'None'}")
+                
+    except ValueError as e:
+        # 如果是我们抛出的 ValueError（stats 缺失），直接抛出
+        raise
+    except Exception as e:
+        raise RuntimeError(
+            f"❌ ERROR: Failed to load processors from checkpoint: {e}\n"
+            f"   Please ensure the checkpoint path is correct and contains preprocessor/postprocessor files."
+        ) from e
     
     # Debug: Print model configuration
     print(f"🔍 Model configuration input_features keys: {list(policy.config.input_features.keys()) if hasattr(policy.config, 'input_features') else 'N/A'}")
@@ -344,9 +331,13 @@ def eval_on_dataset(ckpt_path,
     print(f"\n📂 Loading dataset from {lerobot_dataset_path}")
     print(f"📹 Episode: {episode}")
     
+    # 对于本地数据集，repo_id应该是一个字符串标识符（不包含"/"）
+    # 使用数据集路径的最后一部分作为标识符，或者使用"local"
+    dataset_name = Path(lerobot_dataset_path).name if lerobot_dataset_path else "local"
+    
     # 注意：LeRobotDataset的episodes参数主要用于下载时选择文件
     # 但在加载后需要手动过滤数据，因为多个episodes可能存储在同一个parquet文件中
-    dataset = LeRobotDataset(repo_id=0, root=lerobot_dataset_path, episodes=[episode])
+    dataset = LeRobotDataset(repo_id=dataset_name, root=lerobot_dataset_path, episodes=[episode])
     
     # 使用episode的索引范围直接切片，比filter快得多
     # 这是必要的，因为v3.0格式中多个episodes可能存储在同一个文件中
@@ -630,11 +621,21 @@ def eval_on_dataset(ckpt_path,
             print(f"pred_actions shape: {pred_actions.shape}")
             
             # pred_actions shape: (batch_size, chunk_size, action_dim)
-            # 注意：pred_actions是归一化后的值，范围在[-1, 1]
-            # 需要手动反归一化到真实单位
+            # 使用 postprocessor 进行反归一化
+            # postprocessor 期望输入是 (B, action_dim)，所以需要处理整个 chunk
+            _, chunk_size, _ = pred_actions.shape
+            processed_actions = []
+            for i in range(chunk_size):
+                # 提取单个 action: (B, action_dim)
+                single_action = pred_actions[:, i, :]
+                # 使用 postprocessor 进行反归一化
+                processed_action = postprocessor(single_action)
+                processed_actions.append(processed_action)
             
-            # 反归一化预测动作
-            pred_action_single, pred_chunk = denormalize_actions(pred_actions, action_dim, dataset_stats)
+            # 堆叠回 (B, chunk_size, action_dim)，然后转换为 numpy
+            pred_actions_unnorm = torch.stack(processed_actions, dim=1)  # (B, chunk_size, action_dim)
+            pred_chunk = pred_actions_unnorm[0].cpu().numpy()  # (chunk_size, action_dim)
+            pred_action_single = pred_chunk[0]  # (action_dim,) - 取第一个 action
             
             # 保存预测结果供后续帧使用
             last_inferred_chunk = pred_chunk.copy()
@@ -667,7 +668,18 @@ def eval_on_dataset(ckpt_path,
                     inference_time = inference_end - inference_start
                     inference_times.append(inference_time)
                     
-                    pred_action_single, pred_chunk = denormalize_actions(pred_actions, action_dim, dataset_stats)
+                    # 使用 postprocessor 进行反归一化
+                    _, chunk_size, _ = pred_actions.shape
+                    processed_actions = []
+                    for i in range(chunk_size):
+                        single_action = pred_actions[:, i, :]
+                        processed_action = postprocessor(single_action)
+                        processed_actions.append(processed_action)
+                    
+                    pred_actions_unnorm = torch.stack(processed_actions, dim=1)
+                    pred_chunk = pred_actions_unnorm[0].cpu().numpy()
+                    pred_action_single = pred_chunk[0]
+                    
                     last_inferred_chunk = pred_chunk.copy()
                     last_inference_step = data_step
                 else:

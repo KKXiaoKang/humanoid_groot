@@ -224,6 +224,31 @@ class Eagle25VLForConditionalGeneration(Eagle25VLPreTrainedModel, GenerationMixi
 
         input_embeds = self.language_model.get_input_embeddings()(input_ids)
 
+        """
+            第一阶段 vision - language 融合
+            # 关键步骤
+            * 这是早期Early Fusion策略, 将视觉特征直接插入文本序列
+            * 1) 视觉编码: 图像通过SigLip编码器得到的视觉特征, 维度为VIT_Dim
+            * 2) 维度对齐: 通过mlp1将视觉特征投影到2048维, 与语言embedding维度一致
+            * 3) Token替换: 在文本序列的image_token位置, 直接用视觉特征替换文本embedding
+            * 4) 联合编码: 替换后的序列输入到Qwen3-1.5B的12层Transformer中
+                * 4.1) 通过Self-Attention机制, 视觉和语言tokens可以相互关注
+                * 4.2) LLM的每一层都会进行跨模态的信息交互
+            * 5) 计算语言loss:
+                * 5.1) 计算语言模型输出与标签的交叉熵损失
+            
+            # values:
+            * vit_embeds: 图像通过SigLip编码器得到的视觉特征, 维度为VIT_Dim
+            * input_embeds: 文本通过语言模型得到的文本特征
+            * selected: 图像token的位置
+            * input_embeds[selected]: 将图像token位置的文本特征替换为视觉特征
+            * input_embeds: 将文本特征和视觉特征拼接在一起
+            * outputs: 语言模型输出
+            * logits: 语言模型输出
+            * loss: 语言模型损失
+            * return_dict: 是否返回字典
+            * return_dict: 是否返回字典
+        """
         vit_embeds = self.extract_feature(pixel_values)
 
         if image_flags is not None:

@@ -332,6 +332,20 @@ class FlowmatchingActionHead(nn.Module):
         return BatchFeature(data=batch)
 
     def process_backbone_output(self, backbone_output: BatchFeature) -> BatchFeature:
+        """
+            第二阶段: Vision-Language特征增强(vl_self_attention)
+            # 关键步骤
+            * 1) 对已经融合的视觉-语言特征进行4层自注意力处理
+            * 2) 进一步强化视觉和语言之间的关联
+            * 3) 为后续的跨模态注意力做准备
+            # values:
+            * backbone_features: 视觉-语言特征
+            * vlln: 视觉-语言特征归一化
+            * vl_self_attention: 视觉-语言特征自注意力处理
+            * backbone_output: 视觉-语言特征
+            * return_dict: 是否返回字典
+            * return_dict: 是否返回字典
+        """
         backbone_features = backbone_output["backbone_features"]
         backbone_features = self.vlln(backbone_features)
         backbone_features = self.vl_self_attention(backbone_features)
@@ -415,6 +429,22 @@ class FlowmatchingActionHead(nn.Module):
             action_features = action_features + pos_embs
 
         # Join vision, language, state and action embedding along sequence dimension.
+        """
+            第三阶段: Vision-Language与State-Action融合(DiT Cross-Attention)
+            # 关键步骤
+            * 1) 将视觉-语言特征和状态-动作特征拼接在一起
+            * 2) 通过DiT的Cross-Attention机制, 让视觉-语言特征和状态-动作特征相互关注
+            * 3) 输出: 状态-动作特征
+            
+            # values:
+            * future_tokens: 未来tokens
+            * vl_embs: 视觉-语言特征 # Key/Value
+            * sa_embs: 状态-动作特征 # Query
+            * vl_attn_mask: 视觉-语言特征的注意力掩码
+            * model_output: 模型输出
+            * return_dict: 是否返回字典
+            * return_dict: 是否返回字典
+        """
         future_tokens = self.future_tokens.weight.unsqueeze(0).expand(vl_embs.shape[0], -1, -1)
         sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1)
 

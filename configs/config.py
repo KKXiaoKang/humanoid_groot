@@ -26,7 +26,7 @@ ACTION_MODE = "absolute"  # "absolute", "delta", "relative"
     5_wheel: 5代轮臂机器人
     4_pro: 4代双足机器人
 """
-ROBOT_VERSION = "4_pro" 
+ROBOT_VERSION = "5_wheel" 
 
 """
     TASK_DATA_MODE - 指定任务数据集来源
