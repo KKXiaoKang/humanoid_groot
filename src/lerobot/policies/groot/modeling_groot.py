@@ -34,6 +34,8 @@ Notes:
 
 import os
 from collections import deque
+from typing import TYPE_CHECKING, Literal, TypedDict
+from typing_extensions import Unpack
 
 import torch
 from torch import Tensor
@@ -41,6 +43,13 @@ from torch import Tensor
 from lerobot.policies.groot.configuration_groot import GrootConfig
 from lerobot.policies.groot.groot_n1 import GR00TN15
 from lerobot.policies.pretrained import PreTrainedPolicy
+from lerobot.policies.rtc.modeling_rtc import RTCProcessor
+
+
+class ActionSelectKwargs(TypedDict, total=False):
+    inference_delay: int | None
+    prev_chunk_left_over: Tensor | None
+    execution_horizon: int | None
 
 
 class GrootPolicy(PreTrainedPolicy):
@@ -49,18 +58,33 @@ class GrootPolicy(PreTrainedPolicy):
     name = "groot"
     config_class = GrootConfig
 
-    def __init__(self, config: GrootConfig):
+    def __init__(self, config: GrootConfig, rtc_processor: RTCProcessor | None = None):
         """Initialize Groot policy wrapper."""
         super().__init__(config)
         config.validate_features()
         self.config = config
 
+        self.init_rtc_processor()
+
         # Initialize GR00T model using ported components
-        self._groot_model = self._create_groot_model()
+        self._groot_model = self._create_groot_model(rtc_processor=self.rtc_processor)
 
         self.reset()
 
-    def _create_groot_model(self):
+    def init_rtc_processor(self):
+        """Initialize RTC processor if RTC is enabled in config."""
+        self.rtc_processor = None
+
+        # Create processor if config provided
+        # If RTC is not enabled - we can still track the denoising data
+        if self.config.rtc_config is not None:
+            self.rtc_processor = RTCProcessor(self.config.rtc_config)
+
+            model_value = getattr(self, "model", None)
+            if model_value is not None:
+                model_value.rtc_processor = self.rtc_processor
+
+    def _create_groot_model(self, rtc_processor: RTCProcessor | None = None):
         """Create and initialize the GR00T model using Isaac-GR00T API.
 
         This is only called when creating a NEW policy (not when loading from checkpoint).
@@ -78,6 +102,7 @@ class GrootPolicy(PreTrainedPolicy):
             tune_visual=self.config.tune_visual,
             tune_projector=self.config.tune_projector,
             tune_diffusion_model=self.config.tune_diffusion_model,
+            rtc_processor=rtc_processor,
         )
 
         model.compute_dtype = "bfloat16" if self.config.use_bf16 else model.compute_dtype
@@ -138,7 +163,7 @@ class GrootPolicy(PreTrainedPolicy):
         return loss, loss_dict
 
     @torch.no_grad()
-    def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
+    def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs: Unpack[ActionSelectKwargs]) -> Tensor:
         """Predict a chunk of actions for inference by delegating to Isaac-GR00T.
 
         Returns a tensor of shape (B, n_action_steps, action_dim).
@@ -160,8 +185,10 @@ class GrootPolicy(PreTrainedPolicy):
 
         # Use bf16 autocast for inference to keep memory low and match backbone dtype
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=self.config.use_bf16):
-            outputs = self._groot_model.get_action(groot_inputs)
-
+            # for name, p in self._groot_model.named_parameters():
+            #     print(name, p.device)
+            outputs = self._groot_model.get_action(groot_inputs, **kwargs)
+        
         actions = outputs.get("action_pred")
 
         original_action_dim = self.config.output_features["action"].shape[0]
@@ -172,6 +199,9 @@ class GrootPolicy(PreTrainedPolicy):
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
         """Select single action from action queue."""
+        assert not self._groot_model._rtc_enabled(), (
+            "RTC is not supported for select_action, use it with predict_action_chunk"
+        )
         self.eval()
 
         if len(self._action_queue) == 0:
