@@ -62,6 +62,7 @@ from lerobot.robots.utils import make_robot_from_config
 from lerobot.utils.constants import OBS_IMAGES
 from lerobot.utils.hub import HubMixin
 from lerobot.utils.utils import init_logging
+from std_srvs.srv import Trigger, TriggerRequest, SetBool, SetBoolRequest
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -110,8 +111,9 @@ class RTCDemoConfig(HubMixin):
 
     # Get new actions horizon. The amount of executed steps after which will be requested new actions.
     # It should be higher than inference delay + execution horizon.
-    action_queue_size_to_get_new_actions: int = 50
-
+    # action_queue_size_to_get_new_actions: int = 50
+    action_queue_size_to_get_new_actions: int = 90
+    
     # Task to execute
     task: str = field(default="Depalletize the box", metadata={"help": "Task to execute"})
 
@@ -560,6 +562,23 @@ def _apply_torch_compile(policy, cfg: RTCDemoConfig):
 
     return policy
 
+def set_arm_quick_mode(enable: bool) -> bool:
+    """开关手臂快速模式"""
+    rospy.loginfo(f"call set_arm_quick_mode:{enable}")
+    try:
+        rospy.wait_for_service('/enable_lb_arm_quick_mode', timeout=5.0)
+        cli = rospy.ServiceProxy('/enable_lb_arm_quick_mode', SetBool)
+        resp = cli(enable)
+        if resp.success:
+            rospy.loginfo(f"Successfully {'enabled' if enable else 'disabled'} arm quick mode")
+            return True
+        else:
+            rospy.logwarn(f"Failed to {'enable' if enable else 'disable'} arm quick mode")
+            return False
+    except rospy.ServiceException as e:
+        rospy.logerr(f"Service call failed: {e}")
+        return False
+
 @parser.wrap()
 def demo_cli(cfg: RTCDemoConfig):
     """Main entry point for RTC demo with draccus configuration, with verbose printing for debugging."""
@@ -586,8 +605,9 @@ def demo_cli(cfg: RTCDemoConfig):
         control_arm=True,
         control_claw=True
     )
-    robot_sdk.control.set_arm_quick_mode(True)
-
+    # robot_sdk.control.set_arm_quick_mode(True)
+    set_arm_quick_mode(True)
+    
     # 加载 policy
     policy_class = get_policy_class(cfg.policy.type)
     config = PreTrainedConfig.from_pretrained(cfg.policy.pretrained_path)
