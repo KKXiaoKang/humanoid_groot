@@ -256,6 +256,7 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
     use_shared_arm_features: bool = field(default=True, metadata={"help": "Whether to share bottom layer features between left and right arms for better coordination"})
     use_cross_attention_arms: bool = field(default=True, metadata={"help": "Whether to use cross-attention between left and right arm features. Recommended: True for bimanual tasks"})
     arm_coordination_loss_weight: float = field(default=0.2, metadata={"help": "Weight for arm coordination loss (encourages synchronized movements). Recommended: 0.1-0.3"})
+    arm_coordination_loss_use_learnable_weights : bool = field(default=True, metadata={"help": "Whether to use learnable loss weights for arm coordination"})
     
     # Loss weights for different action heads
     arm_loss_weight: float = field(default=1.0, metadata={"help": "Arm absolute position loss weight"})
@@ -423,12 +424,18 @@ class FlowmatchingActionHead(nn.Module):
         # Learnable loss weights (参考 https://arxiv.org/pdf/1705.07115)
         if config.use_learnable_loss_weights and config.use_multi_action_heads:
             if config.split_arm_heads:
-                self.task_log_sigma = nn.ParameterDict({
+                task_log_sigma_dict = {
                     "left_arm": nn.Parameter(torch.zeros(())),    # log(σ_left_arm)
                     "right_arm": nn.Parameter(torch.zeros(())),   # log(σ_right_arm)
                     "claw": nn.Parameter(torch.zeros(())),        # log(σ_claw)
-                })
-                print(f"🎯 Learnable loss weights enabled: left_arm, right_arm, claw")
+                }
+                # 如果启用了协调性损失且使用可学习权重，添加可学习的协调性损失权重
+                if config.arm_coordination_loss_weight > 0 and config.arm_coordination_loss_use_learnable_weights:
+                    task_log_sigma_dict["coordination"] = nn.Parameter(torch.zeros(()))  # log(σ_coordination)
+                    print(f"🎯 Learnable loss weights enabled: left_arm, right_arm, claw, coordination")
+                else:
+                    print(f"🎯 Learnable loss weights enabled: left_arm, right_arm, claw")
+                self.task_log_sigma = nn.ParameterDict(task_log_sigma_dict)
             else:
                 self.task_log_sigma = nn.ParameterDict({
                     "arm": nn.Parameter(torch.zeros(())),    # log(σ_arm)
@@ -737,9 +744,16 @@ class FlowmatchingActionHead(nn.Module):
                     
                     loss = precision_left_arm * loss_left_arm_mean + precision_right_arm * loss_right_arm_mean + precision_claw * loss_claw_mean + s_left_arm + s_right_arm + s_claw
                     
-                    # 添加协调性损失
+                    # 添加协调性损失（使用可学习权重或固定权重）
                     if coordination_loss is not None:
-                        loss = loss + self.config.arm_coordination_loss_weight * coordination_loss
+                        if self.config.arm_coordination_loss_use_learnable_weights and "coordination" in self.task_log_sigma:
+                            # 使用可学习的协调性损失权重
+                            s_coordination = self.task_log_sigma["coordination"]
+                            precision_coordination = torch.exp(-2.0 * s_coordination)
+                            loss = loss + precision_coordination * coordination_loss + s_coordination
+                        else:
+                            # 使用固定的协调性损失权重
+                            loss = loss + self.config.arm_coordination_loss_weight * coordination_loss
                     
                     output_dict = {
                         "loss": loss,
@@ -755,6 +769,11 @@ class FlowmatchingActionHead(nn.Module):
                     }
                     if coordination_loss is not None:
                         output_dict["arm_coordination_loss"] = coordination_loss.item()
+                        # 如果使用可学习权重，添加协调性损失的sigma和weight信息
+                        if self.config.arm_coordination_loss_use_learnable_weights and "coordination" in self.task_log_sigma:
+                            s_coordination = self.task_log_sigma["coordination"]
+                            output_dict["sigma_coordination"] = torch.exp(s_coordination).item()
+                            output_dict["weight_coordination"] = torch.exp(-2.0 * s_coordination).item()
                 else:
                     # Use fixed weights
                     loss_left_arm_mean = loss_left_arm.sum() / action_mask_left_arm.sum()
