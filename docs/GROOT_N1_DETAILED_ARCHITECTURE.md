@@ -38,6 +38,22 @@ graph TB
             VLSA["vl_self_attention<br/>SelfAttentionTransformer<br/>4层 Transformer<br/>tune_projector控制"]
         end
         
+        subgraph ReasoningHead["CoC Reasoning Head (可选)<br/>use_coc_reasoning控制"]
+            BackboneProj["backbone_proj<br/>Linear: 2048 to 512<br/>投影backbone特征"]
+            BackboneGlobal["backbone_global<br/>平均池化<br/>B x 512"]
+            ReasoningTrans["reasoning_transformer<br/>2层 TransformerEncoder<br/>生成reasoning tokens"]
+            ReasoningOutput["reasoning_output<br/>B x L x 512<br/>reasoning trace隐藏状态"]
+            ReasoningAgg["reasoning_aggregated<br/>平均池化<br/>B x 512"]
+            ConditioningProj["conditioning_proj<br/>Linear: 512 to 512<br/>生成base conditioning"]
+            BaseCond["base_conditioning<br/>B x 512<br/>基础条件向量"]
+            ActionDecisionPred["action_decision_predictor<br/>MLP: 512 to 6<br/>基于reasoning trace预测"]
+            ActionDecisionLogits["action_decision_logits<br/>B x 6<br/>决策类型logits"]
+            ActionDecisionIdx["action_decision_idx<br/>argmax或ground truth<br/>B"]
+            ActionDecisionEmb["action_decision_embedding<br/>Embedding(6, 512)<br/>决策嵌入向量"]
+            ActionDecisionEmbOut["action_decision_emb<br/>B x 512<br/>决策嵌入"]
+            ReasoningCond["reasoning_conditioning<br/>B x 512<br/>融合了action decision的条件向量<br/>base_conditioning + action_decision_emb"]
+        end
+        
         subgraph Projectors["投影层 tune_projector控制"]
             StateEnc["State Encoder<br/>CategorySpecificMLP<br/>64 to 1024 to 1536"]
             ActionEnc["Action Encoder<br/>MultiEmbodimentActionEncoder<br/>32 to 1536<br/>包含W1, W2, W3"]
@@ -60,6 +76,8 @@ graph TB
             
             DiTOut["输出投影<br/>proj_out_2: 1536 to 1024<br/>DiT inner_dim=1536"]
         end
+        
+        ReasoningCondApply["Reasoning Conditioning<br/>残差连接<br/>model_output_actions + reasoning_cond<br/>指导动作生成方向"]
         
         subgraph Decoders["解码器 tune_projector控制"]
             subgraph ArmDecoder["Arm Decoder (可选架构)"]
@@ -104,6 +122,21 @@ graph TB
     Output1 --> VLLN
     VLLN --> VLSA
     
+    VLSA -->|backbone_features| BackboneProj
+    BackboneProj --> BackboneGlobal
+    BackboneGlobal --> ReasoningTrans
+    ReasoningTrans --> ReasoningOutput
+    ReasoningOutput --> ReasoningAgg
+    ReasoningAgg --> ConditioningProj
+    ConditioningProj --> BaseCond
+    ReasoningAgg --> ActionDecisionPred
+    ActionDecisionPred --> ActionDecisionLogits
+    ActionDecisionLogits --> ActionDecisionIdx
+    ActionDecisionIdx --> ActionDecisionEmb
+    ActionDecisionEmb --> ActionDecisionEmbOut
+    BaseCond --> ReasoningCond
+    ActionDecisionEmbOut --> ReasoningCond
+    
     STATE --> StateEnc
     ACTION --> ActionEnc
     ActionEnc --> ActionFeat
@@ -122,7 +155,9 @@ graph TB
     DiTDots --> DiT16
     DiT16 --> DiTOut
     
-    DiTOut --> SharedLayer
+    DiTOut --> ReasoningCondApply
+    ReasoningCond --> ReasoningCondApply
+    ReasoningCondApply --> SharedLayer
     SharedLayer --> LayerNormL
     SharedLayer --> LayerNormR
     LayerNormL -->|query| CrossAttnL
@@ -148,12 +183,14 @@ graph TB
     classDef trainable fill:#fff4e1,stroke:#e65100,stroke-width:2px
     classDef projector fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
     classDef diffusion fill:#fce4ec,stroke:#880e4f,stroke-width:2px
+    classDef reasoning fill:#fff9c4,stroke:#f57f17,stroke-width:2px
     
     class SigLip,MLP1,Tokenizer,LLM,SelectLayer frozen
     class EagleLinear trainable
     class VLSA,StateEnc,ActionEnc,PosEmb,FutureTok,SharedLayer,LayerNormL,LayerNormR,CrossAttnL,CrossAttnR,ResidualL,ResidualR,LeftOut,RightOut,ClawDec projector
     class ActionFeat,ActionFeatWithPos projector
     class DiT1,DiT2,DiT3,DiT16,DiTOut diffusion
+    class BackboneProj,BackboneGlobal,ReasoningTrans,ConditioningProj,ActionDecisionPred,ReasoningCond,ReasoningCondApply reasoning
 ```
 
 ## 关键维度变化
@@ -177,6 +214,14 @@ graph TB
 | DiT Self-Attn | Attention | B×S×1536 | B×S×1536 | 自注意力 |
 | DiT Output | proj_out_2 | B×S×1536 | B×S×1024 | 输出投影(inner_dim→output_dim) |
 | Model Output Actions | Slice | B×S×1024 | B×T×1024 | 只取action部分 |
+| **CoC Reasoning Head (可选)** |
+| Backbone Proj | Linear | B×T×2048 | B×T×512 | 投影到reasoning空间 |
+| Backbone Global | Mean Pool | B×T×512 | B×512 | 全局聚合 |
+| Reasoning Transformer | TransformerEncoder×2 | B×(1+L)×512 | B×(1+L)×512 | 生成reasoning tokens |
+| Conditioning Proj | Linear | B×512 | B×512 | 生成conditioning向量 |
+| Action Decision Predictor | MLP | B×512 | B×6 | 预测决策类型 |
+| Reasoning Conditioning Apply | Residual | B×T×1024 + B×1×1024 | B×T×1024 | 残差连接，指导动作生成 |
+| **Decoder** |
 | Shared Layer | CategoryLinear | B×T×1024 | B×T×1024 | 共享底层特征提取 |
 | Cross-Attention | MultiheadAttn | left: B×T×1024<br/>right: B×T×1024 | left: B×T×1024<br/>right: B×T×1024 | 左右手特征相互关注 |
 | Left/Right Output | CategoryLinear | B×T×1024 | B×T×7 | 左右手动作解码 |
@@ -209,6 +254,17 @@ graph TB
   - 包括所有DiT Block中的Cross-Attention和Self-Attention
   - 包括DiT内部的to_k, to_v投影层
   - 包括proj_out_1, proj_out_2输出投影
+
+### tune_reasoning_head (Action Head, 可选)
+- ✅ `reasoning_head` (ReasoningHead, 仅在`use_coc_reasoning=True`时存在)
+  - ✅ `backbone_proj` (Linear: 2048→512)
+  - ✅ `reasoning_transformer` (TransformerEncoder, 2层)
+  - ✅ `token_embedding` (Embedding: vocab_size→512)
+  - ✅ `position_embedding` (Embedding: max_length→512)
+  - ✅ `output_proj` (Linear: 512→vocab_size)
+  - ✅ `conditioning_proj` (Linear: 512→512)
+  - ✅ `action_decision_predictor` (MLP: 512→6)
+  - ✅ `action_decision_embedding` (Embedding: 6→512)
 
 ### 默认可训练（无独立控制）
 - ✅ `eagle_linear` (EagleBackbone中的投影层)
@@ -420,13 +476,14 @@ GROOT N1.5采用了**分层多模态融合**策略，将不同模态的信息逐
 
 **融合方式：交叉注意力（Cross-Attention）**
 
-```417:429:src/lerobot/policies/groot/action_head/flow_matching_action_head.py
-        # Join vision, language, state and action embedding along sequence dimension.
+```882:895:src/lerobot/policies/groot/action_head/flow_matching_action_head.py
         future_tokens = self.future_tokens.weight.unsqueeze(0).expand(vl_embs.shape[0], -1, -1)
+        # 6) 拼接为 hidden_states
         sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1)
 
         vl_attn_mask = backbone_output.backbone_attention_mask
 
+        # 7) DiT Cross-Attention
         model_output = self.model(
             hidden_states=sa_embs,
             encoder_hidden_states=vl_embs,
@@ -434,6 +491,30 @@ GROOT N1.5采用了**分层多模态融合**策略，将不同模态的信息逐
             timestep=t_discretized,
             return_all_hidden_states=False,  # NOTE (YL): not using flare now
         )
+        # 8. 预测 velocity
+        # pred_velocity = self.action_decoder(model_output)
+        # 9. 计算损失
+        # loss = MSE(pred_velocity, actions - noise)
+        
+        # Slice out only the action portion of model output
+        model_output_actions = model_output[:, -actions.shape[1] :]
+        
+        # Apply reasoning conditioning to model_output_actions if reasoning is enabled
+        # This guides the action generation direction (6种细粒度决策类型)
+        if self.config.use_coc_reasoning and reasoning_conditioning is not None:
+            # Project reasoning conditioning to match model_output_actions dimension
+            # Use a cached projection layer if available, otherwise create one
+            if not hasattr(self, '_reasoning_proj'):
+                self._reasoning_proj = nn.Linear(
+                    self.config.reasoning_hidden_dim, 
+                    model_output_actions.shape[-1]
+                ).to(model_output_actions.device)
+            reasoning_cond_expanded = self._reasoning_proj(reasoning_conditioning).unsqueeze(1)  # (B, 1, hidden_size)
+            
+            # Add reasoning conditioning to model output (residual connection)
+            # This biases the action generation towards the reasoning decision
+            if self.config.reasoning_conditioning_type in ["decoder", "both"]:
+                model_output_actions = model_output_actions + reasoning_cond_expanded
 ```
 
 **关键机制**：
@@ -513,6 +594,138 @@ GROOT N1.5采用了**分层多模态融合**策略，将不同模态的信息逐
 - **Self-Attention**：State-Action tokens之间的交互（在interleaved层）
 - **Feed-Forward**：特征变换
 
+### 第四阶段：CoC Reasoning条件化（可选）
+
+**融合方式：残差连接（Residual Connection）**
+
+当启用`use_coc_reasoning=True`时，实现真正的Chain of Causation：`backbone → reasoning trace → action decision → conditioning → action`
+
+**完整链路**：
+
+```
+1. backbone_features → reasoning trace (思维链)
+   ├─ 训练时：使用ground truth reasoning_labels
+   └─ 推理时：自回归生成reasoning_output
+
+2. reasoning trace → action decision (动作决策)
+   └─ 基于reasoning_output的聚合特征预测action_decision_logits
+      └─ 这是Chain of Causation的关键：action decision基于reasoning trace生成
+
+3. action decision → action_decision_embedding (决策嵌入)
+   ├─ 训练时：使用ground truth action_decision_labels (teacher forcing)
+   └─ 推理时：使用预测的action_decision_logits (argmax)
+
+4. action_decision_embedding + base_conditioning → reasoning_conditioning (融合的条件向量)
+   └─ 使用残差连接：reasoning_conditioning = base_conditioning + action_decision_emb
+      └─ 这确保了action decision的信息直接注入到conditioning中
+
+5. reasoning_conditioning → 投影到decoder维度 → 残差连接到model_output_actions
+   └─ 位置：DiT输出后，Decoder输入前
+```
+
+**具体实现**：
+
+```1095:1129:src/lerobot/policies/groot/action_head/flow_matching_action_head.py
+        # Apply reasoning conditioning to model_output_actions if reasoning is enabled
+        # 关键：reasoning_conditioning已经融合了action decision的信息（在ReasoningHead中）
+        # 这确保了action decision能够真正引导DiT的动作生成方向
+        # 
+        # 完整链路：
+        # 1. backbone_features → reasoning trace (思维链)
+        # 2. reasoning trace → action decision (动作决策)
+        # 3. action decision → action_decision_embedding (决策嵌入)
+        # 4. action_decision_embedding + base_conditioning → reasoning_conditioning (融合的条件向量)
+        # 5. reasoning_conditioning → 投影到decoder维度 → 残差连接到model_output_actions
+        # 6. 条件化的model_output_actions → decoder → 动作预测
+        #
+        # 例如：如果action decision是"left_search_grasp_pull"：
+        # - action_decision_embedding会编码"左手搜索抓取拉开，右手不动"的信息
+        # - 这个embedding会通过残差连接偏置model_output_actions
+        # - 最终decoder会生成偏置左手动作（搜索、抓取、拉开），右手保持静止的动作
+        if self.config.use_coc_reasoning and reasoning_conditioning is not None:
+            # Project reasoning conditioning to match model_output_actions dimension
+            # Use a cached projection layer if available, otherwise create one
+            if not hasattr(self, '_reasoning_proj'):
+                self._reasoning_proj = nn.Linear(
+                    self.config.reasoning_hidden_dim, 
+                    model_output_actions.shape[-1]
+                ).to(model_output_actions.device)
+            # 投影并扩展维度：reasoning_conditioning (B, reasoning_hidden_dim) 
+            # → (B, hidden_size) → (B, 1, hidden_size)
+            # 然后通过广播自动扩展到 (B, T, hidden_size)
+            reasoning_cond_expanded = self._reasoning_proj(reasoning_conditioning).unsqueeze(1)  # (B, 1, hidden_size)
+            
+            # Add reasoning conditioning to model output (residual connection)
+            # This biases the action generation towards the reasoning decision
+            # 注意：目前只在decoder输入前应用（reasoning_conditioning_type="decoder"或"both"）
+            # 如果设置为"dit"，需要在DiT内部应用，但这需要修改DiT接口
+            if self.config.reasoning_conditioning_type in ["decoder", "both"]:
+                model_output_actions = model_output_actions + reasoning_cond_expanded  # (B, T, hidden_size)
+```
+
+**关键机制**：
+
+1. **Reasoning生成**：
+   - 输入：`backbone_features` (B×T×2048) - 来自`process_backbone_output`之后
+   - 投影：通过`backbone_proj`将backbone特征投影到reasoning空间 (B×T×512)
+   - 聚合：使用平均池化得到全局表示 (B×512)
+   - 生成：
+     - **训练时**：使用ground truth `reasoning_labels`，通过Transformer编码器生成`reasoning_output`
+     - **推理时**：自回归生成`reasoning_output`（`_generate_reasoning_autoregressive`）
+
+2. **Action Decision预测**（基于reasoning trace）：
+   - **关键改进**：action decision基于`reasoning_output`的聚合特征预测，而不是直接基于backbone
+   - 如果`reasoning_output`存在：使用`reasoning_output.mean(dim=1)`得到聚合特征 (B×512)
+   - 如果`reasoning_output`为None（训练初期或兼容性）：回退到使用`backbone_global` (B×512)
+   - 通过`action_decision_predictor`预测六种决策类型：
+     - `left_search_grasp_pull`: 左手搜索抓取拉开，右手不动
+     - `left_hold_right_search_grasp`: 左手保持，右手搜索抓取
+     - `right_search_grasp_pull`: 右手搜索抓取拉开，左手不动
+     - `right_hold_left_search_grasp`: 右手保持，左手搜索抓取
+     - `both_search_grasp`: 双手同时搜索抓取
+     - `both_hold_lift`: 双手保持并上抬
+   - 输出：`action_decision_logits` (B×6)
+
+3. **Action Decision融入Conditioning**：
+   - **生成base_conditioning**：
+     - 如果`reasoning_output`存在：使用`reasoning_output.mean(dim=1)` → `conditioning_proj` → `base_conditioning` (B×512)
+     - 如果`reasoning_output`为None：使用`backbone_global` → `conditioning_proj` → `base_conditioning` (B×512)
+   - **获取action_decision_emb**：
+     - **训练时**：优先使用ground truth `action_decision_labels`（teacher forcing）
+       - `action_decision_emb = action_decision_embedding(action_decision_labels)` (B×512)
+     - **推理时**：使用预测的`action_decision_logits`（argmax）
+       - `predicted_decision_idx = argmax(action_decision_logits)` (B,)
+       - `action_decision_emb = action_decision_embedding(predicted_decision_idx)` (B×512)
+     - 如果都没有：`action_decision_emb = None`，只使用`base_conditioning`
+   - **融合**：`reasoning_conditioning = base_conditioning + action_decision_emb`（如果action_decision_emb不为None）
+     - 这确保了action decision的信息直接注入到conditioning中
+
+4. **Reasoning Conditioning应用**：
+   - 位置：**DiT输出后，Decoder输入前**
+   - 方法：通过残差连接将reasoning conditioning添加到`model_output_actions`
+   - 维度变换：reasoning_conditioning (B×512) → 投影到 (B×1024) → unsqueeze到 (B×1×1024) → 广播到 (B×T×1024)
+   - 公式：`model_output_actions = model_output_actions + reasoning_cond_expanded`
+
+**作用**：
+- ✅ **真正的因果关系**：backbone → reasoning trace → action decision → action
+- ✅ **指导动作生成方向**：根据reasoning决策（6种细粒度决策类型）偏置动作生成
+- ✅ **因果理解**：通过reasoning trace理解场景的因果关系
+- ✅ **可解释性**：提供结构化的推理过程，便于理解和调试
+- ✅ **训练/推理一致性**：训练时使用teacher forcing，推理时使用预测值
+
+**交互位置总结**：
+```
+DiT输出 (B×T×1024)
+    ↓
+Reasoning Conditioning应用 ← reasoning_conditioning (B×512) 投影到 (B×1×1024)
+    ↓ (已融合action decision信息)
+条件化的model_output_actions (B×T×1024)
+    ↓
+Decoder (SharedBottomArmDecoder / CategorySpecificMLP)
+    ↓
+动作预测 (B×T×16)
+```
+
 ### 多模态融合的常见技巧总结
 
 GROOT N1.5使用了以下多模态融合技巧：
@@ -567,6 +780,24 @@ GROOT N1.5使用了以下多模态融合技巧：
   - 在动作分解阶段进行协调，比在特征提取阶段更直接
   - 可选的机制，可以通过配置控制是否启用
 
+#### 9. **CoC Reasoning条件化（思维链指导）**
+- **位置**：DiT输出后，Decoder输入前
+- **方法**：实现真正的Chain of Causation：`backbone → reasoning trace → action decision → conditioning → action`
+  - **Step 1**：从backbone特征生成reasoning trace（训练时使用ground truth，推理时自回归生成）
+  - **Step 2**：基于reasoning trace的聚合特征预测action decision（6种细粒度决策类型）
+  - **Step 3**：将action decision的embedding融入base conditioning，形成reasoning_conditioning
+    - 训练时：使用ground truth `action_decision_labels`（teacher forcing）
+    - 推理时：使用预测的`action_decision_logits`（argmax）
+  - **Step 4**：将reasoning conditioning投影到decoder维度，通过残差连接注入到动作特征
+    - `model_output_actions = model_output_actions + reasoning_cond_expanded`
+- **优势**：
+  - **真正的因果关系**：action decision基于reasoning trace生成，不是独立生成
+  - **指导动作生成方向**：根据reasoning决策（6种细粒度决策类型）偏置动作生成
+  - **因果理解**：通过reasoning trace理解场景的因果关系
+  - **可解释性**：提供结构化的推理过程，便于理解和调试
+  - **联合训练**：同时优化reasoning trace loss和action decision loss，确保reasoning与动作的一致性
+  - **训练/推理一致性**：训练时使用teacher forcing，推理时使用预测值，确保一致性
+
 ### 融合流程图
 
 ```
@@ -607,6 +838,15 @@ State-Action序列 (B×(1+32+T)×1536)
   ↓ Key/Value: VL特征 (2048→1536维投影)
   ↓ 16层DiT Blocks (Cross-Attn + Self-Attn)
 融合后的动作特征 (B×T×1024)
+  ↓
+【融合点4：CoC Reasoning条件化 (可选)】
+  ↓ backbone_features → reasoning trace (自回归生成)
+  ↓ reasoning trace → action decision (基于reasoning trace预测)
+  ↓ action decision → action_decision_embedding (决策嵌入)
+  ↓ base_conditioning + action_decision_emb → reasoning_conditioning (融合)
+  ↓ reasoning_conditioning (B×512) 投影到 (B×1×1024)
+  ↓ 残差连接: model_output_actions + reasoning_cond_expanded
+条件化的动作特征 (B×T×1024)
   ↓ SharedBottomArmDecoder
   ├─ 共享底层特征提取 (B×T×1024)
   ├─ 交叉注意力 (可选)
@@ -646,6 +886,20 @@ FlowmatchingActionHead
 │   └─ vl_self_attention: SelfAttentionTransformer
 │       └─ 4层 Transformer Blocks
 │           └─ 每层: Self-Attention + FeedForward
+├─ ReasoningHead (可选, tune_reasoning_head)
+│   ├─ backbone_proj: Linear(2048→512)
+│   ├─ reasoning_transformer: TransformerEncoder(2层)
+│   │   └─ 每层: Self-Attention + FeedForward
+│   │   └─ 训练时：使用ground truth reasoning_labels
+│   │   └─ 推理时：自回归生成reasoning_output
+│   ├─ token_embedding: Embedding(vocab_size, 512)
+│   ├─ position_embedding: Embedding(max_length, 512)
+│   ├─ output_proj: Linear(512→vocab_size)
+│   ├─ conditioning_proj: Linear(512→512)
+│   ├─ action_decision_predictor: MLP(512→512→6)
+│   │   └─ 基于reasoning_output的聚合特征预测（不是直接基于backbone）
+│   └─ action_decision_embedding: Embedding(6, 512)
+│       └─ 将action decision类型编码为条件向量
 ├─ Projectors (tune_projector)
 │   ├─ state_encoder: CategorySpecificMLP
 │   │   └─ Layer1: Linear(64→1024) + ReLU
@@ -665,6 +919,9 @@ FlowmatchingActionHead
 │   ├─ norm_out: LayerNorm(1536)
 │   ├─ proj_out_1: Linear(1536→3072)
 │   └─ proj_out_2: Linear(1536→1024)
+├─ Reasoning Conditioning Apply (可选)
+│   └─ _reasoning_proj: Linear(512→1024)
+│   └─ 残差连接: model_output_actions + reasoning_cond_expanded
 └─ Decoders (tune_projector)
     ├─ shared_arm_decoder: SharedBottomArmDecoder (如果 split_arm_heads=True)
     │   ├─ shared_layer: CategorySpecificLinear(1024→1024) + ReLU
@@ -683,4 +940,213 @@ FlowmatchingActionHead
         └─ Layer1: Linear(1024→1024) + ReLU
         └─ Layer2: Linear(1024→2)
 ```
+
+## CoC Reasoning（思维链）架构详解
+
+### Reasoning Head完整数据流（真正的Chain of Causation）
+
+**关键设计**：实现真正的因果关系链 `backbone → reasoning trace → action decision → action`
+
+```
+backbone_features (B×T×2048)
+    ↓ backbone_proj: Linear(2048→512)
+backbone_proj (B×T×512)
+    ↓ 平均池化 (mean pooling)
+backbone_global (B×512)
+    ↓
+    └─→ reasoning_transformer (训练/推理)
+        ├─ 训练时：使用ground truth reasoning_labels
+        │   ├─ token_embedding + position_embedding
+        │   ├─ TransformerEncoder×2
+        │   └─ output_proj: Linear(512→vocab_size)
+        │       └─ reasoning_logits (B×L×vocab_size)
+        │       └─ reasoning_output (B×L×512) ← 从ground truth labels生成的reasoning trace隐藏状态
+        │
+        └─ 推理时：自回归生成
+            └─ _generate_reasoning_autoregressive()
+                └─ reasoning_output (B×L×512) ← 自回归生成的reasoning trace隐藏状态
+        
+        ↓ (训练和推理都经过以下步骤)
+        ↓ 平均池化
+        reasoning_aggregated (B×512)
+        ↓
+        ├─→ action_decision_predictor: MLP(512→512→6)
+        │   └─ action_decision_logits (B×6) ← 基于reasoning trace预测决策类型
+        │       ↓
+        │       ├─ 训练时：如果有action_decision_labels，直接使用（teacher forcing）
+        │       │   └─ action_decision_labels (B,) → action_decision_embedding
+        │       │       └─ action_decision_emb (B×512) ← 决策嵌入（来自ground truth）
+        │       │
+        │       └─ 推理时：使用argmax从logits预测
+        │           └─ argmax(action_decision_logits) → action_decision_idx (B,)
+        │               └─ action_decision_embedding
+        │                   └─ action_decision_emb (B×512) ← 决策嵌入（来自预测）
+        │
+        └─→ conditioning_proj: Linear(512→512)
+            └─ base_conditioning (B×512) ← 基础conditioning
+                ↓
+                ↓ + action_decision_emb (残差连接)
+            reasoning_conditioning (B×512) ← 融合了action decision的条件向量
+```
+
+**关键改进**：
+1. **真正的因果关系**：action decision基于reasoning trace生成，而不是直接基于backbone
+2. **Action decision融入conditioning**：通过`action_decision_embedding`将决策信息注入到conditioning中
+3. **训练/推理一致性**：
+   - 训练时：使用ground truth `action_decision_labels`（teacher forcing）
+   - 推理时：使用预测的`action_decision_logits`
+
+### Reasoning Conditioning应用位置和完整链路
+
+**关键交互点**：在DiT输出后、Decoder输入前
+
+**完整链路**：
+```
+1. backbone_features → reasoning trace (思维链)
+   ├─ 训练时：使用ground truth reasoning_labels
+   └─ 推理时：自回归生成reasoning_output
+
+2. reasoning trace → action decision (动作决策)
+   └─ 基于reasoning_output的聚合特征预测action_decision_logits
+
+3. action decision → action_decision_embedding (决策嵌入)
+   ├─ 训练时：使用ground truth action_decision_labels (teacher forcing)
+   └─ 推理时：使用预测的action_decision_logits (argmax)
+
+4. action_decision_embedding + base_conditioning → reasoning_conditioning (融合的条件向量)
+   └─ 使用残差连接：reasoning_conditioning = base_conditioning + action_decision_emb
+
+5. reasoning_conditioning → 投影到decoder维度 → 残差连接到model_output_actions
+   └─ reasoning_conditioning (B×512) → _reasoning_proj → (B×1024) → unsqueeze → (B×1×1024) → 广播到 (B×T×1024)
+
+6. 条件化的model_output_actions → decoder → 动作预测
+   └─ 例如：action decision="left_search_grasp_pull" → 偏置左手动作，右手保持静止
+```
+
+**具体实现**：
+```
+DiT输出
+    model_output (B×S×1024)
+        ↓ Slice
+    model_output_actions (B×T×1024)
+        ↓
+    【Reasoning Conditioning应用】
+    reasoning_conditioning (B×512) ← 已融合action decision信息
+        ↓ _reasoning_proj: Linear(512→1024)
+    reasoning_cond_expanded (B×1×1024)
+        ↓ 广播到 (B×T×1024)
+        ↓ 残差连接
+    model_output_actions = model_output_actions + reasoning_cond_expanded
+        ↓
+    条件化的model_output_actions (B×T×1024)
+        ↓
+    Decoder (SharedBottomArmDecoder / CategorySpecificMLP)
+        ↓
+    动作预测 (B×T×16)
+```
+
+**Action Decision引导机制**：
+- `action_decision_embedding`编码了6种决策类型的信息（每个类型512维）
+- 通过残差连接注入到`base_conditioning`中，形成`reasoning_conditioning`
+- `reasoning_conditioning`通过投影和残差连接偏置`model_output_actions`
+- Decoder基于条件化的特征生成动作，自然受到action decision的引导
+
+### 训练时的损失计算
+
+根据论文 Alpamayo-R1 (https://arxiv.org/pdf/2511.00088)，SFT阶段的损失函数为：
+
+$$\mathcal{L}_{\text{SFT}}(\theta) = -\mathbb{E}_{(o, \text{REASON}, a) \sim \mathcal{D}_{\text{CoC}}} [\log \pi_{\theta}(\text{REASON}, a \mid o)]$$
+
+这包含两部分：
+
+```python
+# 总损失 = 动作预测损失 + reasoning_loss_weight * (reasoning_trace_loss + action_decision_loss)
+total_loss = action_loss + reasoning_loss_weight * total_reasoning_loss
+
+# total_reasoning_loss包含两部分：
+
+# 1. Reasoning trace的交叉熵损失
+# L_reasoning = -log π_θ(REASON | o)
+# 这是思维链reasoning trace的交叉熵损失
+reasoning_trace_loss = F.cross_entropy(
+    reasoning_logits.reshape(-1, vocab_size),
+    reasoning_labels.reshape(-1),
+    ignore_index=-100,  # Ignore padding tokens
+    reduction="mean"
+)
+
+# 2. Action decision的交叉熵损失（CoC-Action Consistency）
+# L_action_decision = -log π_θ(action_decision | o)
+# 这是动作一致性奖励，确保reasoning trace预测的action decision与ground truth一致
+# 这是CoC-Action Consistency的关键组成部分
+action_decision_loss = F.cross_entropy(
+    action_decision_logits,
+    action_decision_labels,
+    reduction="mean"
+)
+
+# 总reasoning损失
+total_reasoning_loss = reasoning_trace_loss + action_decision_loss
+```
+
+**关键点**：
+- ✅ **Reasoning trace损失**：确保模型能够生成正确的reasoning tokens
+- ✅ **Action decision损失（CoC-Action Consistency）**：确保reasoning trace预测的action decision与ground truth一致
+- ✅ **联合训练**：两个损失同时优化，确保reasoning和action的一致性
+- ✅ **Teacher Forcing**：训练时使用ground truth `action_decision_labels`生成conditioning，加速训练
+
+### 推理时的完整决策流程
+
+**完整链路**：`backbone → reasoning trace → action decision → conditioning → action`
+
+```
+1. 从backbone特征生成reasoning trace（思维链）
+   └─ _generate_reasoning_autoregressive()
+      ├─ 从backbone_global开始
+      ├─ 自回归生成reasoning tokens（最大长度128）
+      └─ 得到reasoning_output (B×L×512)
+
+2. 基于reasoning trace生成action decision（动作决策）
+   └─ 这是Chain of Causation的关键：action decision基于reasoning trace生成
+      ├─ reasoning_output → 平均池化 → reasoning_aggregated (B×512)
+      └─ action_decision_predictor → action_decision_logits (B×6)
+         └─ argmax → predicted_decision_idx (B,)
+
+3. 将action decision融入conditioning
+   └─ action_decision_embedding(predicted_decision_idx) → action_decision_emb (B×512)
+      └─ base_conditioning + action_decision_emb → reasoning_conditioning (B×512)
+         └─ 这确保了action decision的信息直接注入到conditioning中
+
+4. 应用conditioning到DiT输出
+   └─ reasoning_conditioning → _reasoning_proj → (B×1024) → unsqueeze → (B×1×1024)
+      └─ model_output_actions + reasoning_cond_expanded → 条件化的model_output_actions
+
+5. Decoder生成动作
+   └─ 条件化的model_output_actions → Decoder → 动作预测
+      └─ action decision通过conditioning偏置动作生成方向
+```
+
+**6种Action Decision类型及其引导效果**：
+
+| Decision Type | 描述 | 引导效果 |
+|-------------|------|---------|
+| `left_search_grasp_pull` | 左手搜索抓取拉开，右手不动 | 偏置左手动作（搜索、抓取、拉开），右手保持静止 |
+| `left_hold_right_search_grasp` | 左手保持，右手搜索抓取 | 偏置左手保持，右手动作（搜索、抓取） |
+| `right_search_grasp_pull` | 右手搜索抓取拉开，左手不动 | 偏置右手动作（搜索、抓取、拉开），左手保持静止 |
+| `right_hold_left_search_grasp` | 右手保持，左手搜索抓取 | 偏置右手保持，左手动作（搜索、抓取） |
+| `both_search_grasp` | 双手同时搜索抓取 | 偏置双手同时动作（搜索、抓取） |
+| `both_hold_lift` | 双手保持并上抬 | 偏置双手保持并上抬 |
+
+**关键机制**：
+- ✅ **真正的因果关系**：reasoning trace → action decision → action，不是独立生成
+- ✅ **Action decision引导**：通过`action_decision_embedding`将决策信息注入conditioning
+- ✅ **残差连接**：conditioning通过残差连接偏置DiT输出，自然引导动作生成
+- ✅ **可解释性**：每一步都有明确的语义，便于理解和调试
+
+**优势**：
+- ✅ **因果理解**：通过reasoning trace理解场景的因果关系
+- ✅ **方向指导**：明确指导动作生成方向（先左手还是先右手）
+- ✅ **可解释性**：提供结构化的推理过程
+- ✅ **联合优化**：reasoning和动作预测联合训练，确保一致性
+- ✅ **训练/推理一致性**：训练时使用teacher forcing，推理时使用预测值，确保一致性
 
