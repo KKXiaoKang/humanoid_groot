@@ -237,7 +237,8 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
     use_vlln: bool = field(default=True)
 
     vl_self_attention_cfg: dict = field(default=None)
-    num_target_vision_tokens: int = field(default=32, metadata={"help": "Number of target vision tokens."})
+    # num_target_vision_tokens: int = field(default=32, metadata={"help": "Number of target vision tokens."})
+    num_target_vision_tokens: int = field(default=64, metadata={"help": "Number of target vision tokens."})
 
     # Multi-head action prediction
     use_multi_action_heads: bool = field(default=True, metadata={"help": "Whether to use multi-head action prediction"})
@@ -591,6 +592,8 @@ class FlowmatchingActionHead(nn.Module):
         # Embed noised action trajectory.
         # NOTE: Processor (GrootPackInputsStep) already pads action to max_action_dim (32)
         # So action_input.action is already (B, T, encoder_action_dim=32)
+        
+        # 1) 获取真实的 action (ground truth)
         actions = action_input.action  # (B, T, encoder_action_dim)
         action_mask = action_input.action_mask  # (B, T, encoder_action_dim) - marks valid dimensions
         
@@ -608,11 +611,14 @@ class FlowmatchingActionHead(nn.Module):
             else:
                 # Truncate if larger (shouldn't happen)
                 actions = actions[:, :, :self.encoder_action_dim]
-        
+        # 2) 生成随机噪声
         noise = torch.randn(actions.shape, device=actions.device, dtype=actions.dtype)
+        # 3) 随机采样时间步 t ∈ [0, 1]
         t = self.sample_time(actions.shape[0], device=actions.device, dtype=actions.dtype)
         t = t[:, None, None]  # shape (B,1,1) for broadcast
-
+        # 4) 创建加噪轨迹（Flow Matching 核心）
+        # 当 t=0：纯噪声
+        # 当 t=1：真实 action
         noisy_trajectory = (1 - t) * noise + t * actions
         
         # For velocity, extract only the actual action dimensions (first actual_action_dim)
@@ -621,6 +627,7 @@ class FlowmatchingActionHead(nn.Module):
 
         # Convert (continuous) t -> discrete if needed
         t_discretized = (t[:, 0, 0] * self.num_timestep_buckets).long()
+        # 5) 编码加噪轨迹为 action_features
         action_features = self.action_encoder(noisy_trajectory, t_discretized, embodiment_id)
 
         # Maybe add position embedding.
@@ -647,10 +654,12 @@ class FlowmatchingActionHead(nn.Module):
             * return_dict: 是否返回字典
         """
         future_tokens = self.future_tokens.weight.unsqueeze(0).expand(vl_embs.shape[0], -1, -1)
+        # 6) 拼接为 hidden_states
         sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1)
 
         vl_attn_mask = backbone_output.backbone_attention_mask
 
+        # 7) DiT Cross-Attention
         model_output = self.model(
             hidden_states=sa_embs,
             encoder_hidden_states=vl_embs,
@@ -658,6 +667,10 @@ class FlowmatchingActionHead(nn.Module):
             timestep=t_discretized,
             return_all_hidden_states=False,  # NOTE (YL): not using flare now
         )
+        # 8. 预测 velocity
+        # pred_velocity = self.action_decoder(model_output)
+        # 9. 计算损失
+        # loss = MSE(pred_velocity, actions - noise)
         
         # Slice out only the action portion of model output
         model_output_actions = model_output[:, -actions.shape[1] :]
@@ -842,6 +855,7 @@ class FlowmatchingActionHead(nn.Module):
         # Use encoder_action_dim for internal processing (compatible with pretrained model)
         batch_size = vl_embs.shape[0]
         device = vl_embs.device
+        # 1. 初始化：从随机噪声开始
         actions = torch.randn(
             size=(batch_size, self.config.action_horizon, self.encoder_action_dim),
             dtype=vl_embs.dtype,
@@ -856,7 +870,7 @@ class FlowmatchingActionHead(nn.Module):
 
         num_steps = self.num_inference_timesteps
         dt = 1.0 / num_steps
-
+        # 2. 迭代去噪（例如 4 步）
         for t in range(num_steps):
             t_cont = t / float(num_steps)  # e.g. goes 0, 1/N, 2/N, ...
             t_discretized = int(t_cont * self.num_timestep_buckets)
@@ -889,7 +903,7 @@ class FlowmatchingActionHead(nn.Module):
             # # Record x_t and v_t after Euler step
             # if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
             #     self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
-
+        # 3. 返回最终生成的 action
         actions_output = x_t[:, :, :self.actual_action_dim]
         return BatchFeature(data={"action_pred": actions_output})
 

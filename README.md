@@ -2,6 +2,12 @@
 ## env prepare
 ```bash
 # 先安装lerobot其他库
+conda create -y -n lerobot_groot python=3.10
+conda activate lerobot_groot
+conda install ffmpeg
+pip install -e .
+pip install lerobot[groot]
+
 # ubuntu22.04可以直接（pip install flash-attn==2.8.1），但是20.04要抓
 pip install lerobot[groot]
 pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.6cxx11abiTRUE-cp310-cp310-linux_x86_64.whl

@@ -1,0 +1,25 @@
+{
+    "dataset": {
+      "image_transforms": {
+        "enable": true,
+        "max_num_transforms": 2,
+        "random_order": false,
+        "tfs": {
+          "brightness": {
+            "weight": 1.0,
+            "type": "ColorJitter",
+            "kwargs": {
+              "brightness": [0.7, 1.3]
+            }
+          },
+          "contrast": {
+            "weight": 0.5,
+            "type": "ColorJitter",
+            "kwargs": {
+              "contrast": [0.8, 1.2]
+            }
+          }
+        }
+      }
+    }
+  }

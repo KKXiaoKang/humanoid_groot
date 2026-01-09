@@ -19,7 +19,7 @@
 # ============================================================================
 
 # 设置输出目录
-OUTPUT_DIR="./outputs/01_03_h100x4_groot_no_down_sample_multi_arm_head_share_features_cross_attention_mix_3x2"
+OUTPUT_DIR="./outputs/0105_h100x4_groot_cross_attention_mix_3x2_vision_token_64_image_enhancement"
 JOB_NAME="groot_depalletize"
 
 # 数据集配置
@@ -151,16 +151,31 @@ fi
 # 是否从checkpoint继续训练
 RESUME=false
 
+# 图像增强配置文件路径（可选）
+# 如果设置了此变量且文件存在，将使用配置文件中的图像增强设置
+# 配置文件应包含完整的 image_transforms 配置，包括 tfs 字典
+# 如果未设置或文件不存在，将使用命令行参数中的基本配置
+# 注意：命令行参数会覆盖配置文件中的对应设置
+IMAGE_TRANSFORMS_CONFIG_PATH="config/image_transforms.json"
+
 # 使用 accelerate launch 启动多卡训练
 # --multi_gpu: 启用多GPU训练（必需）
 # --num_processes: 进程数量（等于GPU数量）
 # --mixed_precision=bf16: 使用bf16混合精度训练（匹配policy.use_bf16=true）
 # 注意: 使用 $(which lerobot-train) 确保使用正确的命令路径
+# 
+# 关于图像增强配置:
+# - 如果设置了 IMAGE_TRANSFORMS_CONFIG_PATH 且文件存在，将使用配置文件
+# - 配置文件中的设置会被命令行参数覆盖（如果同时提供）
+# - random_order 参数说明:
+#   * False: 按照变换的默认顺序应用（brightness -> contrast -> saturation -> ...）
+#   * True: 随机打乱变换的应用顺序，增加数据增强的多样性
 accelerate launch \
   --multi_gpu \
   --num_processes=${NUM_GPUS} \
   --mixed_precision=bf16 \
   $(which lerobot-train) \
+  $(if [ -n "$IMAGE_TRANSFORMS_CONFIG_PATH" ] && [ -f "$IMAGE_TRANSFORMS_CONFIG_PATH" ]; then echo "--config_path=${IMAGE_TRANSFORMS_CONFIG_PATH}"; fi) \
   --output_dir=${OUTPUT_DIR} \
   --job_name=${JOB_NAME} \
   --resume=${RESUME} \
@@ -191,7 +206,7 @@ accelerate launch \
   --dataset.repo_id=${DATASET_REPO_ID} \
   --dataset.root=${DATASET_ROOT} \
   --dataset.video_backend="decord" \
-  \
+  $(if [ -z "$IMAGE_TRANSFORMS_CONFIG_PATH" ] || [ ! -f "$IMAGE_TRANSFORMS_CONFIG_PATH" ]; then echo "--dataset.image_transforms.enable=True --dataset.image_transforms.max_num_transforms=2 --dataset.image_transforms.random_order=False"; fi) \
   --wandb.enable=true \
   --wandb.disable_artifact=true \
   --wandb.project="groot-depalletize"
