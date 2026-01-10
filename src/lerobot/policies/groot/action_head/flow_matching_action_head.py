@@ -430,9 +430,14 @@ class FlowmatchingActionHead(nn.Module):
                     "claw": nn.Parameter(torch.zeros(())),        # log(σ_claw)
                 }
                 # 如果启用了协调性损失且使用可学习权重，添加可学习的协调性损失权重
+                # 注意：使用权重上限和正则化来限制学习速度，防止协调性损失被过度优化
+                # - 权重上限：precision <= 固定权重 * 2.5（防止无限增大）
+                # - 软上限：使用 tanh 进行平滑限制，避免硬截断导致的梯度问题
+                # - 温度参数：控制软上限的陡峭程度（temperature=0.5，值越小上限越软，变化越慢）
+                # - L2正则化：鼓励权重保持在固定权重附近（regularization_strength=0.3）
                 if config.arm_coordination_loss_weight > 0 and config.arm_coordination_loss_use_learnable_weights:
                     task_log_sigma_dict["coordination"] = nn.Parameter(torch.zeros(()))  # log(σ_coordination)
-                    print(f"🎯 Learnable loss weights enabled: left_arm, right_arm, claw, coordination")
+                    print(f"🎯 Learnable loss weights enabled: left_arm, right_arm, claw, coordination (with slow learning: max_weight={config.arm_coordination_loss_weight * 2.5:.2f}, temp=0.5, reg=0.3)")
                 else:
                     print(f"🎯 Learnable loss weights enabled: left_arm, right_arm, claw")
                 self.task_log_sigma = nn.ParameterDict(task_log_sigma_dict)
@@ -747,10 +752,42 @@ class FlowmatchingActionHead(nn.Module):
                     # 添加协调性损失（使用可学习权重或固定权重）
                     if coordination_loss is not None:
                         if self.config.arm_coordination_loss_use_learnable_weights and "coordination" in self.task_log_sigma:
-                            # 使用可学习的协调性损失权重
+                            # 使用可学习的协调性损失权重，但限制学习速度
+                            # 关键：防止权重过快增大导致协调性损失被过度优化
+                            # 方法：使用权重上限 + 正则化项，限制权重变化速度
                             s_coordination = self.task_log_sigma["coordination"]
-                            precision_coordination = torch.exp(-2.0 * s_coordination)
-                            loss = loss + precision_coordination * coordination_loss + s_coordination
+                            
+                            # 计算标准uncertainty weighting的precision
+                            precision_coordination_raw = torch.exp(-2.0 * s_coordination)
+                            
+                            # 设置权重上限：防止precision无限增大，限制学习速度
+                            # max_precision 设置为固定权重的2-3倍，这样可以适度学习但不会过度优化
+                            max_precision = self.config.arm_coordination_loss_weight * 2.5  # 最大权重为固定权重的2.5倍
+                            
+                            # 使用软上限（smooth clamping）限制precision
+                            # 当precision_raw很大时（权重过大），使用max_precision作为上限
+                            # 当precision_raw很小时（权重正常），使用precision_raw
+                            # 使用sigmoid进行平滑的软上限：precision = max_precision * sigmoid(alpha * precision_raw / max_precision)
+                            # 或者更简单：precision = max_precision * tanh(precision_raw / max_precision)
+                            # 但为了更好的控制，使用 temperature 参数
+                            temperature = 0.5  # 温度参数，控制软上限的陡峭程度，值越小，上限越软
+                            # 使用温度缩放的软上限：precision = max_precision * sigmoid(temperature * precision_raw / max_precision)
+                            # 或者使用更直接的公式：precision = max_precision * (precision_raw / max_precision) / (1 + (precision_raw / max_precision) ** (1/temperature))
+                            # 最简单的方法：使用 softplus 或者直接使用 min 的平滑版本
+                            # 实际上，最简单有效的方法是：precision = max_precision * tanh(precision_raw / max_precision * (1/temperature))
+                            precision_coordination = max_precision * torch.tanh(precision_coordination_raw / max_precision / temperature)
+                            
+                            # 计算使得precision = 固定权重时的s值（用于正则化）
+                            s0_value = -0.5 * torch.log(torch.tensor(self.config.arm_coordination_loss_weight, device=s_coordination.device, dtype=s_coordination.dtype) + 1e-8)
+                            
+                            # 添加L2正则化项，鼓励s_coordination保持在s0附近，防止过度偏离固定权重
+                            # 正则化强度：控制正则化的强度，值越大，权重越倾向于保持在固定权重附近
+                            regularization_strength = 0.3  # 正则化强度（可调：0.1-0.5）
+                            regularization_term = regularization_strength * (s_coordination - s0_value) ** 2
+                            
+                            # 使用标准uncertainty weighting公式 + 正则化项
+                            # 注意：s_coordination项仍然保留，因为它是uncertainty weighting的标准正则化项
+                            loss = loss + precision_coordination * coordination_loss + s_coordination + regularization_term
                         else:
                             # 使用固定的协调性损失权重
                             loss = loss + self.config.arm_coordination_loss_weight * coordination_loss
@@ -772,8 +809,16 @@ class FlowmatchingActionHead(nn.Module):
                         # 如果使用可学习权重，添加协调性损失的sigma和weight信息
                         if self.config.arm_coordination_loss_use_learnable_weights and "coordination" in self.task_log_sigma:
                             s_coordination = self.task_log_sigma["coordination"]
+                            # 使用与损失计算相同的权重上限逻辑
+                            max_precision = self.config.arm_coordination_loss_weight * 2.5
+                            precision_coordination_raw = torch.exp(-2.0 * s_coordination)
+                            temperature = 0.5
+                            precision_coordination = max_precision * torch.tanh(precision_coordination_raw / max_precision / temperature)
                             output_dict["sigma_coordination"] = torch.exp(s_coordination).item()
-                            output_dict["weight_coordination"] = torch.exp(-2.0 * s_coordination).item()
+                            output_dict["weight_coordination"] = precision_coordination.item()  # 使用受限后的权重（实际使用的权重）
+                            output_dict["weight_coordination_raw"] = precision_coordination_raw.item()  # 原始权重（用于对比）
+                            output_dict["s_coordination"] = s_coordination.item()  # log权重值（用于调试）
+                            output_dict["weight_coordination_max"] = max_precision  # 权重上限（用于监控）
                 else:
                     # Use fixed weights
                     loss_left_arm_mean = loss_left_arm.sum() / action_mask_left_arm.sum()
