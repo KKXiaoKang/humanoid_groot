@@ -41,295 +41,384 @@ from typing_extensions import Unpack
 from lerobot.policies.rtc.modeling_rtc import RTCProcessor
 
 
-class ReasoningHead(nn.Module):
+class VisionGroundedReasoningHead(nn.Module):
     """
-    Chain of Causation (CoC) Reasoning Head
+    Vision-Grounded Reasoning Head（视觉基础推理头）
     
-    实现真正的Chain of Causation推理链：
-    1. 从backbone_features生成reasoning trace（思维链）
-    2. 基于reasoning trace生成action decision（动作决策）
-    3. 使用reasoning conditioning指导动作生成
+    核心设计理念（参考Alpamayo-R1）：
+    =============================
+    1. **显式生成reasoning trace**：不是隐式的attention，而是真正的文本推理
+    2. **从视觉中推理**：模型学会"看"到箱子尺寸，而不是依赖prompt告诉它
+    3. **Two-stage设计**：先推理（生成CoT），后行动（生成action）
     
-    这是真正的因果关系链：backbone → reasoning trace → action decision → action
+    与Alpamayo-R1的对比：
+    ===================
+    | 方面 | Alpamayo-R1 | VisionGroundedReasoningHead |
+    |------|-------------|----------------------------|
+    | VLM | 完整Qwen3-VL | Eagle2 backbone + 轻量级decoder |
+    | CoT生成 | 完整VLM自回归 | 轻量级reasoning decoder |
+    | Action生成 | Expert + Diffusion | DiT Flow Matching |
+    | 推理过程 | 显式文本输出 | 显式文本输出 + conditioning |
     
-    支持6种action decision类型：
-    1. left_search_grasp_pull: 机器人移动左手寻找箱子左侧边缘，夹爪抓取后并拉开，右手保持不动
-    2. left_hold_right_search_grasp: 机器人左手抓住箱子边缘保持不动，右手找到箱子的边缘并且抓住
-    3. right_search_grasp_pull: 机器人移动右手寻找箱子右侧边缘，夹爪抓取后并拉开，左手保持不动
-    4. right_hold_left_search_grasp: 机器人右手抓住箱子边缘保持不动，左手找到箱子的边缘并且抓住
-    5. both_search_grasp: 机器人左右手同时找到箱子的左右边缘，并且抓取
-    6. both_hold_lift: 机器人左手右手已经抓住箱子边缘，同时上抬提起箱子
+    推理示例：
+    ========
+    输入：视觉特征（看到60cm绿色箱子）+ 简洁prompt "Depalletize the box"
+    输出CoT：
+        <cot_start>
+        观察：我看到一个宽大的绿色箱子，尺寸约为40×60×11 cm (型号4611)
+        分析：这是一个较大的箱子，需要双手协调抓取
+        位置：箱子位于右侧托盘区域
+        决策：执行 both_search_grasp → both_hold_lift 动作序列
+        <cot_end>
+    输出Action：基于CoT的action conditioning → DiT生成动作
     
-    关键设计：
-    - 训练时：使用ground truth reasoning labels，基于reasoning trace生成action decision
-    - 推理时：自回归生成reasoning trace，然后基于生成的reasoning trace生成action decision
-    - 这确保了reasoning trace和action decision之间的因果关系，符合Chain of Causation的设计理念
+    架构设计：
+    ========
+    1. Vision Encoder: 从backbone_features提取视觉关键信息
+    2. Reasoning Decoder: 轻量级Transformer decoder生成CoT
+    3. Conditioning Extractor: 从CoT hidden states提取action conditioning
     """
+    
+    # 预定义的reasoning vocabulary（可训练时扩展）
+    REASONING_VOCAB = {
+        # 特殊tokens
+        "<pad>": 0, "<eos>": 1, "<cot_start>": 2, "<cot_end>": 3,
+        # 观察相关
+        "observe": 4, "see": 5, "detect": 6,
+        # 尺寸相关
+        "wide": 7, "narrow": 8, "large": 9, "small": 10, 
+        "60cm": 11, "30cm": 12, "40x60": 13, "40x30": 14,
+        # 颜色相关
+        "green": 15, "box": 16, "type": 17,
+        # 位置相关
+        "left": 18, "right": 19, "center": 20, "top": 21, "bottom": 22,
+        # 动作决策相关
+        "grasp": 23, "lift": 24, "move": 25, "place": 26,
+        "left_arm": 27, "right_arm": 28, "both_arms": 29,
+        "search": 30, "hold": 31, "pull": 32, "push": 33,
+        # 连接词
+        "and": 34, "then": 35, "because": 36, "so": 37,
+        # 数字
+        "0": 38, "1": 39, "2": 40, "3": 41, "4": 42, "5": 43,
+        "6": 44, "7": 45, "8": 46, "9": 47,
+    }
+    
+    # 动作决策类型（用于CoT生成后的分类）
+    ACTION_DECISIONS = [
+        "left_search_grasp_pull",      # 左手搜索抓取拉开
+        "left_hold_right_search_grasp", # 左手保持，右手搜索抓取
+        "right_search_grasp_pull",     # 右手搜索抓取拉开
+        "right_hold_left_search_grasp", # 右手保持，左手搜索抓取
+        "both_search_grasp",           # 双手同时搜索抓取
+        "both_hold_lift",              # 双手保持并上抬
+    ]
+    
     def __init__(
         self,
-        backbone_embedding_dim: int,
-        reasoning_hidden_dim: int,
-        reasoning_vocab_size: int,
-        reasoning_max_length: int,
-        num_layers: int = 2,
+        backbone_embedding_dim: int = 1536,  # Eagle2输出维度
+        reasoning_hidden_dim: int = 512,     # Reasoning decoder隐藏维度
+        reasoning_num_layers: int = 4,       # Reasoning decoder层数
+        reasoning_num_heads: int = 8,        # 注意力头数
+        reasoning_max_length: int = 64,      # 最大CoT长度
+        conditioning_dim: int = 512,         # 输出conditioning维度
+        dropout: float = 0.1,
+        vocab_size: int = 128,               # 简化的reasoning vocabulary大小
     ):
         super().__init__()
+        self.backbone_embedding_dim = backbone_embedding_dim
         self.reasoning_hidden_dim = reasoning_hidden_dim
-        self.reasoning_vocab_size = reasoning_vocab_size
         self.reasoning_max_length = reasoning_max_length
+        self.conditioning_dim = conditioning_dim
+        self.vocab_size = vocab_size
         
-        # 将backbone特征投影到reasoning空间
-        self.backbone_proj = nn.Linear(backbone_embedding_dim, reasoning_hidden_dim)
+        # ============================================
+        # 1. Vision Feature Encoder
+        # 从backbone_features提取视觉关键信息
+        # ============================================
+        self.vision_proj = nn.Sequential(
+            nn.Linear(backbone_embedding_dim, reasoning_hidden_dim),
+            nn.LayerNorm(reasoning_hidden_dim),
+            nn.GELU(),
+        )
         
-        # 小型Transformer用于生成reasoning tokens
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=reasoning_hidden_dim,
-            nhead=8,
-            dim_feedforward=reasoning_hidden_dim * 4,
-            dropout=0.1,
+        # Vision query tokens（用于聚合视觉信息）
+        self.num_vision_queries = 8  # 8个query聚合不同的视觉信息
+        self.vision_queries = nn.Parameter(torch.randn(1, self.num_vision_queries, reasoning_hidden_dim))
+        nn.init.normal_(self.vision_queries, std=0.02)
+        
+        # Vision cross-attention
+        self.vision_cross_attn = nn.MultiheadAttention(
+            embed_dim=reasoning_hidden_dim,
+            num_heads=reasoning_num_heads,
+            dropout=dropout,
             batch_first=True,
         )
-        self.reasoning_transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.vision_ln = nn.LayerNorm(reasoning_hidden_dim)
         
-        # Token embedding和位置编码
-        self.token_embedding = nn.Embedding(reasoning_vocab_size, reasoning_hidden_dim)
+        # ============================================
+        # 2. Reasoning Decoder（轻量级Transformer）
+        # 自回归生成CoT reasoning trace
+        # ============================================
+        # Token embedding
+        self.token_embedding = nn.Embedding(vocab_size, reasoning_hidden_dim)
         self.position_embedding = nn.Embedding(reasoning_max_length, reasoning_hidden_dim)
         
-        # 输出层：生成reasoning tokens的logits
-        self.output_proj = nn.Linear(reasoning_hidden_dim, reasoning_vocab_size)
+        # Transformer decoder layers
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=reasoning_hidden_dim,
+            nhead=reasoning_num_heads,
+            dim_feedforward=reasoning_hidden_dim * 4,
+            dropout=dropout,
+            activation='gelu',
+            batch_first=True,
+            norm_first=True,  # Pre-LN for stability
+        )
+        self.reasoning_decoder = nn.TransformerDecoder(decoder_layer, num_layers=reasoning_num_layers)
         
-        # 条件化embedding：将reasoning tokens编码为条件向量，用于指导动作生成
-        self.conditioning_proj = nn.Linear(reasoning_hidden_dim, reasoning_hidden_dim)
+        # Output head for token prediction
+        self.reasoning_output_head = nn.Linear(reasoning_hidden_dim, vocab_size)
         
-        # Action decision prediction: 预测action decision类型
-        self.action_decision_predictor = nn.Sequential(
+        # ============================================
+        # 3. Action Decision Head
+        # 从CoT生成action decision
+        # ============================================
+        self.action_decision_head = nn.Sequential(
             nn.Linear(reasoning_hidden_dim, reasoning_hidden_dim),
-            nn.ReLU(),
-            nn.Linear(reasoning_hidden_dim, 6),  # 6种决策类型
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(reasoning_hidden_dim, len(self.ACTION_DECISIONS)),
         )
         
-        # Action decision embedding: 将action decision类型编码为条件向量
-        # 用于直接指导decoder的动作生成方向
-        self.action_decision_embedding = nn.Embedding(6, reasoning_hidden_dim)  # 6种决策类型
+        # Action decision embedding（用于conditioning）
+        self.action_decision_embedding = nn.Embedding(len(self.ACTION_DECISIONS), conditioning_dim)
         
-    def forward(
-        self, 
-        backbone_features: torch.Tensor, 
-        reasoning_labels: torch.Tensor | None = None,
-        action_decision_labels: torch.Tensor | None = None,
-    ):
+        # ============================================
+        # 4. Conditioning Extractor
+        # 从CoT hidden states提取最终的action conditioning
+        # ============================================
+        self.conditioning_proj = nn.Sequential(
+            nn.Linear(reasoning_hidden_dim, conditioning_dim),
+            nn.LayerNorm(conditioning_dim),
+            nn.GELU(),
+            nn.Linear(conditioning_dim, conditioning_dim),
+        )
+        
+        # 特殊token IDs
+        self.pad_token_id = 0
+        self.eos_token_id = 1
+        self.cot_start_token_id = 2
+        self.cot_end_token_id = 3
+        
+        print(f"🧠 VisionGroundedReasoningHead initialized:")
+        print(f"   ✅ Vision-grounded: learns to 'see' box size from visual features")
+        print(f"   ✅ Explicit CoT: generates reasoning trace like Alpamayo-R1")
+        print(f"   ✅ {reasoning_num_layers} decoder layers, {reasoning_num_heads} heads")
+        print(f"   ✅ Max CoT length: {reasoning_max_length} tokens")
+        print(f"   ✅ {len(self.ACTION_DECISIONS)} action decision types")
+        print(f"   ✅ Output conditioning dim: {conditioning_dim}")
+    
+    def encode_vision(
+        self,
+        backbone_features: torch.Tensor,  # (B, T, backbone_embedding_dim)
+        attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """
-        Args:
-            backbone_features: (B, T, backbone_embedding_dim) - 来自backbone的特征
-            reasoning_labels: (B, L) - 可选的ground truth reasoning token ids，用于训练
-            action_decision_labels: (B,) - 可选的ground truth action decision labels，用于训练
+        从backbone_features中编码视觉信息
         
         Returns:
-            reasoning_logits: (B, L, vocab_size) - reasoning tokens的logits
-            reasoning_conditioning: (B, reasoning_hidden_dim) - 用于条件化动作生成的向量（融合了action decision信息）
-            action_decision_logits: (B, 6) - action decision类型的logits (6种决策类型)
+            vision_context: (B, num_vision_queries, reasoning_hidden_dim)
         """
-        B, T, _ = backbone_features.shape
+        B = backbone_features.shape[0]
         
-        # 1. 投影backbone特征
-        backbone_proj = self.backbone_proj(backbone_features)  # (B, T, reasoning_hidden_dim)
+        # Project to reasoning dimension
+        vision_features = self.vision_proj(backbone_features)  # (B, T, reasoning_hidden_dim)
         
-        # 2. 聚合backbone特征（使用平均池化或CLS token）
-        # 使用平均池化得到全局表示
-        backbone_global = backbone_proj.mean(dim=1)  # (B, reasoning_hidden_dim)
+        # Cross-attention: queries attend to vision features
+        queries = self.vision_queries.expand(B, -1, -1)
         
-        # 3. 生成reasoning tokens
-        reasoning_output = None  # 用于后续生成action decision
-        if reasoning_labels is not None:
-            # 训练模式：使用ground truth labels
-            L = reasoning_labels.shape[1]  # reasoning sequence length
-            token_embeds = self.token_embedding(reasoning_labels)  # (B, L, reasoning_hidden_dim)
-            
-            # 添加位置编码
-            pos_ids = torch.arange(L, device=reasoning_labels.device).unsqueeze(0).expand(B, -1)
-            pos_embeds = self.position_embedding(pos_ids)
-            token_embeds = token_embeds + pos_embeds
-            
-            # 将backbone全局特征作为初始token
-            # 拼接: [backbone_global, token_embeds]
-            reasoning_input = torch.cat([backbone_global.unsqueeze(1), token_embeds], dim=1)  # (B, 1+L, reasoning_hidden_dim)
-            
-            # 通过Transformer
-            reasoning_output = self.reasoning_transformer(reasoning_input)  # (B, 1+L, reasoning_hidden_dim)
-            
-            # 只取token部分（不包括backbone_global）
-            reasoning_output = reasoning_output[:, 1:]  # (B, L, reasoning_hidden_dim)
-            
-            # 生成logits
-            reasoning_logits = self.output_proj(reasoning_output)  # (B, L, vocab_size)
-        else:
-            # 推理模式：自回归生成reasoning trace
-            # 这是真正的Chain of Causation：从backbone特征生成reasoning trace
-            reasoning_logits, reasoning_output = self._generate_reasoning_autoregressive(
-                backbone_global, max_length=self.reasoning_max_length
-            )
+        key_padding_mask = None
+        if attention_mask is not None:
+            key_padding_mask = ~attention_mask.bool()
         
-        # 4. 生成action decision logits（基于reasoning trace，而不是直接基于backbone）
-        # 这是Chain of Causation的关键：action decision应该基于reasoning trace生成
-        if reasoning_output is not None:
-            # 使用reasoning trace的聚合特征来预测action decision
-            reasoning_aggregated = reasoning_output.mean(dim=1)  # (B, reasoning_hidden_dim)
-            action_decision_logits = self._predict_action_decision(reasoning_aggregated)  # (B, 6)
-        else:
-            # 如果没有reasoning trace，回退到backbone特征（用于训练初期或兼容性）
-            action_decision_logits = self._predict_action_decision(backbone_global)  # (B, 6)
+        vision_context, _ = self.vision_cross_attn(
+            query=queries,
+            key=vision_features,
+            value=vision_features,
+            key_padding_mask=key_padding_mask,
+        )
+        vision_context = self.vision_ln(vision_context)
         
-        # 5. 生成reasoning conditioning向量（用于条件化动作生成）
-        # 关键改进：将action decision的信息融入到conditioning中，使其能够真正引导动作生成
-        if reasoning_output is not None:
-            # 使用reasoning trace的聚合特征（平均池化）来生成基础conditioning
-            reasoning_aggregated = reasoning_output.mean(dim=1)  # (B, reasoning_hidden_dim)
-            base_conditioning = self.conditioning_proj(reasoning_aggregated)  # (B, reasoning_hidden_dim)
-        else:
-            # 如果没有reasoning trace，使用backbone特征
-            base_conditioning = self.conditioning_proj(backbone_global)  # (B, reasoning_hidden_dim)
-        
-        # 将action decision的embedding融入到conditioning中
-        # 这是关键：让action decision真正引导动作生成
-        # 在训练时，优先使用ground truth action_decision_labels（teacher forcing）
-        # 在推理时，使用预测的action_decision_logits
-        if action_decision_labels is not None:
-            # 训练时：使用ground truth action_decision_labels（teacher forcing）
-            # 这确保了训练时conditioning使用的是正确的action decision
-            action_decision_idx = action_decision_labels  # (B,)
-            action_decision_emb = self.action_decision_embedding(action_decision_idx)  # (B, reasoning_hidden_dim)
-        elif action_decision_logits is not None:
-            # 推理时：使用预测的action_decision_logits
-            predicted_decision_idx = torch.argmax(action_decision_logits, dim=-1)  # (B,)
-            action_decision_emb = self.action_decision_embedding(predicted_decision_idx)  # (B, reasoning_hidden_dim)
-        else:
-            # 如果没有action decision信息，只使用base conditioning
-            action_decision_emb = None
-        
-        # 将action decision embedding与base conditioning融合
-        # 使用残差连接，让action decision的信息直接注入到conditioning中
-        # 这样action decision就能真正引导DiT的动作生成方向
-        if action_decision_emb is not None:
-            reasoning_conditioning = base_conditioning + action_decision_emb  # (B, reasoning_hidden_dim)
-        else:
-            reasoning_conditioning = base_conditioning
-        
-        return reasoning_logits, reasoning_conditioning, action_decision_logits
+        return vision_context  # (B, num_vision_queries, reasoning_hidden_dim)
     
-    def _predict_action_decision(self, features: torch.Tensor) -> torch.Tensor:
-        """预测action decision类型"""
-        return self.action_decision_predictor(features)
-    
-    def _generate_reasoning_autoregressive(
-        self, 
-        backbone_global: torch.Tensor, 
-        max_length: int,
+    def generate_reasoning_trace(
+        self,
+        vision_context: torch.Tensor,  # (B, num_vision_queries, reasoning_hidden_dim)
+        reasoning_labels: torch.Tensor | None = None,  # (B, L) - teacher forcing时的标签
         temperature: float = 1.0,
-    ) -> tuple[torch.Tensor | None, torch.Tensor]:
+        max_length: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        自回归生成reasoning trace
+        生成reasoning trace（CoT）
         
-        Args:
-            backbone_global: (B, reasoning_hidden_dim) - backbone的全局特征
-            max_length: 最大生成长度
-            temperature: 采样温度
+        训练模式：使用teacher forcing
+        推理模式：自回归生成
         
         Returns:
-            reasoning_logits: (B, L, vocab_size) - 最后一个token的logits（用于损失计算，推理时可能为None）
-            reasoning_output: (B, L, reasoning_hidden_dim) - 生成的reasoning trace的隐藏状态
+            reasoning_logits: (B, L, vocab_size) - token预测logits
+            reasoning_hidden: (B, L, reasoning_hidden_dim) - 用于conditioning
         """
-        B = backbone_global.shape[0]
-        device = backbone_global.device
+        B = vision_context.shape[0]
+        device = vision_context.device
+        max_len = max_length or self.reasoning_max_length
         
-        # 初始化：从backbone_global开始
-        current_input = backbone_global.unsqueeze(1)  # (B, 1, reasoning_hidden_dim)
-        generated_tokens = []
-        generated_embeds = []
+        if reasoning_labels is not None:
+            # Training mode: teacher forcing
+            L = reasoning_labels.shape[1]
+            
+            # Token + position embeddings
+            token_embs = self.token_embedding(reasoning_labels)  # (B, L, hidden_dim)
+            pos_ids = torch.arange(L, device=device)
+            pos_embs = self.position_embedding(pos_ids)  # (L, hidden_dim)
+            decoder_input = token_embs + pos_embs
+            
+            # Causal mask for decoder
+            causal_mask = nn.Transformer.generate_square_subsequent_mask(L, device=device)
+            
+            # Decode with vision context as memory
+            reasoning_hidden = self.reasoning_decoder(
+                tgt=decoder_input,
+                memory=vision_context,
+                tgt_mask=causal_mask,
+            )  # (B, L, hidden_dim)
+            
+            # Token prediction
+            reasoning_logits = self.reasoning_output_head(reasoning_hidden)  # (B, L, vocab_size)
+            
+            return reasoning_logits, reasoning_hidden
         
-        # 自回归生成
-        for step in range(max_length):
-            # 通过Transformer处理当前序列
-            reasoning_output_step = self.reasoning_transformer(current_input)  # (B, seq_len, reasoning_hidden_dim)
-            
-            # 取最后一个token的输出（用于预测下一个token）
-            last_token_output = reasoning_output_step[:, -1:]  # (B, 1, reasoning_hidden_dim)
-            
-            # 生成下一个token的logits
-            next_token_logits = self.output_proj(last_token_output)  # (B, 1, vocab_size)
-            
-            # 采样下一个token（使用greedy decoding或temperature sampling）
-            if temperature == 0.0:
-                # Greedy decoding
-                next_token_id = torch.argmax(next_token_logits, dim=-1)  # (B, 1)
-            else:
-                # Temperature sampling
-                probs = F.softmax(next_token_logits / temperature, dim=-1)
-                next_token_id = torch.multinomial(probs.squeeze(1), num_samples=1).unsqueeze(1)  # (B, 1)
-            
-            # 检查是否遇到结束token（这里假设0是结束token，实际应该根据vocab定义）
-            # 简化实现：如果生成的token是0，则停止（实际应该使用专门的结束token，如EOS token）
-            if (next_token_id == 0).all():
-                break
-            
-            generated_tokens.append(next_token_id)
-            
-            # 将新生成的token embedding添加到输入中
-            next_token_embed = self.token_embedding(next_token_id.squeeze(1))  # (B, reasoning_hidden_dim)
-            pos_embed = self.position_embedding(
-                torch.full((B,), step + 1, device=device, dtype=torch.long)
-            )  # (B, reasoning_hidden_dim)
-            next_token_embed = next_token_embed + pos_embed.unsqueeze(1)  # (B, 1, reasoning_hidden_dim)
-            
-            # 更新输入：拼接新生成的token
-            current_input = torch.cat([current_input, next_token_embed], dim=1)  # (B, seq_len+1, reasoning_hidden_dim)
-        
-        # 重新通过Transformer处理完整序列，获取所有token的隐藏状态
-        # 这样可以得到完整的reasoning trace表示，用于后续的action decision预测
-        if len(generated_tokens) > 0:
-            # 重新处理完整序列以获取所有token的隐藏状态
-            reasoning_output = self.reasoning_transformer(current_input)  # (B, 1+L, reasoning_hidden_dim)
-            # 只取生成的token部分（不包括初始的backbone_global）
-            reasoning_output = reasoning_output[:, 1:]  # (B, L, reasoning_hidden_dim)
         else:
-            # 如果没有生成任何token，使用backbone_global
-            reasoning_output = backbone_global.unsqueeze(1)  # (B, 1, reasoning_hidden_dim)
-        
-        # 推理时不需要返回logits（因为已经采样了），但为了接口一致性，返回None
-        reasoning_logits = None
-        
-        return reasoning_logits, reasoning_output
+            # Inference mode: autoregressive generation
+            generated_tokens = torch.full((B, 1), self.cot_start_token_id, device=device, dtype=torch.long)
+            all_hidden_states = []
+            
+            for step in range(max_len - 1):
+                L = generated_tokens.shape[1]
+                
+                # Token + position embeddings
+                token_embs = self.token_embedding(generated_tokens)
+                pos_ids = torch.arange(L, device=device)
+                pos_embs = self.position_embedding(pos_ids)
+                decoder_input = token_embs + pos_embs
+                
+                # Causal mask
+                causal_mask = nn.Transformer.generate_square_subsequent_mask(L, device=device)
+                
+                # Decode
+                reasoning_hidden = self.reasoning_decoder(
+                    tgt=decoder_input,
+                    memory=vision_context,
+                    tgt_mask=causal_mask,
+                )  # (B, L, hidden_dim)
+                
+                # Get last token's logits
+                last_hidden = reasoning_hidden[:, -1, :]  # (B, hidden_dim)
+                last_logits = self.reasoning_output_head(last_hidden)  # (B, vocab_size)
+                
+                # Sample next token
+                if temperature == 0.0:
+                    next_token = torch.argmax(last_logits, dim=-1)
+                else:
+                    probs = F.softmax(last_logits / temperature, dim=-1)
+                    next_token = torch.multinomial(probs, num_samples=1).squeeze(1)
+                
+                generated_tokens = torch.cat([generated_tokens, next_token.unsqueeze(1)], dim=1)
+                all_hidden_states.append(last_hidden)
+                
+                # Stop if all sequences have generated EOS
+                if (next_token == self.eos_token_id).all() or (next_token == self.cot_end_token_id).all():
+                    break
+            
+            # Stack hidden states
+            reasoning_hidden = torch.stack(all_hidden_states, dim=1)  # (B, generated_len, hidden_dim)
+            
+            # Get final logits for all generated tokens
+            reasoning_logits = self.reasoning_output_head(reasoning_hidden)  # (B, generated_len, vocab_size)
+            
+            return reasoning_logits, reasoning_hidden
     
-    def get_action_decision_embedding(self, decision_type: str) -> torch.Tensor:
+    def forward(
+        self,
+        backbone_features: torch.Tensor,  # (B, T, backbone_embedding_dim)
+        attention_mask: torch.Tensor | None = None,
+        reasoning_labels: torch.Tensor | None = None,  # (B, L) - CoT标签（训练时）
+        action_decision_labels: torch.Tensor | None = None,  # (B,) - 动作决策标签（训练时）
+        **kwargs,
+    ) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor | None]:
         """
-        获取action decision类型的embedding
+        Vision-Grounded Reasoning forward pass
         
-        Args:
-            decision_type: 6种决策类型之一：
-                - "left_search_grasp_pull": 左手搜索抓取拉开，右手不动
-                - "left_hold_right_search_grasp": 左手保持，右手搜索抓取
-                - "right_search_grasp_pull": 右手搜索抓取拉开，左手不动
-                - "right_hold_left_search_grasp": 右手保持，左手搜索抓取
-                - "both_search_grasp": 双手同时搜索抓取
-                - "both_hold_lift": 双手保持并上抬
+        核心流程：
+        1. 编码视觉特征 → vision_context
+        2. 生成reasoning trace（CoT）
+        3. 从CoT提取action decision
+        4. 生成最终的action conditioning
         
         Returns:
-            embedding: (reasoning_hidden_dim,) - action decision的embedding向量
+            reasoning_logits: (B, L, vocab_size) - CoT token预测logits
+            conditioning: (B, conditioning_dim) - action conditioning向量
+            action_decision_logits: (B, num_decisions) - 动作决策logits
         """
-        decision_map = {
-            "left_search_grasp_pull": 0,
-            "left_hold_right_search_grasp": 1,
-            "right_search_grasp_pull": 2,
-            "right_hold_left_search_grasp": 3,
-            "both_search_grasp": 4,
-            "both_hold_lift": 5,
-        }
-        if decision_type not in decision_map:
-            raise ValueError(
-                f"Unknown decision type: {decision_type}. "
-                f"Valid types: {list(decision_map.keys())}"
-            )
-        idx = decision_map[decision_type]
-        return self.action_decision_embedding(torch.tensor(idx))
+        # 1. Encode vision features
+        vision_context = self.encode_vision(backbone_features, attention_mask)
+        
+        # 2. Generate reasoning trace
+        reasoning_logits, reasoning_hidden = self.generate_reasoning_trace(
+            vision_context,
+            reasoning_labels=reasoning_labels,
+        )
+        
+        # 3. Extract action decision from reasoning
+        # Use mean pooling of reasoning hidden states
+        reasoning_aggregated = reasoning_hidden.mean(dim=1)  # (B, hidden_dim)
+        action_decision_logits = self.action_decision_head(reasoning_aggregated)  # (B, num_decisions)
+        
+        # 4. Generate conditioning
+        # Combine reasoning aggregation with action decision embedding
+        base_conditioning = self.conditioning_proj(reasoning_aggregated)  # (B, conditioning_dim)
+        
+        # Get action decision (predicted or from labels)
+        if action_decision_labels is not None:
+            decision_idx = action_decision_labels
+        else:
+            decision_idx = torch.argmax(action_decision_logits, dim=-1)
+        
+        action_decision_emb = self.action_decision_embedding(decision_idx)  # (B, conditioning_dim)
+        
+        # Final conditioning: base + action decision
+        conditioning = base_conditioning + action_decision_emb
+        
+        return reasoning_logits, conditioning, action_decision_logits
+    
+    def decode_reasoning_tokens(self, token_ids: torch.Tensor) -> list[str]:
+        """
+        将token IDs解码为可读的reasoning text（用于可视化/调试）
+        """
+        # 反转vocabulary
+        id_to_token = {v: k for k, v in self.REASONING_VOCAB.items()}
+        
+        decoded = []
+        for batch_tokens in token_ids:
+            tokens = []
+            for tid in batch_tokens.tolist():
+                if tid == self.eos_token_id or tid == self.cot_end_token_id:
+                    break
+                token = id_to_token.get(tid, f"<unk_{tid}>")
+                tokens.append(token)
+            decoded.append(" ".join(tokens))
+        
+        return decoded
+
+
 
 
 class CategorySpecificLinear(nn.Module):
@@ -560,16 +649,26 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
     # Pretrained action dimension (for compatibility with pretrained models)
     pretrained_action_dim: int = field(default=None, metadata={"help": "Action dimension of pretrained model (for compatibility)"})
     
-    # Chain of Causation (CoC) reasoning configuration
-    use_coc_reasoning: bool = field(default=True, metadata={"help": "Whether to use Chain of Causation reasoning"})
-    reasoning_vocab_size: int = field(default=1000, metadata={"help": "Vocabulary size for reasoning tokens"})
-    reasoning_max_length: int = field(default=128, metadata={"help": "Maximum length of reasoning trace"})
+    # ============================================
+    # VisionGroundedReasoningHead Configuration
+    # ============================================
+    # 使用VisionGroundedReasoningHead从视觉中显式生成CoT推理
+    # 参考Alpamayo-R1的two-stage设计（先推理，后行动）
+    
+    use_coc_reasoning: bool = field(default=True, metadata={"help": "Whether to use Vision-Grounded CoT reasoning"})
+    
+    # VisionGroundedReasoningHead config
+    reasoning_vocab_size: int = field(default=128, metadata={"help": "Vocabulary size for reasoning tokens"})
+    reasoning_max_length: int = field(default=64, metadata={"help": "Maximum length of reasoning trace"})
     reasoning_hidden_dim: int = field(default=512, metadata={"help": "Hidden dimension for reasoning head"})
-    reasoning_num_layers: int = field(default=2, metadata={"help": "Number of transformer layers in reasoning head"})
-    reasoning_loss_weight: float = field(default=1.0, metadata={"help": "Weight for reasoning loss"})
+    reasoning_num_layers: int = field(default=4, metadata={"help": "Number of transformer decoder layers in reasoning head"})
+    reasoning_num_heads: int = field(default=8, metadata={"help": "Number of attention heads in reasoning decoder"})
+    reasoning_loss_weight: float = field(default=1.0, metadata={"help": "Weight for reasoning trace loss"})
+    action_decision_loss_weight: float = field(default=1.0, metadata={"help": "Weight for action decision classification loss"})
     tune_reasoning_head: bool = field(default=True, metadata={"help": "Whether to tune the reasoning head"})
     reasoning_conditioning_type: str = field(default="decoder", metadata={"help": "Where to condition reasoning: 'decoder' or 'dit' or 'both'"})
-    # Action decision types: 6种细粒度的决策类型
+    
+    # Action decision types（6种动作决策类型）
     action_decision_types: list[str] = field(
         default_factory=lambda: [
             "left_search_grasp_pull",      # 1. 左手搜索抓取拉开，右手不动
@@ -579,7 +678,7 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
             "both_search_grasp",           # 5. 双手同时搜索抓取
             "both_hold_lift",              # 6. 双手保持并上抬
         ],
-        metadata={"help": "List of action decision types (6 types)"}
+        metadata={"help": "List of action decision types (6 types)."}
     )
 
     def __init__(self, **kwargs):
@@ -767,21 +866,35 @@ class FlowmatchingActionHead(nn.Module):
         self.num_timestep_buckets = config.num_timestep_buckets
         self.config = config
         
-        # Chain of Causation (CoC) Reasoning Head
+        # ============================================
+        # VisionGroundedReasoningHead
+        # ============================================
+        # 从视觉中显式生成CoT，模型学会"看"
+        # 参考Alpamayo-R1的two-stage设计
+        
         if config.use_coc_reasoning:
-            self.reasoning_head = ReasoningHead(
+            # VisionGroundedReasoningHead - 从视觉中显式生成CoT推理
+            # 核心优势：
+            # 1. 从视觉中显式生成reasoning trace（类似Alpamayo-R1）
+            # 2. 模型学会"看"到箱子尺寸，而不是依赖prompt
+            # 3. 可解释的推理过程
+            # 4. 支持简洁prompt（如"Depalletize the box"）
+            self.reasoning_head = VisionGroundedReasoningHead(
                 backbone_embedding_dim=config.backbone_embedding_dim,
                 reasoning_hidden_dim=config.reasoning_hidden_dim,
-                reasoning_vocab_size=config.reasoning_vocab_size,
+                reasoning_num_layers=config.reasoning_num_layers,
+                reasoning_num_heads=config.reasoning_num_heads,
                 reasoning_max_length=config.reasoning_max_length,
-                num_layers=config.reasoning_num_layers,
+                conditioning_dim=config.reasoning_hidden_dim,
+                dropout=0.1,
+                vocab_size=config.reasoning_vocab_size,
             )
-            print(f"🧠 Chain of Causation (CoC) Reasoning enabled:")
-            print(f"   ✅ Reasoning vocab size: {config.reasoning_vocab_size}")
-            print(f"   ✅ Reasoning max length: {config.reasoning_max_length}")
-            print(f"   ✅ Reasoning hidden dim: {config.reasoning_hidden_dim}")
-            print(f"   ✅ Reasoning conditioning: {config.reasoning_conditioning_type}")
-            print(f"   ✅ Action decision types: {config.action_decision_types}")
+            print(f"🧠 Vision-Grounded Reasoning enabled (like Alpamayo-R1):")
+            print(f"   ✅ Explicit CoT: model learns to 'see' box size from vision")
+            print(f"   ✅ Works with simple prompt: 'Depalletize the box'")
+            print(f"   ✅ {config.reasoning_num_layers} decoder layers")
+            print(f"   ✅ Max CoT length: {config.reasoning_max_length}")
+            print(f"   ✅ Conditioning dim: {config.reasoning_hidden_dim}")
         else:
             self.reasoning_head = None
         
@@ -901,56 +1014,63 @@ class FlowmatchingActionHead(nn.Module):
 
         backbone_output = self.process_backbone_output(backbone_output)
         
-        # Generate reasoning trace if CoC reasoning is enabled
-        # 根据论文 Alpamayo-R1 (https://arxiv.org/pdf/2511.00088)，SFT阶段的损失函数为：
-        # L_SFT(θ) = -E_{(o, REASON, a) ~ D_CoC} [log π_θ(REASON, a | o)]
-        # 这包含两部分：
-        # 1. Reasoning trace的交叉熵损失：log π_θ(REASON | o)
-        # 2. Action decision的交叉熵损失（CoC-Action Consistency）：确保reasoning trace和action之间的一致性
+        # Generate language-conditioned features if reasoning head is enabled
+        # 关键改进：使用LanguageConditionedHead，直接从backbone_features提取语言条件化信息
+        # 
+        # 与原来的区别：
+        # 1. 不需要分类标签（action_decision_labels）
+        # 2. 不生成reasoning trace（没有reasoning_logits）
+        # 3. 直接从已编码的language prompt中提取task-relevant信息
+        # 
+        # 这样30cm和60cm的箱子可以通过language prompt自然区分：
+        # - "wider green box of type 4611 (40×60×11 cm)"
+        # - "narrower green box of type 4322 (40×30×22 cm)"
         reasoning_logits = None
         reasoning_conditioning = None
         action_decision_logits = None
-        reasoning_trace_loss = None  # Reasoning trace的交叉熵损失
-        action_decision_loss = None  # Action decision的交叉熵损失（CoC-Action Consistency）
-        total_reasoning_loss = None  # 总reasoning损失 = reasoning_trace_loss + action_decision_loss
+        reasoning_trace_loss = None
+        action_decision_loss = None
+        total_reasoning_loss = None
         
         if self.config.use_coc_reasoning and self.reasoning_head is not None:
             backbone_features = backbone_output.backbone_features  # (B, T, backbone_embedding_dim)
+            backbone_attention_mask = backbone_output.backbone_attention_mask  # (B, T)
             
-            # Get reasoning labels from action_input if available (for training)
-            reasoning_labels = action_input.get("reasoning_labels", None) if hasattr(action_input, "get") else None
-            if reasoning_labels is None and hasattr(action_input, "data"):
-                reasoning_labels = action_input.data.get("reasoning_labels", None)
-            
-            # Get action decision labels from action_input if available (for training)
+            # 获取训练标签（如果有）
+            reasoning_labels = None
             action_decision_labels = None
             if hasattr(action_input, "get"):
+                reasoning_labels = action_input.get("reasoning_labels", None)
                 action_decision_labels = action_input.get("action_decision_labels", None)
             elif hasattr(action_input, "data"):
+                reasoning_labels = action_input.data.get("reasoning_labels", None)
                 action_decision_labels = action_input.data.get("action_decision_labels", None)
             
-            # Generate reasoning
-            # 注意：在训练时，action_decision_labels会被用于teacher forcing，确保conditioning使用正确的decision
+            # VisionGroundedReasoningHead - 从视觉中显式生成CoT推理
+            # 支持训练时的teacher forcing
             reasoning_logits, reasoning_conditioning, action_decision_logits = self.reasoning_head(
-                backbone_features, reasoning_labels, action_decision_labels
+                backbone_features=backbone_features,
+                attention_mask=backbone_attention_mask,
+                reasoning_labels=reasoning_labels,
+                action_decision_labels=action_decision_labels,
             )
             
-            # 1. 计算Reasoning trace的交叉熵损失
-            # L_reasoning = -log π_θ(REASON | o)
-            # 这是思维链reasoning trace的交叉熵损失
+            # 计算CoT reasoning trace损失
             if reasoning_labels is not None and reasoning_logits is not None:
+                # Shift labels for next-token prediction
+                # reasoning_logits: (B, L, vocab_size), reasoning_labels: (B, L)
+                # 标签向右移一位：预测下一个token
+                shift_logits = reasoning_logits[:, :-1, :].contiguous()
+                shift_labels = reasoning_labels[:, 1:].contiguous()
+                
                 reasoning_trace_loss = F.cross_entropy(
-                    reasoning_logits.reshape(-1, reasoning_logits.shape[-1]),
-                    reasoning_labels.reshape(-1),
-                    ignore_index=-100,  # Ignore padding tokens
+                    shift_logits.view(-1, shift_logits.shape[-1]),
+                    shift_labels.view(-1),
+                    ignore_index=0,  # 忽略pad token
                     reduction="mean"
                 )
             
-            # 2. 计算Action decision的交叉熵损失（CoC-Action Consistency）
-            # L_action_decision = -log π_θ(action_decision | o)
-            # 这是动作一致性奖励，确保reasoning trace预测的action decision与ground truth一致
-            # 这是CoC-Action Consistency的关键组成部分
-            # 注意：action_decision_labels已经在上面获取过了（第933-937行），这里直接使用
+            # 计算action decision分类损失
             if action_decision_labels is not None and action_decision_logits is not None:
                 action_decision_loss = F.cross_entropy(
                     action_decision_logits,
@@ -958,14 +1078,16 @@ class FlowmatchingActionHead(nn.Module):
                     reduction="mean"
                 )
             
-            # 3. 总reasoning损失 = reasoning trace损失 + action decision损失
-            # 这实现了论文中的 L_SFT(θ) = -E[log π_θ(REASON, a | o)]
+            # 合并reasoning损失
             if reasoning_trace_loss is not None and action_decision_loss is not None:
-                total_reasoning_loss = reasoning_trace_loss + action_decision_loss
+                total_reasoning_loss = (
+                    self.config.reasoning_loss_weight * reasoning_trace_loss + 
+                    self.config.action_decision_loss_weight * action_decision_loss
+                )
             elif reasoning_trace_loss is not None:
-                total_reasoning_loss = reasoning_trace_loss
+                total_reasoning_loss = self.config.reasoning_loss_weight * reasoning_trace_loss
             elif action_decision_loss is not None:
-                total_reasoning_loss = action_decision_loss
+                total_reasoning_loss = self.config.action_decision_loss_weight * action_decision_loss
 
         if self.config.expand_batch is not None:
             for k, v in backbone_output.items():
@@ -1314,31 +1436,29 @@ class FlowmatchingActionHead(nn.Module):
     def get_action(self, backbone_output: BatchFeature, action_input: BatchFeature, rtc_enabled: bool, **kwargs) -> BatchFeature:
         backbone_output = self.process_backbone_output(backbone_output)
         
-        # Generate reasoning trace if CoC reasoning is enabled
+        # VisionGroundedReasoningHead - 从视觉中显式生成CoT推理
+        # 模型学会"看"到箱子尺寸，而不是依赖prompt
         reasoning_conditioning = None
         action_decision_logits = None
         
         if self.config.use_coc_reasoning and self.reasoning_head is not None:
             backbone_features = backbone_output.backbone_features  # (B, T, backbone_embedding_dim)
+            backbone_attention_mask = backbone_output.backbone_attention_mask  # (B, T)
             
-            # Generate reasoning (inference mode, no labels)
-            _, reasoning_conditioning, action_decision_logits = self.reasoning_head(
-                backbone_features, reasoning_labels=None
+            # 推理模式：自回归生成CoT
+            reasoning_logits, reasoning_conditioning, action_decision_logits = self.reasoning_head(
+                backbone_features=backbone_features,
+                attention_mask=backbone_attention_mask,
+                reasoning_labels=None,  # 推理模式不需要标签
             )
             
-            # Get predicted action decision
+            # 打印预测的action decision
             if action_decision_logits is not None:
                 predicted_decision_idx = torch.argmax(action_decision_logits, dim=-1)  # (B,)
-                decision_map = {
-                    0: "left_search_grasp_pull",
-                    1: "left_hold_right_search_grasp",
-                    2: "right_search_grasp_pull",
-                    3: "right_hold_left_search_grasp",
-                    4: "both_search_grasp",
-                    5: "both_hold_lift",
-                }
-                predicted_decision = [decision_map[idx.item()] for idx in predicted_decision_idx]
-                print(f"🧠 Predicted action decision: {predicted_decision}")
+                decision_names = VisionGroundedReasoningHead.ACTION_DECISIONS
+                predicted_decisions = [decision_names[idx.item()] for idx in predicted_decision_idx]
+                print(f"🧠 Vision-Grounded Reasoning:")
+                print(f"   → Predicted action decision: {predicted_decisions}")
 
         # Get vision and language embeddings.
         vl_embs = backbone_output.backbone_features

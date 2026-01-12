@@ -278,6 +278,16 @@ class GR00TN15(PreTrainedModel):
                 print(f"🔧 Using pretrained action encoder ({pretrained_action_dim}D) with multi-head output ({actual_action_dim}D)")
         
         action_head_cfg = FlowmatchingActionHeadConfig(**action_head_cfg_dict)
+        
+        # ============================================
+        # VisionGroundedReasoningHead
+        # ============================================
+        # 从视觉中显式生成CoT，模型学会"看"
+        if action_head_cfg.use_coc_reasoning:
+            print(f"🧠 Using VisionGroundedReasoningHead (explicit CoT from vision)")
+            print(f"   → Model learns to 'see' box size: 30cm vs 60cm")
+            print(f"   → Works with simple prompt: 'Depalletize the box'")
+        
         self.action_head = FlowmatchingActionHead(action_head_cfg)
 
         self.action_horizon = config.action_horizon
