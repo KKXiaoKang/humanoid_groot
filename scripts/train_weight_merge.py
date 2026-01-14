@@ -792,16 +792,75 @@ def run_dare_merge(args):
     print(f"\n✅ DARE merged model saved to {output_path}")
 
 
+def run_two_stage_merge(args):
+    """
+    运行两阶段融合（推荐方法）⭐
+    
+    基于 kai0 Model Arithmetic 的思想：
+    https://mmlab.hk/research/kai0
+    
+    阶段 1: 融合 backbone（简单插值）
+    阶段 2: 训练分布适配层（使用 action loss）
+    
+    这种方法解决了：
+    1. action_head (DiT) 对参数敏感不能直接融合的问题
+    2. 只融合 backbone 导致输入分布漂移的问题
+    """
+    from lerobot.policies.groot.weight_merge_groot import TwoStageExpertMerger
+    
+    print(f"\n{'='*60}")
+    print(f"⭐ Two-Stage Adapter Merge (kai0 style)")
+    print(f"   基于 https://mmlab.hk/research/kai0 的 Model Arithmetic 方法")
+    print(f"{'='*60}")
+    print(f"\n📋 方法说明：")
+    print(f"   阶段 1: 融合 backbone (插值比例 α={args.alpha})")
+    print(f"   阶段 2: 训练分布适配层 (使用 action loss)")
+    print(f"   这样可以解决 action_head 对参数敏感的问题！")
+    print(f"\n")
+    
+    # 创建两阶段融合器
+    merger = TwoStageExpertMerger(
+        narrower_path=args.narrower_path,
+        wider_path=args.wider_path,
+        alpha=args.alpha,
+        adapter_type=args.adapter_type,
+        device=args.device,
+    )
+    
+    # 阶段 1: 加载并融合
+    merger.load_and_merge()
+    
+    # 创建数据加载器
+    data_paths = args.data_path.split(",") if args.data_path else None
+    
+    dataloader = create_calibration_dataloader(
+        data_paths=data_paths,
+        batch_size=args.batch_size,
+        num_samples=args.num_samples,
+        use_default_datasets=args.use_default_datasets,
+    )
+    
+    # 阶段 2: 训练适配层
+    merger.train_adapter(
+        train_dataloader=dataloader,
+        num_epochs=args.adapter_epochs,
+        learning_rate=args.adapter_lr,
+    )
+    
+    # 保存
+    merger.save(args.output_path)
+
+
 def main():
     parser = argparse.ArgumentParser(description="GROOT Model Weight Merging")
     
-    # 融合方法 - 默认使用 expert_merge（效果最好）
+    # 融合方法 - 默认使用 two_stage_adapter（效果最好）⭐
     parser.add_argument(
         "--method", 
         type=str, 
-        default="expert_merge",  # 默认使用 Expert Merging
-        choices=["expert_merge", "task_arithmetic", "interpolation", "ties", "dare"],
-        help="Merge method: expert_merge (best, default), task_arithmetic, "
+        default="two_stage_adapter",  # 默认使用两阶段融合
+        choices=["two_stage_adapter", "expert_merge", "task_arithmetic", "interpolation", "ties", "dare"],
+        help="Merge method: two_stage_adapter (best, default), expert_merge, task_arithmetic, "
              "interpolation (simplest), ties, dare"
     )
     
@@ -874,6 +933,16 @@ def main():
     parser.add_argument("--dare_drop_rate", type=float, default=0.1,
                        help="DARE drop rate")
     
+    # Two-Stage Adapter 参数 ⭐ 新增
+    parser.add_argument("--adapter_type", type=str, default="linear",
+                       choices=["linear", "mlp", "layernorm_only"],
+                       help="Distribution adapter type: linear (default, lightweight), "
+                            "mlp (more capacity), layernorm_only (simplest)")
+    parser.add_argument("--adapter_epochs", type=int, default=20,
+                       help="Number of epochs to train the distribution adapter")
+    parser.add_argument("--adapter_lr", type=float, default=1e-4,
+                       help="Learning rate for adapter training")
+    
     # 设备
     parser.add_argument("--device", type=str, default="cuda:0",
                        help="Device for training")
@@ -888,7 +957,9 @@ def main():
     print(f"   Output: {args.output_path}")
     print(f"{'='*60}\n")
     
-    if args.method == "task_arithmetic":
+    if args.method == "two_stage_adapter":
+        run_two_stage_merge(args)
+    elif args.method == "task_arithmetic":
         run_task_arithmetic_merge(args)
     elif args.method == "interpolation":
         run_interpolation_merge(args)

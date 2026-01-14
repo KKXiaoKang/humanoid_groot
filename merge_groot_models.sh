@@ -3,30 +3,32 @@
 # GROOT 模型权重融合快速脚本
 #
 # 使用方式：
-#   ./merge_groot_models.sh                   # 默认使用 Expert Merging（效果最好）⭐
-#   ./merge_groot_models.sh expert_merge      # Expert Merging（效果最好，使用训练数据校准）
-#   ./merge_groot_models.sh expert_merge 0    # 指定使用 GPU 0
-#   ./merge_groot_models.sh expert_merge 0,1  # 指定使用 GPU 0 和 1（通过 CUDA_VISIBLE_DEVICES）
-#   ./merge_groot_models.sh task_arithmetic   # Task Arithmetic 融合（无需训练，快速）
-#   ./merge_groot_models.sh ties              # TIES 融合
-#   ./merge_groot_models.sh dare              # DARE 融合
-#   ./merge_groot_models.sh interpolation     # 直接插值（最简单）
+#   ./merge_groot_models.sh                      # 默认使用 Two-Stage Adapter（效果最好）⭐
+#   ./merge_groot_models.sh two_stage_adapter    # Two-Stage Adapter（推荐，解决分布漂移）⭐
+#   ./merge_groot_models.sh two_stage_adapter 4  # 指定使用 GPU 4
+#   ./merge_groot_models.sh expert_merge         # Expert Merging（使用训练数据校准）
+#   ./merge_groot_models.sh task_arithmetic      # Task Arithmetic 融合（无需训练，快速）
+#   ./merge_groot_models.sh ties                 # TIES 融合
+#   ./merge_groot_models.sh dare                 # DARE 融合
+#   ./merge_groot_models.sh interpolation        # 直接插值（最简单）
 #
 # GPU 控制：
 #   可以通过第二个参数指定 GPU：
-#   - 单个 GPU: ./merge_groot_models.sh expert_merge 0
-#   - 多个 GPU: ./merge_groot_models.sh expert_merge 0,1  (使用 CUDA_VISIBLE_DEVICES)
+#   - 单个 GPU: ./merge_groot_models.sh two_stage_adapter 0
+#   - 多个 GPU: ./merge_groot_models.sh two_stage_adapter 0,1  (使用 CUDA_VISIBLE_DEVICES)
 #   - 默认: 使用 cuda:0
 #
-# 校准数据说明：
-#   Expert Merging 需要少量校准数据（5-10个样本），可以使用原始训练数据集！
-#   默认会自动使用 lerobot_data 文件夹中的数据集
+# ⭐ 推荐方法：two_stage_adapter
+#   基于 kai0 Model Arithmetic 方法 (https://mmlab.hk/research/kai0)
+#   阶段 1: 融合 backbone（简单插值）
+#   阶段 2: 训练分布适配层（使用 action loss）
+#   这种方法解决了 action_head (DiT) 对参数敏感的问题！
 #
 
 set -e
 
-# 默认方法改为 expert_merge（效果最好）
-METHOD=${1:-expert_merge}
+# 默认方法改为 two_stage_adapter（效果最好）⭐
+METHOD=${1:-two_stage_adapter}
 
 # 模型路径
 NARROWER_PATH="/home/kangkk/humanoid_groot_base/outputs/0112_h100x4_groot_cross_attention_narrower_very_conservative/checkpoints/020000/pretrained_model"
@@ -73,9 +75,40 @@ fi
 echo "======================================"
 
 case $METHOD in
+    two_stage_adapter)
+        # ⭐ 推荐方法 - 基于 kai0 Model Arithmetic
+        # https://mmlab.hk/research/kai0
+        echo "使用 Two-Stage Adapter 方法（推荐，解决分布漂移问题）⭐..."
+        echo ""
+        echo "📋 方法说明（基于 kai0 Model Arithmetic）："
+        echo "   阶段 1: 融合 backbone (50% narrower + 50% wider)"
+        echo "   阶段 2: 训练分布适配层 (使用 action loss)"
+        echo ""
+        echo "✅ 优势："
+        echo "   - 解决 action_head (DiT) 对参数敏感的问题"
+        echo "   - 解决只融合 backbone 导致的分布漂移问题"
+        echo "   - 适配层轻量级，只有约 1M 参数"
+        echo ""
+        echo "📚 校准数据：将使用 lerobot_data/split_dataset 文件夹中的训练数据集"
+        echo ""
+        python scripts/train_weight_merge.py \
+            --method two_stage_adapter \
+            --narrower_path "$NARROWER_PATH" \
+            --wider_path "$WIDER_PATH" \
+            --use_default_datasets \
+            --alpha 0.5 \
+            --adapter_type linear \
+            --adapter_epochs 20 \
+            --adapter_lr 1e-4 \
+            --num_samples 20 \
+            --batch_size 1 \
+            --device "$DEVICE" \
+            --output_path "$OUTPUT_PATH"
+        ;;
+    
     expert_merge)
-        # ⭐ 默认方法 - 基于论文 "Expert Merging" (arXiv:2509.25712)
-        echo "使用 Expert Merging 方法（基于论文推荐参数）⭐..."
+        # 基于论文 "Expert Merging" (arXiv:2509.25712)
+        echo "使用 Expert Merging 方法（基于论文推荐参数）..."
         echo ""
         echo "📚 校准数据：将使用 lerobot_data/split_dataset 文件夹中的训练数据集"
         echo "   - 窄箱子数据集 (narrower): four, random, dense, mix"
@@ -171,7 +204,7 @@ case $METHOD in
     
     *)
         echo "未知方法: $METHOD"
-        echo "可用方法: task_arithmetic, ties, dare, expert_merge, interpolation"
+        echo "可用方法: two_stage_adapter (推荐⭐), expert_merge, task_arithmetic, ties, dare, interpolation"
         exit 1
         ;;
 esac

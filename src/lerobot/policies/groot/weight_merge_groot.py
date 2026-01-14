@@ -1189,6 +1189,491 @@ class ExpertMerger:
 
 
 # ============================================================
+# 分布适配层 (Distribution Adapter)
+# ============================================================
+# 
+# 基于 kai0 Model Arithmetic 方法的思想：
+# https://mmlab.hk/research/kai0
+# 
+# 问题：融合 backbone 后，输出分布发生漂移，导致 action_head 崩溃
+# 解决：在 backbone 和 action_head 之间插入一个轻量级适配层
+# 
+# 架构：
+# backbone_merged → [DistributionAdapter] → action_head_narrower → action
+#                          ↑
+#                   只训练这一层！
+
+class DistributionAdapter(nn.Module):
+    """
+    分布适配层：将融合后的 backbone 输出分布映射回 action_head 期望的分布
+    
+    参考 kai0 的 Model Arithmetic 方法，使用 on-policy loss 优化适配层
+    """
+    
+    def __init__(
+        self,
+        hidden_size: int = 1024,
+        adapter_type: str = "linear",  # "linear", "mlp", "layernorm_only"
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.adapter_type = adapter_type
+        
+        if adapter_type == "linear":
+            # 简单线性变换 + LayerNorm（最轻量）
+            self.adapter = nn.Sequential(
+                nn.Linear(hidden_size, hidden_size, bias=True),
+                nn.LayerNorm(hidden_size),
+            )
+            # 初始化为接近恒等映射
+            nn.init.eye_(self.adapter[0].weight)
+            nn.init.zeros_(self.adapter[0].bias)
+            
+        elif adapter_type == "mlp":
+            # 两层 MLP（更强表达能力）
+            self.adapter = nn.Sequential(
+                nn.Linear(hidden_size, hidden_size * 2),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_size * 2, hidden_size),
+                nn.LayerNorm(hidden_size),
+            )
+            # 初始化最后一层接近零（残差风格）
+            nn.init.zeros_(self.adapter[-2].weight)
+            nn.init.zeros_(self.adapter[-2].bias)
+            
+        elif adapter_type == "layernorm_only":
+            # 只用 LayerNorm（最简单）
+            self.adapter = nn.LayerNorm(hidden_size)
+            
+        else:
+            raise ValueError(f"Unknown adapter type: {adapter_type}")
+        
+        # 残差连接的系数（可学习）
+        self.residual_scale = nn.Parameter(torch.ones(1))
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: backbone 输出 [B, T, hidden_size]
+        Returns:
+            适配后的特征 [B, T, hidden_size]
+        """
+        if self.adapter_type == "mlp":
+            # 残差连接
+            return x + self.residual_scale * self.adapter(x)
+        else:
+            return self.adapter(x)
+
+
+class MergedModelWithAdapter(nn.Module):
+    """
+    带适配层的融合模型
+    
+    结构：
+    - backbone: 融合后的 backbone（冻结）
+    - adapter: 分布适配层（可训练）
+    - action_head: narrower 的 action_head（冻结）
+    """
+    
+    def __init__(
+        self,
+        merged_backbone_state_dict: dict,
+        narrower_action_head_state_dict: dict,
+        base_model: GR00TN15,
+        adapter_type: str = "linear",
+        hidden_size: int = 1024,
+    ):
+        super().__init__()
+        
+        # 1. 创建模型结构（使用 base_model 的架构）
+        self.model = copy.deepcopy(base_model)
+        
+        # 2. 加载融合后的 backbone 权重
+        backbone_keys = [k for k in merged_backbone_state_dict.keys() if k.startswith('backbone.')]
+        backbone_state = {k: merged_backbone_state_dict[k] for k in backbone_keys}
+        self.model.load_state_dict(backbone_state, strict=False)
+        
+        # 3. 加载 narrower 的 action_head 权重
+        action_head_keys = [k for k in narrower_action_head_state_dict.keys() if k.startswith('action_head.')]
+        action_head_state = {k: narrower_action_head_state_dict[k] for k in action_head_keys}
+        self.model.load_state_dict(action_head_state, strict=False)
+        
+        # 4. 冻结所有参数
+        for param in self.model.parameters():
+            param.requires_grad = False
+        
+        # 5. 创建适配层（可训练）
+        self.adapter = DistributionAdapter(
+            hidden_size=hidden_size,
+            adapter_type=adapter_type,
+        )
+        
+        print(f"✅ MergedModelWithAdapter initialized")
+        print(f"   Adapter type: {adapter_type}")
+        print(f"   Adapter params: {sum(p.numel() for p in self.adapter.parameters()):,}")
+    
+    def forward(self, inputs: dict) -> dict:
+        """
+        前向传播（用于训练适配层）
+        """
+        # 1. 通过 backbone
+        backbone_inputs, action_inputs = self.model.prepare_input(inputs)
+        backbone_outputs = self.model.backbone(backbone_inputs)
+        
+        # 2. 通过适配层
+        backbone_features = backbone_outputs[BACKBONE_FEATURE_KEY]
+        adapted_features = self.adapter(backbone_features)
+        backbone_outputs[BACKBONE_FEATURE_KEY] = adapted_features
+        
+        # 3. 通过 action_head
+        action_outputs = self.model.action_head(backbone_outputs, action_inputs)
+        
+        return action_outputs
+    
+    def get_action(self, inputs: dict, **kwargs) -> dict:
+        """
+        推理时获取动作
+        """
+        # 1. 通过 backbone
+        backbone_inputs, action_inputs = self.model.prepare_input(inputs)
+        backbone_outputs = self.model.backbone(backbone_inputs)
+        
+        # 2. 通过适配层
+        backbone_features = backbone_outputs[BACKBONE_FEATURE_KEY]
+        adapted_features = self.adapter(backbone_features)
+        backbone_outputs[BACKBONE_FEATURE_KEY] = adapted_features
+        
+        # 3. 通过 action_head (推理模式)
+        action_outputs = self.model.action_head.get_action(backbone_outputs, action_inputs, **kwargs)
+        
+        return action_outputs
+
+
+class TwoStageExpertMerger:
+    """
+    两阶段融合器（推荐方法）⭐
+    
+    基于 kai0 Model Arithmetic 的思想：
+    https://mmlab.hk/research/kai0
+    
+    阶段 1: 融合 backbone（使用 Expert Merging 或 Task Arithmetic）
+    阶段 2: 训练分布适配层（使用 action loss）
+    
+    这种方法解决了：
+    1. action_head (DiT) 对参数敏感不能直接融合的问题
+    2. 只融合 backbone 导致输入分布漂移的问题
+    """
+    
+    def __init__(
+        self,
+        narrower_path: str,
+        wider_path: str,
+        base_model_path: str = None,
+        merge_method: str = "interpolation",  # "interpolation", "task_arithmetic"
+        alpha: float = 0.5,  # 融合系数
+        adapter_type: str = "linear",  # "linear", "mlp", "layernorm_only"
+        device: str = "cuda:0",
+    ):
+        self.narrower_path = narrower_path
+        self.wider_path = wider_path
+        self.base_model_path = base_model_path or narrower_path
+        self.merge_method = merge_method
+        self.alpha = alpha
+        self.adapter_type = adapter_type
+        self.device = torch.device(device)
+        
+        self.merged_model = None
+        self.preprocessor = None
+        self.postprocessor = None
+    
+    def load_and_merge(self):
+        """
+        阶段 1：加载模型并融合 backbone
+        """
+        print(f"\n{'='*60}")
+        print(f"🚀 Two-Stage Expert Merging (kai0 style)")
+        print(f"   Stage 1: Merge backbone ({self.merge_method})")
+        print(f"   Stage 2: Train distribution adapter")
+        print(f"{'='*60}\n")
+        
+        # 加载权重
+        def load_weights(path: str) -> dict:
+            path = Path(path)
+            safetensors_files = glob.glob(str(path / "model*.safetensors"))
+            state_dict = {}
+            for f in sorted(safetensors_files):
+                state_dict.update(load_file(f))
+            return state_dict
+        
+        narrower_state_dict = load_weights(self.narrower_path)
+        wider_state_dict = load_weights(self.wider_path)
+        
+        print(f"✅ Loaded weights")
+        print(f"   Narrower: {len(narrower_state_dict)} tensors")
+        print(f"   Wider: {len(wider_state_dict)} tensors")
+        
+        # 融合 backbone
+        merged_state_dict = {}
+        backbone_count = 0
+        action_head_count = 0
+        
+        for k in narrower_state_dict:
+            if k.startswith('backbone.'):
+                # 融合 backbone
+                if k in wider_state_dict:
+                    merged_state_dict[k] = (
+                        self.alpha * narrower_state_dict[k] + 
+                        (1 - self.alpha) * wider_state_dict[k]
+                    )
+                else:
+                    merged_state_dict[k] = narrower_state_dict[k]
+                backbone_count += 1
+            elif k.startswith('action_head.'):
+                # 保留 narrower 的 action_head
+                merged_state_dict[k] = narrower_state_dict[k]
+                action_head_count += 1
+            else:
+                merged_state_dict[k] = narrower_state_dict[k]
+        
+        print(f"\n📊 Stage 1 完成: Backbone 融合")
+        print(f"   Backbone 层: {backbone_count} (融合比例 {self.alpha:.1%} narrower + {1-self.alpha:.1%} wider)")
+        print(f"   Action head 层: {action_head_count} (使用 narrower)")
+        
+        # 加载 base 模型结构
+        from lerobot.policies.groot.modeling_groot import GrootPolicy
+        policy = GrootPolicy.from_pretrained(Path(self.narrower_path), strict=False)
+        base_model = policy._groot_model
+        
+        # 获取 hidden_size
+        # 从配置或推断
+        hidden_size = 1024  # GROOT 默认值
+        
+        # 创建带适配层的模型
+        self.merged_model = MergedModelWithAdapter(
+            merged_backbone_state_dict=merged_state_dict,
+            narrower_action_head_state_dict=narrower_state_dict,
+            base_model=base_model,
+            adapter_type=self.adapter_type,
+            hidden_size=hidden_size,
+        ).to(self.device)
+        
+        # 加载预处理器
+        self._load_processors(self.narrower_path)
+        
+        print(f"\n✅ Stage 1 完成，准备进行 Stage 2: 训练适配层")
+    
+    def _load_processors(self, model_path: str):
+        """加载预处理器和后处理器"""
+        from lerobot.policies.factory import make_pre_post_processors
+        from lerobot.configs.policies import PreTrainedConfig
+        
+        try:
+            config = PreTrainedConfig.from_pretrained(model_path)
+            self.preprocessor, self.postprocessor = make_pre_post_processors(
+                policy_cfg=config,
+                pretrained_path=model_path,
+                preprocessor_overrides={
+                    "device_processor": {"device": str(self.device)},
+                },
+            )
+            print(f"   ✅ Preprocessor and postprocessor loaded")
+        except Exception as e:
+            print(f"   ⚠️  Warning: Failed to load processors: {e}")
+    
+    def train_adapter(
+        self,
+        train_dataloader,
+        num_epochs: int = 20,
+        learning_rate: float = 1e-4,
+    ):
+        """
+        阶段 2：训练分布适配层
+        
+        使用 action loss（真实 action 与预测 action 的 MSE）
+        这是 kai0 Model Arithmetic 的核心思想：使用 on-policy loss 优化
+        """
+        print(f"\n{'='*60}")
+        print(f"🏋️ Stage 2: Training Distribution Adapter")
+        print(f"   Epochs: {num_epochs}")
+        print(f"   Learning rate: {learning_rate}")
+        print(f"   Optimizer: AdamW")
+        print(f"{'='*60}\n")
+        
+        # 只优化适配层
+        optimizer = torch.optim.AdamW(
+            self.merged_model.adapter.parameters(),
+            lr=learning_rate,
+            weight_decay=1e-4,
+        )
+        
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=num_epochs
+        )
+        
+        self.merged_model.train()
+        
+        for epoch in range(num_epochs):
+            epoch_losses = []
+            
+            for batch_idx, batch in enumerate(train_dataloader):
+                optimizer.zero_grad()
+                
+                # 准备输入
+                observation = self._prepare_observation(batch)
+                
+                # 使用预处理器
+                if self.preprocessor is not None:
+                    try:
+                        inputs = self.preprocessor(observation)
+                        inputs = self._to_device(inputs)
+                    except Exception as e:
+                        print(f"   ⚠️ Preprocessor failed: {e}")
+                        continue
+                else:
+                    inputs = self._to_device(observation)
+                
+                # 前向传播
+                try:
+                    outputs = self.merged_model(inputs)
+                except Exception as e:
+                    print(f"   ⚠️ Forward failed: {e}")
+                    continue
+                
+                # 计算 action loss
+                if 'loss' in outputs:
+                    loss = outputs['loss']
+                else:
+                    # 如果没有内置 loss，计算 MSE
+                    if 'action_pred' in outputs and 'action' in inputs:
+                        pred_action = outputs['action_pred']
+                        target_action = inputs['action']
+                        loss = F.mse_loss(pred_action, target_action)
+                    else:
+                        print(f"   ⚠️ Cannot compute loss, skipping batch")
+                        continue
+                
+                # 检查 NaN
+                if not torch.isfinite(loss):
+                    print(f"   ⚠️ Non-finite loss: {loss.item()}")
+                    continue
+                
+                # 反向传播
+                loss.backward()
+                
+                # 梯度裁剪
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    self.merged_model.adapter.parameters(),
+                    max_norm=1.0,
+                )
+                
+                optimizer.step()
+                epoch_losses.append(loss.item())
+                
+                if batch_idx % 10 == 0:
+                    print(f"   Epoch {epoch+1}/{num_epochs}, Batch {batch_idx}: "
+                          f"loss = {loss.item():.4f}, grad_norm = {grad_norm:.4f}")
+            
+            scheduler.step()
+            
+            if epoch_losses:
+                avg_loss = sum(epoch_losses) / len(epoch_losses)
+                print(f"\n📊 Epoch {epoch+1}/{num_epochs}: avg_loss = {avg_loss:.4f}")
+        
+        print(f"\n✅ Stage 2 完成: 适配层训练完成")
+    
+    def _prepare_observation(self, batch: dict) -> dict:
+        """将 LeRobot batch 转换为观测格式"""
+        observation = {}
+        
+        for key, value in batch.items():
+            if key.startswith('observation'):
+                if isinstance(value, torch.Tensor):
+                    observation[key] = value.to(self.device)
+                else:
+                    observation[key] = value
+        
+        # 处理 task
+        if 'task' in batch:
+            task_value = batch['task']
+            if isinstance(task_value, (list, tuple)) and len(task_value) > 0:
+                observation['task'] = task_value[0]
+            elif isinstance(task_value, str):
+                observation['task'] = task_value
+            else:
+                observation['task'] = "Depalletize the box"
+        else:
+            observation['task'] = "Depalletize the box"
+        
+        # 添加 action（用于计算 loss）
+        if 'action' in batch:
+            observation['action'] = batch['action'].to(self.device)
+        
+        return observation
+    
+    def _to_device(self, inputs: dict) -> dict:
+        """将输入移动到设备"""
+        result = {}
+        for key, value in inputs.items():
+            if isinstance(value, torch.Tensor):
+                result[key] = value.to(self.device)
+            elif isinstance(value, dict):
+                result[key] = self._to_device(value)
+            else:
+                result[key] = value
+        return result
+    
+    def save(self, output_path: str):
+        """保存融合后的模型（包含适配层）"""
+        output_path = Path(output_path)
+        output_path.mkdir(parents=True, exist_ok=True)
+        
+        # 获取完整的 state_dict
+        state_dict = self.merged_model.model.state_dict()
+        
+        # 添加适配层权重（使用特殊前缀）
+        adapter_state = self.merged_model.adapter.state_dict()
+        for k, v in adapter_state.items():
+            state_dict[f"distribution_adapter.{k}"] = v
+        
+        # 克隆以处理共享内存
+        state_dict_cloned = {k: v.clone().contiguous() for k, v in state_dict.items()}
+        
+        save_file(state_dict_cloned, str(output_path / "model.safetensors"))
+        
+        # 复制配置文件
+        import shutil
+        narrower_path = Path(self.narrower_path)
+        for config_file in ["config.json", "policy_preprocessor.json", "policy_postprocessor.json"]:
+            src = narrower_path / config_file
+            if src.exists():
+                shutil.copy(src, output_path / config_file)
+        
+        for pattern in ["policy_preprocessor*.safetensors", "policy_postprocessor*.safetensors"]:
+            for src in narrower_path.glob(pattern):
+                shutil.copy(src, output_path / src.name)
+        
+        # 保存融合配置
+        merge_config = {
+            "merge_method": "two_stage_adapter",
+            "backbone_merge_method": self.merge_method,
+            "backbone_alpha": self.alpha,
+            "adapter_type": self.adapter_type,
+            "narrower_path": str(self.narrower_path),
+            "wider_path": str(self.wider_path),
+            "action_head_source": "narrower",
+        }
+        with open(output_path / "merge_config.json", "w") as f:
+            json.dump(merge_config, f, indent=2)
+        
+        print(f"\n✅ Model saved to {output_path}")
+        print(f"   - model.safetensors (包含 distribution_adapter 权重)")
+        print(f"   - config.json")
+        print(f"   - merge_config.json")
+
+
+# ============================================================
 # 便捷函数
 # ============================================================
 
