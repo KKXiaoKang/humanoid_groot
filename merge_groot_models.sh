@@ -29,8 +29,8 @@ set -e
 METHOD=${1:-expert_merge}
 
 # 模型路径
-NARROWER_PATH="/home/lab/humanoid_groot/outputs/train/0112_h100x4_groot_cross_attention_narrower_very_conservative/checkpoints/020000/pretrained_model"
-WIDER_PATH="/home/lab/humanoid_groot/outputs/train/0113_h100x4_groot_cross_attention_wider_very_conservative_mix_dense/checkpoints/014000/pretrained_model"
+NARROWER_PATH="/home/kangkk/humanoid_groot/outputs/0112_h100x4_groot_cross_attention_narrower_very_conservative/checkpoints/020000/pretrained_model"
+WIDER_PATH="/home/kangkk/humanoid_groot/outputs/0113_h100x4_groot_cross_attention_wider_very_conservative_mix_dense/checkpoints/014000/pretrained_model"
 OUTPUT_PATH="./outputs/merged_groot/pretrained_model"
 
 # ⚠️ 重要：Base 模型必须与专家模型有相同的架构！
@@ -68,15 +68,21 @@ echo "======================================"
 
 case $METHOD in
     expert_merge)
-        # ⭐ 默认方法 - 效果最好
-        echo "使用 Expert Merging 方法（效果最好）⭐..."
+        # ⭐ 默认方法 - 基于论文 "Expert Merging" (arXiv:2509.25712)
+        echo "使用 Expert Merging 方法（基于论文推荐参数）⭐..."
         echo ""
-        echo "📚 校准数据：将使用 lerobot_data/v3_0_dataset 文件夹中的训练数据集"
-        echo "   - 窄箱子数据集 (narrower): 1215, 1221, 1223, 1225"
-        echo "   - 宽箱子数据集 (wider): 1215, 1221, 1223, 1225"
-        echo "   - 只需要 5-10 个样本，不需要动作标签"
+        echo "📚 校准数据：将使用 lerobot_data/split_dataset 文件夹中的训练数据集"
+        echo "   - 窄箱子数据集 (narrower): four, random, dense, mix"
+        echo "   - 宽箱子数据集 (wider): four, random, dense, mix"
+        echo "   - 论文推荐: N=5-10 个样本即可 (Table 11-13)"
         echo ""
-        echo "⚠️ Base 模型：使用 narrower 模型作为 base（与专家模型架构一致）"
+        echo "⚠️ 论文参数说明 (Table 9, 10):"
+        echo "   - γ (regularization_weight) = 0.8: 论文最优值"
+        echo "   - N (num_samples) = 5: 性能饱和点"
+        echo "   - epochs = 10: 足够收敛"
+        echo ""
+        echo "💡 注意：Hidden loss 不下降是正常的！这是多目标优化问题。"
+        echo "   真正的评估应该在实际任务上进行。"
         echo ""
         python scripts/train_weight_merge.py \
             --method expert_merge \
@@ -84,11 +90,13 @@ case $METHOD in
             --wider_path "$WIDER_PATH" \
             --base_model_path "$BASE_MODEL_PATH" \
             --use_default_datasets \
-            --num_samples 10 \
+            --num_samples 5 \
             --num_epochs 10 \
             --lr 1e-3 \
             --regularization_weight 0.8 \
             --initial_coefficient 0.5 \
+            --merge_backbone_only \
+            --action_head_source interpolate \
             --device "$DEVICE" \
             --output_path "$OUTPUT_PATH"
         ;;
