@@ -52,6 +52,10 @@ class ExpertMergeConfig:
     # 融合模式
     merge_mode: Literal["layer_wise", "global", "chunk_wise"] = "layer_wise"
     
+    # 融合范围控制
+    merge_backbone_only: bool = False  # 如果为 True，只融合 backbone，action_head 使用第一个专家的
+    action_head_source: Literal["first_expert", "second_expert", "interpolate"] = "first_expert"  # action_head 的来源
+    
     # 训练配置
     learning_rate: float = 1e-3
     num_epochs: int = 10
@@ -154,17 +158,25 @@ class LayerWiseCoefficients(nn.Module):
         num_experts: int,
         layer_names: list[str],
         initial_value: float = 0.5,
+        merge_backbone_only: bool = False,
+        action_head_source: str = "first_expert",
     ):
         super().__init__()
         
         self.num_experts = num_experts
         self.layer_names = layer_names
         self.num_layers = len(layer_names)
+        self.merge_backbone_only = merge_backbone_only
+        self.action_head_source = action_head_source
         
         # 创建系数参数: (num_experts, num_layers)
         # 使用 ParameterDict 以便按层名访问
         self.coefficients = nn.ParameterDict()
         for layer_name in layer_names:
+            # 如果只融合 backbone，跳过 action_head 层的系数
+            if merge_backbone_only and layer_name.startswith('action_head.'):
+                continue  # 不创建 action_head 层的系数
+            
             # 每层的系数: (num_experts,)
             safe_name = layer_name.replace(".", "_")
             self.coefficients[safe_name] = nn.Parameter(
@@ -242,6 +254,7 @@ class MergedGR00TModel(nn.Module):
         self.coefficients = coefficients
         self.expert_names = expert_names
         self.num_experts = len(task_vectors)
+        self.expert_models = []  # 将在 ExpertMerger 中设置
         
         # 注册 base model 的参数（不可训练）
         for param in self.base_model.parameters():
@@ -251,23 +264,89 @@ class MergedGR00TModel(nn.Module):
         self._merged_state_dict = None
         self._cached = False
     
+    def _is_backbone_layer(self, key: str) -> bool:
+        """
+        判断一个层是否属于 backbone
+        
+        Backbone 层通常以 'backbone.' 开头
+        Action head 层通常以 'action_head.' 开头
+        """
+        return key.startswith('backbone.')
+    
+    def _is_action_head_layer(self, key: str) -> bool:
+        """
+        判断一个层是否属于 action_head
+        """
+        return key.startswith('action_head.')
+    
     def _apply_merge(self):
         """
         应用权重融合
         
         θ_merged = θ_base + Σ_k α_k * τ_k
+        
+        如果 merge_backbone_only=True，只融合 backbone，action_head 使用指定专家的
+        
+        ⚠️ 重要：返回的 merged_state_dict 中的 tensor 需要保留梯度连接！
+        不能使用 .clone()，而要使用直接计算，这样梯度才能反向传播到系数。
         """
         base_state_dict = self.base_model.state_dict()
         merged_state_dict = {}
         
+        # 获取第一个和第二个专家的 state_dict（用于 action_head 选择）
+        first_expert_state_dict = None
+        second_expert_state_dict = None
+        if len(self.expert_models) > 0:
+            first_expert_state_dict = self.expert_models[0].state_dict()
+        if len(self.expert_models) > 1:
+            second_expert_state_dict = self.expert_models[1].state_dict()
+        
         for key in base_state_dict:
-            merged_param = base_state_dict[key].clone()
+            # 如果只融合 backbone，action_head 使用指定专家的
+            if hasattr(self.coefficients, 'merge_backbone_only') and self.coefficients.merge_backbone_only:
+                if self._is_action_head_layer(key):
+                    # Action head 层：使用指定专家的权重（detach，不需要梯度）
+                    if self.coefficients.action_head_source == "first_expert" and first_expert_state_dict and key in first_expert_state_dict:
+                        merged_state_dict[key] = first_expert_state_dict[key].clone().detach()
+                        continue
+                    elif self.coefficients.action_head_source == "second_expert" and second_expert_state_dict and key in second_expert_state_dict:
+                        merged_state_dict[key] = second_expert_state_dict[key].clone().detach()
+                        continue
+                    elif self.coefficients.action_head_source == "interpolate":
+                        # 插值：使用固定系数 0.5 进行插值（简单插值）
+                        if first_expert_state_dict and second_expert_state_dict and key in first_expert_state_dict and key in second_expert_state_dict:
+                            merged_state_dict[key] = (0.5 * first_expert_state_dict[key] + 0.5 * second_expert_state_dict[key]).detach()
+                            continue
+                    # 如果找不到，使用 base 的
+                    merged_state_dict[key] = base_state_dict[key].clone().detach()
+                    continue
             
-            # 添加所有专家的 Task Vector 贡献
+            # Backbone 层或全量融合：正常融合（保留梯度连接！）
+            # ⚠️ 关键修复：不能使用 .clone()，要直接计算，这样梯度才能传播到系数
+            base_param = base_state_dict[key]
+            # ⚠️ 关键修复：确保 merged_param 的计算图正确，保留梯度连接
+            # 先 detach base_param（base 不需要梯度），然后通过 coef * task_vec 添加梯度连接
+            merged_param = base_param.detach().clone()  # detach base，因为 base 不需要梯度
+            
+            # 添加所有专家的 Task Vector 贡献（保留梯度连接）
             for expert_idx, task_vector in enumerate(self.task_vectors):
                 if key in task_vector.task_vector:
-                    coef = self.coefficients.get_coefficient(key, expert_idx)
-                    merged_param = merged_param + coef * task_vector[key].to(merged_param.device)
+                    # 检查是否有该层的系数（如果只融合 backbone，action_head 层可能没有系数）
+                    try:
+                        coef = self.coefficients.get_coefficient(key, expert_idx)
+                        # ⚠️ 关键：直接计算，保留梯度连接
+                        # coef 是可训练参数，task_vec 是 detach 的（不需要梯度）
+                        # 所以 merged_param 的梯度来自 coef
+                        task_vec = task_vector[key].to(merged_param.device).detach()  # task_vec 不需要梯度
+                        # ⚠️ 关键：这里 coef 有梯度，所以 merged_param 也会有梯度！
+                        merged_param = merged_param + coef * task_vec
+                    except:
+                        # 如果没有系数（比如 action_head 层在只融合 backbone 模式下），跳过
+                        pass
+            
+            # ⚠️ 关键：确保 merged_param 有梯度（如果 coef 有梯度）
+            # 但当我们使用 param.data = merged_param 时，梯度会断开
+            # 所以我们需要确保在前向传播时，loss 的计算图连接到 merged_param
             
             merged_state_dict[key] = merged_param
         
@@ -287,54 +366,109 @@ class MergedGR00TModel(nn.Module):
         
         return merged_model
     
-    def forward_with_merged_weights(self, inputs: dict) -> dict:
+    def forward_with_merged_weights(self, inputs: dict, compute_actions: bool = True) -> dict:
         """
         使用融合权重进行前向传播
         
         这是训练时使用的方法，会动态计算融合权重
+        
+        Args:
+            inputs: 输入数据
+            compute_actions: 是否计算 action outputs（如果只需要 hidden states，设为 False）
+        
+        ⚠️ 关键修复：使用 functional_call 保留梯度连接
         """
-        # 应用融合权重
+        from torch.func import functional_call
+        
+        # 应用融合权重（保留梯度连接）
         merged_state_dict = self._apply_merge()
         
-        # 临时加载融合权重
-        original_state = self.base_model.state_dict()
-        self.base_model.load_state_dict(merged_state_dict, strict=False)
+        # 获取设备类型
+        device = next(self.base_model.parameters()).device
+        use_bf16 = getattr(self.base_model, "compute_dtype", None) == "bfloat16"
         
-        try:
-            # 获取设备类型
-            device = next(self.base_model.parameters()).device
-            # 使用 autocast 确保数据类型正确（参考 modeling_groot.py）
-            use_bf16 = getattr(self.base_model, "compute_dtype", None) == "bfloat16"
-            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16):
-                # 前向传播
-                outputs = self.base_model.get_action(inputs)
-        finally:
-            # 恢复原始权重
-            self.base_model.load_state_dict(original_state, strict=False)
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16):
+            # 先准备输入
+            backbone_inputs, action_inputs = self.base_model.prepare_input(inputs)
+            
+            # ⚠️ 关键：使用 functional_call 调用 backbone，保留梯度连接
+            # 提取 backbone 的参数，去掉 backbone. 前缀
+            backbone_params = {}
+            for key, value in merged_state_dict.items():
+                if key.startswith('backbone.'):
+                    new_key = key[len('backbone.'):]  # 去掉 backbone. 前缀
+                    backbone_params[new_key] = value
+            
+            # 使用 functional_call 调用 backbone
+            backbone_outputs = functional_call(
+                self.base_model.backbone,
+                backbone_params,
+                (backbone_inputs,),
+                tie_weights=False,
+                strict=False,
+            )
+            
+            # 如果不需要计算 actions（比如 action loss 权重为 0），只返回 backbone outputs
+            if not compute_actions:
+                return backbone_outputs
+            
+            # 提取 action_head 的参数，去掉 action_head. 前缀
+            action_head_params = {}
+            for key, value in merged_state_dict.items():
+                if key.startswith('action_head.'):
+                    new_key = key[len('action_head.'):]  # 去掉 action_head. 前缀
+                    action_head_params[new_key] = value
+            
+            # 使用 functional_call 调用 action_head
+            # action_head.forward 接受两个参数：backbone_output 和 action_input
+            action_outputs = functional_call(
+                self.base_model.action_head,
+                action_head_params,
+                (backbone_outputs, action_inputs),  # 两个位置参数
+                tie_weights=False,
+                strict=False,
+            )
         
-        return outputs
+        return action_outputs
     
     def get_hidden_states(self, inputs: dict) -> torch.Tensor:
         """
         获取融合模型的隐藏状态
         
         用于 Hidden Alignment Loss
-        """
-        merged_state_dict = self._apply_merge()
-        original_state = self.base_model.state_dict()
-        self.base_model.load_state_dict(merged_state_dict, strict=False)
         
-        try:
-            # 获取设备类型
-            device = next(self.base_model.parameters()).device
-            # 使用 autocast 确保数据类型正确（参考 modeling_groot.py）
-            use_bf16 = getattr(self.base_model, "compute_dtype", None) == "bfloat16"
-            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16):
-                backbone_inputs, action_inputs = self.base_model.prepare_input(inputs)
-                backbone_outputs = self.base_model.backbone(backbone_inputs)
-                hidden_states = backbone_outputs[BACKBONE_FEATURE_KEY]
-        finally:
-            self.base_model.load_state_dict(original_state, strict=False)
+        ⚠️ 关键修复：使用 functional_call 保留梯度连接
+        """
+        from torch.func import functional_call
+        
+        # 应用融合权重（保留梯度连接）
+        merged_state_dict = self._apply_merge()
+        
+        # 获取设备类型
+        device = next(self.base_model.parameters()).device
+        use_bf16 = getattr(self.base_model, "compute_dtype", None) == "bfloat16"
+        
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16):
+            # 准备输入
+            backbone_inputs, action_inputs = self.base_model.prepare_input(inputs)
+            
+            # ⚠️ 关键：使用 functional_call 调用 backbone，保留梯度连接
+            # 提取 backbone 的参数，去掉 backbone. 前缀
+            backbone_params = {}
+            for key, value in merged_state_dict.items():
+                if key.startswith('backbone.'):
+                    new_key = key[len('backbone.'):]  # 去掉 backbone. 前缀
+                    backbone_params[new_key] = value
+            
+            # 使用 functional_call 调用 backbone
+            backbone_outputs = functional_call(
+                self.base_model.backbone,
+                backbone_params,
+                (backbone_inputs,),
+                tie_weights=False,
+                strict=False,
+            )
+            hidden_states = backbone_outputs[BACKBONE_FEATURE_KEY]
         
         return hidden_states
 
@@ -453,7 +587,24 @@ class ExpertMerger:
             num_experts=len(self.task_vectors),
             layer_names=layer_names,
             initial_value=self.config.initial_coefficient,
+            merge_backbone_only=self.config.merge_backbone_only,
+            action_head_source=self.config.action_head_source,
         ).to(self.device)
+        
+        # 如果只融合 backbone，打印信息
+        if self.config.merge_backbone_only:
+            backbone_layers = [k for k in layer_names if k.startswith('backbone.')]
+            action_head_layers = [k for k in layer_names if k.startswith('action_head.')]
+            print(f"\n⚠️  只融合 Backbone 模式已启用")
+            print(f"   Backbone 层数: {len(backbone_layers)}")
+            print(f"   Action Head 层数: {len(action_head_layers)}")
+            print(f"   Action Head 来源: {self.config.action_head_source}")
+            if self.config.action_head_source == "first_expert":
+                print(f"   → Action Head 将使用第一个专家模型（narrower）的权重")
+            elif self.config.action_head_source == "second_expert":
+                print(f"   → Action Head 将使用第二个专家模型（wider）的权重")
+            elif self.config.action_head_source == "interpolate":
+                print(f"   → Action Head 将使用两个专家模型的插值")
         
         print(f"\n📊 Coefficient stats:")
         print(f"   Layers: {len(layer_names)}")
@@ -569,6 +720,7 @@ class ExpertMerger:
         self,
         batch: dict,
         optimizer: torch.optim.Optimizer,
+        batch_idx: int = 0,
     ) -> dict:
         """
         单步训练
@@ -600,64 +752,141 @@ class ExpertMerger:
         total_loss = 0.0
         loss_dict = {}
         
-        # 对每个专家计算对齐损失
-        for expert_idx, expert_model in enumerate(self.expert_models):
-            expert_name = self.config.expert_names[expert_idx]
-            task_weight = self.config.task_weights[expert_idx] if expert_idx < len(self.config.task_weights) else 1.0
-            
-            # 1. 获取专家模型的输出（作为目标）
-            with torch.no_grad():
-                expert_model.eval()
-                expert_model = expert_model.to(self.device)
-                
-                # 获取设备类型和是否使用 bf16
-                device = next(expert_model.parameters()).device
-                use_bf16 = getattr(expert_model, "compute_dtype", None) == "bfloat16"
-                
-                # 使用 autocast 确保数据类型正确（参考 modeling_groot.py）
-                with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16):
-                    # 获取 hidden states
-                    expert_backbone_inputs, expert_action_inputs = expert_model.prepare_input(inputs)
-                    expert_backbone_outputs = expert_model.backbone(expert_backbone_inputs)
-                    expert_hidden = expert_backbone_outputs[BACKBONE_FEATURE_KEY]
-                    
-                    # 获取 actions
-                    expert_outputs = expert_model.get_action(inputs)
-                    expert_actions = expert_outputs[ACTION_KEY]
-            
-            # 2. 获取融合模型的输出
-            # 获取 hidden states
-            merged_hidden = self.merged_model.get_hidden_states(inputs)
-            
-            # 获取 actions
-            merged_outputs = self.merged_model.forward_with_merged_weights(inputs)
-            merged_actions = merged_outputs[ACTION_KEY]
-            
-            # 3. 计算对齐损失
-            hidden_loss = self.compute_hidden_alignment_loss(merged_hidden, expert_hidden)
-            action_loss = self.compute_logit_alignment_loss(merged_actions, expert_actions)
-            
-            # 4. 加权组合
-            expert_loss = (
-                self.config.hidden_alignment_weight * hidden_loss +
-                self.config.logit_alignment_weight * action_loss
-            ) * task_weight
-            
-            total_loss = total_loss + expert_loss
-            
-            loss_dict[f"{expert_name}_hidden_loss"] = hidden_loss.item()
-            loss_dict[f"{expert_name}_action_loss"] = action_loss.item()
-            loss_dict[f"{expert_name}_total_loss"] = expert_loss.item()
+        # ⚠️ 关键修复：根据样本的任务来源，只对齐对应的专家！
+        # 这样就不会有"左右脑互博"的问题
         
-        # 5. 添加正则化损失
+        # 1. 获取样本的任务来源
+        # task_source: 0=narrower, 1=wider
+        if 'task_source' in batch:
+            task_source = batch['task_source']
+            if isinstance(task_source, torch.Tensor):
+                task_source = task_source[0].item()  # 取第一个样本的任务来源
+            elif isinstance(task_source, list):
+                task_source = task_source[0]
+        else:
+            # 如果没有 task_source，默认交替使用两个专家
+            task_source = batch_idx % len(self.expert_models)
+        
+        # 2. 选择对应的专家模型
+        expert_idx = int(task_source)
+        if expert_idx >= len(self.expert_models):
+            expert_idx = 0
+        
+        expert_model = self.expert_models[expert_idx]
+        expert_name = self.config.expert_names[expert_idx]
+        
+        if batch_idx == 0:
+            print(f"\n   🎯 Aligning with expert: {expert_name} (task_source={task_source})")
+        
+        # 3. 获取目标专家的 hidden states
+        with torch.no_grad():
+            expert_model.eval()
+            expert_model = expert_model.to(self.device)
+            
+            device = next(expert_model.parameters()).device
+            use_bf16 = getattr(expert_model, "compute_dtype", None) == "bfloat16"
+            
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16):
+                expert_backbone_inputs, _ = expert_model.prepare_input(inputs)
+                expert_backbone_outputs = expert_model.backbone(expert_backbone_inputs)
+                target_hidden = expert_backbone_outputs[BACKBONE_FEATURE_KEY]
+        
+        # 4. 获取融合模型的 hidden states
+        merged_hidden = self.merged_model.get_hidden_states(inputs)
+        
+        # 5. 计算与目标专家的对齐损失（不是加权平均，而是直接对齐目标专家！）
+        hidden_loss = self.compute_hidden_alignment_loss(merged_hidden, target_hidden)
+        
+        # 记录损失
+        loss_dict[f"{expert_name}_hidden_loss"] = hidden_loss.item()
+        loss_dict[f"{expert_name}_action_loss"] = 0.0
+        loss_dict[f"{expert_name}_total_loss"] = hidden_loss.item()
+        
+        # 记录其他专家的 hidden loss（仅用于诊断，不影响优化）
+        with torch.no_grad():
+            for other_idx, other_model in enumerate(self.expert_models):
+                if other_idx != expert_idx:
+                    other_name = self.config.expert_names[other_idx]
+                    other_model.eval()
+                    other_model = other_model.to(self.device)
+                    other_device = next(other_model.parameters()).device
+                    other_bf16 = getattr(other_model, "compute_dtype", None) == "bfloat16"
+                    with torch.autocast(device_type=other_device.type, dtype=torch.bfloat16, enabled=other_bf16):
+                        other_backbone_inputs, _ = other_model.prepare_input(inputs)
+                        other_backbone_outputs = other_model.backbone(other_backbone_inputs)
+                        other_hidden = other_backbone_outputs[BACKBONE_FEATURE_KEY]
+                    other_loss = F.mse_loss(merged_hidden.detach(), other_hidden)
+                    loss_dict[f"{other_name}_hidden_loss"] = other_loss.item()
+                    loss_dict[f"{other_name}_action_loss"] = 0.0
+                    loss_dict[f"{other_name}_total_loss"] = other_loss.item()
+            
+        # 6. 计算总损失 = hidden_alignment_loss + regularization_loss
+        total_loss = self.config.hidden_alignment_weight * hidden_loss
+        loss_dict["hidden_loss"] = hidden_loss.item()
+        
+        # 检查损失是否正常
+        if not torch.isfinite(hidden_loss):
+            print(f"   ⚠️  Warning: Non-finite hidden_loss: {hidden_loss.item()}")
+            optimizer.zero_grad()
+            return loss_dict
+        
+        # 6. 添加正则化损失
         reg_loss = self.coefficients.regularization_loss()
         total_loss = total_loss + self.config.regularization_weight * reg_loss
         
         loss_dict["regularization_loss"] = reg_loss.item()
         loss_dict["total_loss"] = total_loss.item()
         
+        # 检查 NaN/Inf
+        if not torch.isfinite(total_loss):
+            print(f"   ⚠️  Warning: Non-finite loss detected: {total_loss.item()}")
+            print(f"   Hidden losses: {[loss_dict.get(f'{name}_hidden_loss', 'N/A') for name in self.config.expert_names]}")
+            print(f"   Action losses: {[loss_dict.get(f'{name}_action_loss', 'N/A') for name in self.config.expert_names]}")
+            # 跳过这个 batch
+            optimizer.zero_grad()
+            return loss_dict
+        
         # 6. 反向传播
         total_loss.backward()
+        
+        # 检查系数是否有梯度（调试）
+        if batch_idx == 0:
+            has_grad = False
+            for name, param in self.coefficients.named_parameters():
+                if param.grad is not None:
+                    has_grad = True
+                    print(f"   ✅ Coefficient {name} has gradient: {param.grad.norm().item():.6f}")
+                    break
+            if not has_grad:
+                print(f"   ⚠️  Warning: No gradients found in coefficients!")
+                print(f"   This means the computation graph is broken.")
+                print(f"   Checking merged_state_dict...")
+                # 检查 merged_state_dict 中的值是否有梯度
+                merged_state_dict = self.merged_model._apply_merge()
+                has_grad_in_merged = False
+                for key, value in list(merged_state_dict.items())[:5]:  # 只检查前5个
+                    if hasattr(value, 'requires_grad') and value.requires_grad:
+                        has_grad_in_merged = True
+                        print(f"   ✅ merged_state_dict['{key}'] has gradient: {value.requires_grad}")
+                        break
+                if not has_grad_in_merged:
+                    print(f"   ⚠️  merged_state_dict values don't have gradients!")
+        
+        # 7. 梯度裁剪（防止梯度爆炸）
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            self.coefficients.parameters(),
+            max_norm=1.0,  # 梯度裁剪阈值
+            error_if_nonfinite=False
+        )
+        loss_dict["grad_norm"] = grad_norm.item()
+        
+        # 检查梯度是否正常
+        if not torch.isfinite(torch.tensor(grad_norm)) or grad_norm > 100.0:
+            print(f"   ⚠️  Warning: Large gradient norm detected: {grad_norm:.4f}")
+            # 清零梯度，跳过这个 step
+            optimizer.zero_grad()
+            return loss_dict
+        
         optimizer.step()
         
         return loss_dict
@@ -802,10 +1031,13 @@ class ExpertMerger:
         learning_rate = learning_rate or self.config.learning_rate
         
         # 只优化系数
+        # 使用较小的学习率和梯度裁剪来防止训练不稳定
         optimizer = torch.optim.AdamW(
             self.coefficients.parameters(),
             lr=learning_rate,
             weight_decay=1e-4,
+            betas=(0.9, 0.999),  # 默认 beta 值
+            eps=1e-8,
         )
         
         print(f"\n{'='*60}")
@@ -819,11 +1051,18 @@ class ExpertMerger:
             epoch_losses = []
             
             for batch_idx, batch in enumerate(train_dataloader):
-                loss_dict = self.train_step(batch, optimizer)
+                loss_dict = self.train_step(batch, optimizer, batch_idx)
                 epoch_losses.append(loss_dict["total_loss"])
                 
                 if batch_idx % 10 == 0:
-                    print(f"   Epoch {epoch+1}/{num_epochs}, Batch {batch_idx}: loss = {loss_dict['total_loss']:.4f}")
+                    grad_norm_str = f", grad_norm = {loss_dict.get('grad_norm', 'N/A'):.4f}" if 'grad_norm' in loss_dict else ""
+                    print(f"   Epoch {epoch+1}/{num_epochs}, Batch {batch_idx}: loss = {loss_dict['total_loss']:.4f}{grad_norm_str}")
+                    
+                    # 打印详细的损失信息（前几个 batch）
+                    if batch_idx < 3:
+                        for key, value in loss_dict.items():
+                            if key != 'total_loss' and key != 'grad_norm':
+                                print(f"      {key}: {value:.4f}")
             
             avg_loss = sum(epoch_losses) / len(epoch_losses)
             coef_stats = self.coefficients.get_stats()
@@ -836,6 +1075,54 @@ class ExpertMerger:
             print(f"   Per-expert mean: {coef_stats.get('per_expert_mean', [])}")
         
         print(f"\n✅ Training completed!")
+        
+        # 打印融合质量评估和建议
+        self._print_merge_quality_report(coef_stats)
+    
+    def _print_merge_quality_report(self, coef_stats: dict):
+        """
+        打印融合质量评估报告
+        
+        ⚠️ 重要：Hidden loss 不是融合质量的好指标！
+        真正的质量评估需要在实际任务上测试。
+        """
+        print(f"\n{'='*60}")
+        print(f"📊 融合质量评估报告")
+        print(f"{'='*60}")
+        
+        # 1. 系数分析
+        per_expert_mean = coef_stats.get('per_expert_mean', [0.5, 0.5])
+        print(f"\n1️⃣ 系数分析:")
+        print(f"   Per-expert mean: {per_expert_mean}")
+        
+        if len(per_expert_mean) >= 2:
+            alpha_narrower = per_expert_mean[0]
+            alpha_wider = per_expert_mean[1]
+            
+            # 由于 base = narrower，τ_narrower = 0
+            # 所以实际融合权重是 α_wider
+            print(f"\n   💡 融合策略解读:")
+            print(f"   θ_merged = θ_narrower + α_wider × (θ_wider - θ_narrower)")
+            print(f"   实际融合比例: α_wider = {alpha_wider:.4f}")
+            print(f"   → 约 {(1-alpha_wider)*100:.1f}% narrower + {alpha_wider*100:.1f}% wider")
+        
+        # 2. 融合质量警告
+        print(f"\n2️⃣ 重要说明:")
+        print(f"   ⚠️  Hidden alignment loss 不能直接反映融合质量！")
+        print(f"   ⚠️  Loss 不下降是正常的（这是多目标优化问题）")
+        
+        # 3. 建议
+        print(f"\n3️⃣ 下一步建议:")
+        print(f"   1. 在实际任务上测试融合模型:")
+        print(f"      python eval/eval_merged_groot.py --model_path ./outputs/merged_groot/pretrained_model")
+        print(f"")
+        print(f"   2. 分别测试 narrower 和 wider 任务的成功率")
+        print(f"   3. 与原始专家模型对比性能")
+        print(f"")
+        print(f"   4. 如果效果不好，尝试其他融合方法:")
+        print(f"      ./merge_groot_models.sh task_arithmetic 6  # 无需训练")
+        print(f"      ./merge_groot_models.sh interpolation 6    # 直接插值")
+        print(f"{'='*60}\n")
     
     def get_merged_model(self) -> GR00TN15:
         """获取训练后的融合模型"""
@@ -856,7 +1143,16 @@ class ExpertMerger:
         
         # 保存权重
         state_dict = merged_model.state_dict()
-        save_file(state_dict, str(output_path / "model.safetensors"))
+        
+        # ⚠️ 修复：处理共享权重（tied weights）问题
+        # 语言模型中 lm_head.weight 和 embed_tokens.weight 共享内存
+        # safetensors 不允许保存共享内存的张量，需要先克隆
+        state_dict_cloned = {}
+        for key, value in state_dict.items():
+            # 克隆所有张量以断开共享内存
+            state_dict_cloned[key] = value.clone().contiguous()
+        
+        save_file(state_dict_cloned, str(output_path / "model.safetensors"))
         
         # 保存配置（使用第一个专家的配置作为模板）
         first_expert_path = Path(self.config.expert_paths[0])

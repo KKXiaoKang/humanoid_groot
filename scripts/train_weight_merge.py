@@ -53,9 +53,9 @@ logger = logging.getLogger(__name__)
 
 # 模型路径
 MODEL_NARROW_PATH = \
-    "/home/lab/humanoid_groot/outputs/train/0112_h100x4_groot_cross_attention_narrower_very_conservative/checkpoints/020000/pretrained_model"
+    "/home/kangkk/humanoid_groot/outputs/0112_h100x4_groot_cross_attention_narrower_very_conservative/checkpoints/020000/pretrained_model"
 MODEL_WIDE_PATH = \
-    "/home/lab/humanoid_groot/outputs/train/0113_h100x4_groot_cross_attention_wider_very_conservative_mix_dense/checkpoints/014000/pretrained_model"
+    "/home/kangkk/humanoid_groot/outputs/0113_h100x4_groot_cross_attention_wider_very_conservative_mix_dense/checkpoints/014000/pretrained_model"
 
 # ⚠️ 重要：Base 模型必须与专家模型有相同的架构！
 # 不能使用 nvidia/GR00T-N1.5-3B，因为原始预训练模型的 action_head 结构不同
@@ -67,15 +67,15 @@ BASE_MODEL_PATH = MODEL_NARROW_PATH
 # 混合使用窄箱子和宽箱子的数据，以确保融合模型能处理两种任务
 DEFAULT_CALIBRATION_DATASETS = [
     # 窄箱子相关数据集 (narrower)
-    "/home/lab/humanoid_groot/lerobot_data/v3_0_dataset/1215_5w_groot_4311_4322_4611_4633_narrower",
-    "/home/lab/humanoid_groot/lerobot_data/v3_0_dataset/1221_5w_random_height_4322_4611_narrower",
-    "/home/lab/humanoid_groot/lerobot_data/v3_0_dataset/1223_5w_dense_stacking_narrower",
-    "/home/lab/humanoid_groot/lerobot_data/v3_0_dataset/1225_5w_unpack_mix_color_narrower",
+    "/home/kangkk/humanoid_groot/lerobot_data/split_dataset/narrower/four",
+    "/home/kangkk/humanoid_groot/lerobot_data/split_dataset/narrower/random",
+    "/home/kangkk/humanoid_groot/lerobot_data/split_dataset/narrower/dense",
+    "/home/kangkk/humanoid_groot/lerobot_data/split_dataset/narrower/mix",
     # 宽箱子相关数据集 (wider)
-    "/home/lab/humanoid_groot/lerobot_data/v3_0_dataset/1215_5w_groot_4311_4322_4611_4633_wider",
-    "/home/lab/humanoid_groot/lerobot_data/v3_0_dataset/1221_5w_random_height_4322_4611_wider",
-    "/home/lab/humanoid_groot/lerobot_data/v3_0_dataset/1223_5w_dense_stacking_wider",
-    "/home/lab/humanoid_groot/lerobot_data/v3_0_dataset/1225_5w_unpack_mix_color_wider",
+    "/home/kangkk/humanoid_groot/lerobot_data/split_dataset/wider/four",
+    "/home/kangkk/humanoid_groot/lerobot_data/split_dataset/wider/random",
+    "/home/kangkk/humanoid_groot/lerobot_data/split_dataset/wider/dense",
+    "/home/kangkk/humanoid_groot/lerobot_data/split_dataset/wider/mix",
 ]
 
 
@@ -134,6 +134,28 @@ def create_calibration_dataloader(
     return create_lerobot_dataloader(paths_to_use, batch_size, num_samples)
 
 
+class TaskLabeledDataset:
+    """
+    带任务标签的数据集包装器
+    
+    为每个样本添加 task_source 字段，标识来自哪个专家任务
+    """
+    def __init__(self, dataset, task_source: int):
+        self.dataset = dataset
+        self.task_source = task_source  # 0=narrower, 1=wider
+    
+    def __len__(self):
+        return len(self.dataset)
+    
+    def __getitem__(self, idx):
+        item = self.dataset[idx]
+        # 添加任务来源标签
+        if isinstance(item, dict):
+            item = dict(item)  # 复制以避免修改原数据
+            item['task_source'] = self.task_source
+        return item
+
+
 def create_lerobot_dataloader(
     data_paths: list[str],
     batch_size: int = 1,
@@ -141,6 +163,8 @@ def create_lerobot_dataloader(
 ):
     """
     从 LeRobot 数据集创建校准数据加载器
+    
+    ⚠️ 关键：为每个样本添加 task_source 标签，用于区分来自哪个专家任务
     
     参考 eval_on_dataset_lowpass.py 中的正确加载方式
     
@@ -168,6 +192,21 @@ def create_lerobot_dataloader(
             logger.info(f"📂 Loading dataset from {data_path}")
             logger.info(f"   repo_id: {dataset_name}")
             
+            # ⚠️ 关键：根据路径判断任务来源
+            # narrower 数据集路径包含 "narrower"，wider 数据集路径包含 "wider"
+            if "narrower" in data_path.lower():
+                task_source = 0  # narrower
+                task_label = "narrower"
+            elif "wider" in data_path.lower():
+                task_source = 1  # wider
+                task_label = "wider"
+            else:
+                # 默认：根据位置判断（前半部分是 narrower，后半部分是 wider）
+                task_source = 0 if len(datasets) < 4 else 1
+                task_label = "narrower" if task_source == 0 else "wider"
+            
+            logger.info(f"   Task source: {task_label} (id={task_source})")
+            
             # 使用正确的参数加载 LeRobotDataset
             dataset = LeRobotDataset(repo_id=dataset_name, root=data_path)
             
@@ -179,10 +218,13 @@ def create_lerobot_dataloader(
             sample_count = min(num_samples, total_frames)
             indices = np.random.choice(total_frames, sample_count, replace=False)
             subset = Subset(dataset, indices.tolist())
-            datasets.append(subset)
+            
+            # ⚠️ 关键：包装数据集以添加任务标签
+            labeled_subset = TaskLabeledDataset(subset, task_source)
+            datasets.append(labeled_subset)
             total_samples += sample_count
             
-            logger.info(f"✅ Loaded {sample_count} samples from {data_path}")
+            logger.info(f"✅ Loaded {sample_count} samples from {data_path} (task={task_label})")
             
         except Exception as e:
             logger.warning(f"❌ Failed to load dataset {data_path}: {e}")
@@ -193,7 +235,10 @@ def create_lerobot_dataloader(
             try:
                 dataset = load_dataset_from_path(data_path, num_samples)
                 if dataset is not None:
-                    datasets.append(dataset)
+                    # 根据路径判断任务来源
+                    task_source = 0 if "narrower" in data_path.lower() else 1
+                    labeled_dataset = TaskLabeledDataset(dataset, task_source)
+                    datasets.append(labeled_dataset)
                     total_samples += len(dataset)
                     logger.info(f"✅ Loaded {len(dataset)} samples from {data_path} (fallback)")
             except Exception as e2:
@@ -216,6 +261,7 @@ def create_lerobot_dataloader(
         - observation.images.*: 图像观测
         - action: 动作
         - task: 任务描述
+        - task_source: 任务来源 (0=narrower, 1=wider) ⚠️ 新增
         等字段
         """
         result = {}
@@ -436,6 +482,8 @@ def run_expert_merge(args):
         hidden_alignment_weight=args.hidden_weight,
         logit_alignment_weight=args.logit_weight,
         task_weights=[args.narrower_task_weight, args.wider_task_weight],
+        merge_backbone_only=args.merge_backbone_only,
+        action_head_source=args.action_head_source,
         device=args.device,
     )
     
@@ -750,12 +798,19 @@ def main():
                        help="Initial coefficient value for task vectors")
     parser.add_argument("--hidden_weight", type=float, default=1.0,
                        help="Hidden alignment loss weight")
-    parser.add_argument("--logit_weight", type=float, default=1.0,
-                       help="Logit (action) alignment loss weight")
+    parser.add_argument("--logit_weight", type=float, default=0.0,
+                       help="Logit (action) alignment loss weight (default 0.0, use hidden loss only)")
     parser.add_argument("--narrower_task_weight", type=float, default=1.0,
                        help="Task weight for narrower expert (increase to prioritize)")
     parser.add_argument("--wider_task_weight", type=float, default=1.0,
                        help="Task weight for wider expert (increase to prioritize)")
+    
+    # 融合范围控制
+    parser.add_argument("--merge_backbone_only", action="store_true", default=False,
+                       help="Only merge backbone weights, use specified expert's action_head (recommended if action loss explodes)")
+    parser.add_argument("--action_head_source", type=str, default="first_expert",
+                       choices=["first_expert", "second_expert", "interpolate"],
+                       help="Action head source when merge_backbone_only=True: first_expert (narrower), second_expert (wider), or interpolate")
     
     # TIES 参数
     parser.add_argument("--ties_trim_ratio", type=float, default=0.2,

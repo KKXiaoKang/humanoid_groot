@@ -19,7 +19,8 @@
 # ============================================================================
 
 # 设置输出目录
-OUTPUT_DIR="./outputs/0105_h100x4_groot_cross_attention_mix_3x2_vision_token_64_image_enhancement"
+# OUTPUT_DIR="./outputs/0113_h100x4_groot_cross_attention_narrower_very_conservative_mix_dense"
+OUTPUT_DIR="./outputs/0113_h100x4_groot_cross_attention_wider_very_conservative_mix_dense"
 JOB_NAME="groot_depalletize"
 
 # 数据集配置
@@ -40,9 +41,12 @@ JOB_NAME="groot_depalletize"
 # DATASET_REPO_ID="1125_groot_train_data_with_task_filtered"
 
 # 多数据集配置（使用两个数据集）
-DATASET_ROOT="/home/kangkk/humanoid_groot/lerobot_data/v3_0_dataset"
-DATASET_REPO_ID="1223_dense,1225_mix,1229_4322,1215_four,1221_random,3X2"
+# DATASET_ROOT="/home/kangkk/humanoid_groot/lerobot_data/split_dataset/narrower"
+DATASET_ROOT="/home/kangkk/humanoid_groot/lerobot_data/split_dataset/wider"
 
+# DATASET_REPO_ID="dense,mix,4322,four,random,4622_fail_rc"
+# DATASET_REPO_ID="dense,mix,four,random,4322_2X2,4322_3X2,4322_mix_fail"
+DATASET_REPO_ID="dense,mix,four,random,4622_rc,4611_mix_fail"
 
 # GPU选择配置
 # 方式1: 通过命令行参数指定 (推荐)
@@ -118,7 +122,7 @@ NUM_WORKERS=8          # 数据加载器工作进程数（每个GPU）
 # 如果出现loss震荡，建议使用 conservative 或 very_conservative
 # ============================================================================
 BASE_LR=1e-4           # 单卡时的基础学习率
-LR_SCALING_MODE="conservative"  # "linear", "sqrt", "conservative", "very_conservative", "fixed_scale"
+LR_SCALING_MODE="very_conservative"  # "linear", "sqrt", "conservative", "very_conservative", "fixed_scale"
 FIXED_SCALE_FACTOR=1.3  # 仅在 LR_SCALING_MODE="fixed_scale" 时使用
 
 # 根据GPU数量自动计算缩放后的学习率

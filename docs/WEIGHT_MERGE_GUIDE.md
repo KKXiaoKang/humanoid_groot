@@ -22,15 +22,17 @@ Expert Merging 方法需要少量校准数据来学习最优的融合系数：
 
 默认使用的校准数据集：
 ```
-/home/lab/humanoid_groot/lerobot_data/v3_0_dataset/
-├── 1215_5w_groot_4311_4322_4611_4633_narrower    # 窄箱子数据
-├── 1221_5w_random_height_4322_4611_narrower      # 窄箱子数据
-├── 1223_5w_dense_stacking_narrower               # 窄箱子数据
-├── 1225_5w_unpack_mix_color_narrower             # 窄箱子数据
-├── 1215_5w_groot_4311_4322_4611_4633_wider       # 宽箱子数据
-├── 1221_5w_random_height_4322_4611_wider         # 宽箱子数据
-├── 1223_5w_dense_stacking_wider                  # 宽箱子数据
-└── 1225_5w_unpack_mix_color_wider                # 宽箱子数据
+/home/kangkk/humanoid_groot/lerobot_data/split_dataset/
+├── narrower/
+│   ├── four      # 窄箱子数据
+│   ├── random    # 窄箱子数据
+│   ├── dense     # 窄箱子数据
+│   └── mix       # 窄箱子数据
+└── wider/
+    ├── four      # 宽箱子数据
+    ├── random    # 宽箱子数据
+    ├── dense     # 宽箱子数据
+    └── mix       # 宽箱子数据
 ```
 
 ## 🎯 方案对比
