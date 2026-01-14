@@ -168,6 +168,12 @@ def create_lerobot_dataloader(
     
     参考 eval_on_dataset_lowpass.py 中的正确加载方式
     
+    数据集返回的样本格式（LeRobot v2）：
+    - observation.state: (state_dim,) 状态观测
+    - observation.images.cam_head: (C, H, W) 图像
+    - action: (action_dim,) 动作 ⚠️ 关键：这个字段用于训练适配层
+    - task: str 任务描述
+    
     Args:
         data_paths: LeRobot 数据集路径列表
         batch_size: 批次大小
@@ -182,6 +188,7 @@ def create_lerobot_dataloader(
     
     datasets = []
     total_samples = 0
+    first_sample_logged = False
     
     for data_path in data_paths:
         try:
@@ -213,6 +220,26 @@ def create_lerobot_dataloader(
             # 获取数据集总帧数
             total_frames = dataset.num_frames
             logger.info(f"   Total frames in dataset: {total_frames}")
+            
+            # 🔍 诊断：检查数据集的第一个样本
+            if not first_sample_logged and total_frames > 0:
+                sample = dataset[0]
+                logger.info(f"\n   📋 Sample data diagnostics (first sample):")
+                logger.info(f"   Sample keys: {list(sample.keys())}")
+                for k, v in sample.items():
+                    if isinstance(v, torch.Tensor):
+                        logger.info(f"      {k}: shape={v.shape}, dtype={v.dtype}")
+                    else:
+                        logger.info(f"      {k}: type={type(v)}, value={v if isinstance(v, (str, int, float)) else '...'}")
+                
+                # 检查关键字段
+                if 'action' in sample:
+                    logger.info(f"   ✅ 'action' field found: shape={sample['action'].shape}")
+                else:
+                    logger.warning(f"   ⚠️ 'action' field NOT found in sample!")
+                
+                first_sample_logged = True
+                print()  # 空行
             
             # 随机采样
             sample_count = min(num_samples, total_frames)

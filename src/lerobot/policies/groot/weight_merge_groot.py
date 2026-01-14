@@ -1317,18 +1317,37 @@ class MergedModelWithAdapter(nn.Module):
     def forward(self, inputs: dict) -> dict:
         """
         前向传播（用于训练适配层）
+        
+        ⚠️ 关键：确保 inputs 包含 GROOT action_head 所需的所有字段：
+        - action: (B, action_horizon, action_dim) - ground truth action
+        - action_mask: (B, action_horizon, action_dim) - 有效维度掩码
+        - state: (B, 1, state_dim) - 状态观测
+        - embodiment_id: (B,) - embodiment ID
+        - video 或图像数据 - 视觉输入
         """
-        # 1. 通过 backbone
-        backbone_inputs, action_inputs = self.model.prepare_input(inputs)
-        backbone_outputs = self.model.backbone(backbone_inputs)
+        # 获取计算设备和数据类型
+        device = next(self.model.parameters()).device
+        use_bf16 = getattr(self.model, "compute_dtype", None) == "bfloat16"
         
-        # 2. 通过适配层
-        backbone_features = backbone_outputs[BACKBONE_FEATURE_KEY]
-        adapted_features = self.adapter(backbone_features)
-        backbone_outputs[BACKBONE_FEATURE_KEY] = adapted_features
-        
-        # 3. 通过 action_head
-        action_outputs = self.model.action_head(backbone_outputs, action_inputs)
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16):
+            # 1. 准备输入
+            # model.prepare_input 会调用 backbone.prepare_input 和 action_head.prepare_input
+            # action_head.prepare_input 只是返回 BatchFeature(data=inputs)
+            backbone_inputs, action_inputs = self.model.prepare_input(inputs)
+            
+            # 2. 通过 backbone
+            backbone_outputs = self.model.backbone(backbone_inputs)
+            
+            # 3. 通过适配层
+            backbone_features = backbone_outputs[BACKBONE_FEATURE_KEY]
+            adapted_features = self.adapter(backbone_features)
+            backbone_outputs[BACKBONE_FEATURE_KEY] = adapted_features
+            
+            # 4. 通过 action_head（计算 Flow Matching loss）
+            # action_head.forward 会：
+            # - 从 action_inputs 获取 action, action_mask, state, embodiment_id
+            # - 计算 Flow Matching loss: MSE(pred_velocity, action - noise)
+            action_outputs = self.model.action_head(backbone_outputs, action_inputs)
         
         return action_outputs
     
@@ -1446,9 +1465,38 @@ class TwoStageExpertMerger:
         policy = GrootPolicy.from_pretrained(Path(self.narrower_path), strict=False)
         base_model = policy._groot_model
         
-        # 获取 hidden_size
-        # 从配置或推断
-        hidden_size = 1024  # GROOT 默认值
+        # 获取 hidden_size（backbone 输出维度）
+        hidden_size = None
+        
+        # 方法1: 从 action_head 配置中获取 backbone_embedding_dim
+        if hasattr(base_model, 'action_head') and hasattr(base_model.action_head, 'config'):
+            hidden_size = getattr(base_model.action_head.config, 'backbone_embedding_dim', None)
+        
+        # 方法2: 如果方法1失败，从 action_head_cfg 中获取
+        if hidden_size is None and hasattr(base_model.config, 'action_head_cfg'):
+            hidden_size = base_model.config.action_head_cfg.get('backbone_embedding_dim', None)
+        
+        # 方法3: 如果还是 None，尝试从实际的 backbone 输出推断
+        if hidden_size is None:
+            # 创建一个虚拟输入来推断维度
+            try:
+                # 检查 backbone 是否有 project_to_dim 或输出维度信息
+                if hasattr(base_model.backbone, 'eagle_linear'):
+                    if isinstance(base_model.backbone.eagle_linear, torch.nn.Identity):
+                        # Identity 表示不投影，输出是 2048
+                        hidden_size = 2048
+                    elif isinstance(base_model.backbone.eagle_linear, torch.nn.Linear):
+                        # Linear 投影层，输出维度是 out_features
+                        hidden_size = base_model.backbone.eagle_linear.out_features
+                    else:
+                        hidden_size = 2048  # 默认值
+                else:
+                    hidden_size = 2048  # GROOT N1.5 默认 backbone 输出维度
+            except Exception as e:
+                print(f"   ⚠️ Warning: Failed to infer hidden_size: {e}")
+                hidden_size = 2048  # 默认值
+        
+        print(f"   📐 Detected backbone hidden_size: {hidden_size}")
         
         # 创建带适配层的模型
         self.merged_model = MergedModelWithAdapter(
@@ -1491,14 +1539,26 @@ class TwoStageExpertMerger:
         """
         阶段 2：训练分布适配层
         
-        使用 action loss（真实 action 与预测 action 的 MSE）
-        这是 kai0 Model Arithmetic 的核心思想：使用 on-policy loss 优化
+        基于 kai0 Model Arithmetic 的思想：
+        使用 action loss（Flow Matching loss）来优化适配层
+        
+        ⚠️ 关键洞察（来自 kai0）：
+        - 他们使用 on-policy 数据（真实执行数据）来优化融合权重
+        - 这里我们使用训练数据集的 action 作为目标
+        - 虽然不是真正的 on-policy，但足以让适配层学习分布映射
+        
+        技术细节：
+        - GROOT 使用 Flow Matching 训练，loss 是预测 velocity 与真实 velocity 的 MSE
+        - action_head.forward() 会自动计算这个 loss
+        - 我们只需要提供正确格式的输入，然后优化适配层参数
         """
         print(f"\n{'='*60}")
         print(f"🏋️ Stage 2: Training Distribution Adapter")
         print(f"   Epochs: {num_epochs}")
         print(f"   Learning rate: {learning_rate}")
         print(f"   Optimizer: AdamW")
+        print(f"   💡 基于 kai0 Model Arithmetic 思想")
+        print(f"   📚 使用训练数据集的 action 作为校准目标")
         print(f"{'='*60}\n")
         
         # 只优化适配层
@@ -1514,49 +1574,106 @@ class TwoStageExpertMerger:
         
         self.merged_model.train()
         
+        # 统计
+        total_batches = 0
+        successful_batches = 0
+        
         for epoch in range(num_epochs):
             epoch_losses = []
+            epoch_details = {}  # 记录各组件 loss
             
             for batch_idx, batch in enumerate(train_dataloader):
+                total_batches += 1
                 optimizer.zero_grad()
                 
-                # 准备输入
+                # 准备输入：将 LeRobot batch 转换为 GROOT 格式
                 observation = self._prepare_observation(batch)
                 
-                # 使用预处理器
+                # 使用预处理器处理输入
+                # 预处理器会：
+                # 1. 处理图像 -> video 格式
+                # 2. 处理 state -> (B, 1, max_state_dim) 并归一化
+                # 3. 处理 action -> (B, action_horizon, max_action_dim) 并创建 mask
+                # 4. 处理 language -> Eagle tokenization
+                # 5. 添加 embodiment_id
                 if self.preprocessor is not None:
                     try:
                         inputs = self.preprocessor(observation)
                         inputs = self._to_device(inputs)
                     except Exception as e:
-                        print(f"   ⚠️ Preprocessor failed: {e}")
+                        if batch_idx == 0:
+                            print(f"   ⚠️ Preprocessor failed: {e}")
+                            import traceback
+                            traceback.print_exc()
                         continue
                 else:
                     inputs = self._to_device(observation)
                 
+                # 检查输入是否包含必要的字段
+                if batch_idx == 0:
+                    print(f"\n   📋 Input keys: {list(inputs.keys())}")
+                    if 'action' in inputs:
+                        action_shape = inputs['action'].shape if hasattr(inputs['action'], 'shape') else type(inputs['action'])
+                        print(f"   📋 Action shape: {action_shape}")
+                    if 'action_mask' in inputs:
+                        mask_shape = inputs['action_mask'].shape if hasattr(inputs['action_mask'], 'shape') else type(inputs['action_mask'])
+                        print(f"   📋 Action mask shape: {mask_shape}")
+                
                 # 前向传播
+                # MergedModelWithAdapter.forward() 会：
+                # 1. 通过融合后的 backbone
+                # 2. 通过分布适配层
+                # 3. 通过 narrower 的 action_head（计算 Flow Matching loss）
                 try:
-                    outputs = self.merged_model(inputs)
+                    with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16):
+                        outputs = self.merged_model(inputs)
                 except Exception as e:
-                    print(f"   ⚠️ Forward failed: {e}")
+                    if batch_idx == 0:
+                        print(f"   ⚠️ Forward failed: {e}")
+                        import traceback
+                        traceback.print_exc()
                     continue
                 
-                # 计算 action loss
-                if 'loss' in outputs:
-                    loss = outputs['loss']
+                # 获取 loss
+                # GROOT action_head.forward() 返回 BatchFeature，包含：
+                # - 'loss': Flow Matching loss (MSE between predicted velocity and ground truth)
+                # - 其他组件 loss（如 left_arm_loss, right_arm_loss, claw_loss）
+                if hasattr(outputs, 'data'):
+                    outputs_dict = outputs.data
+                elif isinstance(outputs, dict):
+                    outputs_dict = outputs
                 else:
-                    # 如果没有内置 loss，计算 MSE
-                    if 'action_pred' in outputs and 'action' in inputs:
-                        pred_action = outputs['action_pred']
+                    print(f"   ⚠️ Unexpected outputs type: {type(outputs)}")
+                    continue
+                
+                if 'loss' in outputs_dict:
+                    loss = outputs_dict['loss']
+                    
+                    # 记录详细 loss（首次打印）
+                    if batch_idx == 0:
+                        for k, v in outputs_dict.items():
+                            if 'loss' in k.lower() and k != 'loss':
+                                if isinstance(v, (int, float)):
+                                    print(f"      {k}: {v:.4f}")
+                else:
+                    # 如果没有内置 loss，手动计算
+                    if 'action_pred' in outputs_dict and 'action' in inputs:
+                        pred_action = outputs_dict['action_pred']
                         target_action = inputs['action']
                         loss = F.mse_loss(pred_action, target_action)
+                        if batch_idx == 0:
+                            print(f"   ⚠️ Using manual MSE loss (no built-in loss)")
                     else:
-                        print(f"   ⚠️ Cannot compute loss, skipping batch")
+                        if batch_idx == 0:
+                            print(f"   ⚠️ Cannot compute loss")
+                            print(f"      outputs keys: {list(outputs_dict.keys())}")
+                            print(f"      inputs keys: {list(inputs.keys())}")
                         continue
                 
                 # 检查 NaN
                 if not torch.isfinite(loss):
-                    print(f"   ⚠️ Non-finite loss: {loss.item()}")
+                    if batch_idx < 3:
+                        print(f"   ⚠️ Non-finite loss: {loss.item()}")
                     continue
                 
                 # 反向传播
@@ -1568,8 +1685,20 @@ class TwoStageExpertMerger:
                     max_norm=1.0,
                 )
                 
+                # 检查梯度
+                if batch_idx == 0:
+                    adapter_has_grad = any(
+                        p.grad is not None and p.grad.abs().sum() > 0
+                        for p in self.merged_model.adapter.parameters()
+                    )
+                    if adapter_has_grad:
+                        print(f"   ✅ Adapter gradients: OK")
+                    else:
+                        print(f"   ⚠️ Adapter has no gradients!")
+                
                 optimizer.step()
                 epoch_losses.append(loss.item())
+                successful_batches += 1
                 
                 if batch_idx % 10 == 0:
                     print(f"   Epoch {epoch+1}/{num_epochs}, Batch {batch_idx}: "
@@ -1580,37 +1709,70 @@ class TwoStageExpertMerger:
             if epoch_losses:
                 avg_loss = sum(epoch_losses) / len(epoch_losses)
                 print(f"\n📊 Epoch {epoch+1}/{num_epochs}: avg_loss = {avg_loss:.4f}")
+            else:
+                print(f"\n⚠️ Epoch {epoch+1}/{num_epochs}: No successful batches!")
         
         print(f"\n✅ Stage 2 完成: 适配层训练完成")
+        print(f"   成功批次: {successful_batches}/{total_batches}")
+        
+        if successful_batches == 0:
+            print(f"\n⚠️ 警告：没有成功训练的批次！")
+            print(f"   可能的原因：")
+            print(f"   1. 数据格式不正确")
+            print(f"   2. 预处理器配置问题")
+            print(f"   3. 模型配置不匹配")
     
     def _prepare_observation(self, batch: dict) -> dict:
-        """将 LeRobot batch 转换为观测格式"""
-        observation = {}
+        """
+        将 LeRobot batch 转换为预处理器期望的格式
         
+        ⚠️ 关键理解：
+        预处理器 pipeline 使用 batch_to_transition 将输入转换为 EnvTransition 格式，
+        然后使用 transition_to_batch 将处理后的数据转换回 batch 格式。
+        
+        所以我们应该提供扁平的 batch 格式：
+        {
+            'observation.state': (B, state_dim),
+            'observation.images.cam_head': (B, C, H, W),
+            'action': (B, action_dim),  # 预处理器会扩展为 (B, T, max_action_dim)
+            'task': str,  # 会被放入 complementary_data
+        }
+        
+        预处理器会：
+        1. 将图像转换为 video 格式并编码为 Eagle 特征
+        2. 将 state 归一化并填充
+        3. 将单帧 action 扩展为 action_horizon 长度并创建 action_mask
+        4. 添加 embodiment_id
+        """
+        result = {}
+        
+        # 1. 复制所有观测数据（保持 observation.* 格式）
         for key, value in batch.items():
-            if key.startswith('observation'):
+            if key.startswith('observation.'):
                 if isinstance(value, torch.Tensor):
-                    observation[key] = value.to(self.device)
+                    result[key] = value.to(self.device)
                 else:
-                    observation[key] = value
+                    result[key] = value
         
-        # 处理 task
+        # 2. 处理 action
+        if 'action' in batch:
+            action = batch['action']
+            if isinstance(action, torch.Tensor):
+                result['action'] = action.to(self.device)
+        
+        # 3. 处理 task
         if 'task' in batch:
             task_value = batch['task']
             if isinstance(task_value, (list, tuple)) and len(task_value) > 0:
-                observation['task'] = task_value[0]
+                result['task'] = task_value[0]
             elif isinstance(task_value, str):
-                observation['task'] = task_value
+                result['task'] = task_value
             else:
-                observation['task'] = "Depalletize the box"
+                result['task'] = "Depalletize the box"
         else:
-            observation['task'] = "Depalletize the box"
+            result['task'] = "Depalletize the box"
         
-        # 添加 action（用于计算 loss）
-        if 'action' in batch:
-            observation['action'] = batch['action'].to(self.device)
-        
-        return observation
+        return result
     
     def _to_device(self, inputs: dict) -> dict:
         """将输入移动到设备"""
