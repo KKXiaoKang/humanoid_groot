@@ -41,6 +41,16 @@ from lerobot.policies.groot.modeling_groot import GrootPolicy
 from lerobot.policies.factory import make_pre_post_processors
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
+# 导入适配层相关类（用于 two_stage_adapter 方法）
+try:
+    from lerobot.policies.groot.weight_merge_groot import DistributionAdapter
+    from lerobot.policies.groot.groot_n1 import BACKBONE_FEATURE_KEY
+    ADAPTER_AVAILABLE = True
+except ImportError:
+    ADAPTER_AVAILABLE = False
+    DistributionAdapter = None
+    BACKBONE_FEATURE_KEY = "backbone_features"
+
 # 可选的可视化工具（如果不存在则禁用）
 try:
     from visualization_tools.visualizers import RerunVisualizer, KeyboardManager
@@ -74,6 +84,163 @@ def load_merge_config(model_path: str) -> dict | None:
         with open(merge_config_path, 'r') as f:
             return json.load(f)
     return None
+
+
+def load_adapter_if_needed(policy: GrootPolicy, model_path: str, merge_config: dict | None) -> DistributionAdapter | None:
+    """
+    如果需要，加载适配层权重
+    
+    Args:
+        policy: GrootPolicy 实例
+        model_path: 模型路径
+        merge_config: 融合配置（如果为 None 会尝试加载）
+    
+    Returns:
+        适配层实例，如果不需要适配层则返回 None
+    """
+    if not ADAPTER_AVAILABLE:
+        return None
+    
+    # 检查是否为 two_stage_adapter 方法
+    if merge_config is None:
+        merge_config = load_merge_config(model_path)
+    
+    if merge_config is None:
+        return None
+    
+    merge_method = merge_config.get('merge_method', '')
+    if merge_method != 'two_stage_adapter':
+        return None
+    
+    print(f"\n🔧 检测到 two_stage_adapter 融合方法，正在加载适配层...")
+    
+    # 加载适配层配置
+    adapter_type = merge_config.get('adapter_type', 'linear')
+    
+    # 获取 hidden_size
+    groot_model = policy._groot_model
+    hidden_size = None
+    
+    # 方法1: 从 action_head 配置中获取 backbone_embedding_dim
+    if hasattr(groot_model, 'action_head') and hasattr(groot_model.action_head, 'config'):
+        hidden_size = getattr(groot_model.action_head.config, 'backbone_embedding_dim', None)
+    
+    # 方法2: 如果方法1失败，从 action_head_cfg 中获取
+    if hidden_size is None and hasattr(groot_model.config, 'action_head_cfg'):
+        hidden_size = groot_model.config.action_head_cfg.get('backbone_embedding_dim', None)
+    
+    # 方法3: 如果还是 None，尝试从实际的 backbone 输出推断
+    if hidden_size is None:
+        try:
+            if hasattr(groot_model.backbone, 'eagle_linear'):
+                if isinstance(groot_model.backbone.eagle_linear, torch.nn.Identity):
+                    hidden_size = 2048
+                elif isinstance(groot_model.backbone.eagle_linear, torch.nn.Linear):
+                    hidden_size = groot_model.backbone.eagle_linear.out_features
+                else:
+                    hidden_size = 2048
+            else:
+                hidden_size = 2048  # GROOT N1.5 默认 backbone 输出维度
+        except Exception as e:
+            print(f"   ⚠️ Warning: Failed to infer hidden_size: {e}")
+            hidden_size = 2048
+    
+    print(f"   📐 Detected backbone hidden_size: {hidden_size}")
+    print(f"   📐 Adapter type: {adapter_type}")
+    
+    # 创建适配层
+    adapter = DistributionAdapter(
+        hidden_size=hidden_size,
+        adapter_type=adapter_type,
+    )
+    
+    # 加载适配层权重
+    try:
+        from safetensors.torch import load_file
+        import glob
+        
+        model_path = Path(model_path)
+        safetensors_files = glob.glob(str(model_path / "model*.safetensors"))
+        
+        if not safetensors_files:
+            print(f"   ⚠️ Warning: 未找到 model.safetensors 文件")
+            return None
+        
+        # 加载权重
+        state_dict = {}
+        for f in sorted(safetensors_files):
+            state_dict.update(load_file(f))
+        
+        # 提取适配层权重
+        adapter_state_dict = {}
+        for key, value in state_dict.items():
+            if key.startswith('distribution_adapter.'):
+                new_key = key[len('distribution_adapter.'):]  # 去掉前缀
+                adapter_state_dict[new_key] = value
+        
+        if not adapter_state_dict:
+            print(f"   ⚠️ Warning: 未找到 distribution_adapter.* 权重")
+            return None
+        
+        # 加载适配层权重
+        adapter.load_state_dict(adapter_state_dict)
+        adapter.eval()  # 设置为评估模式
+        adapter.to(next(policy.parameters()).device)
+        
+        print(f"   ✅ 适配层权重加载成功")
+        print(f"   📊 适配层参数数量: {sum(p.numel() for p in adapter.parameters()):,}")
+        
+        return adapter
+        
+    except Exception as e:
+        print(f"   ⚠️ Warning: 加载适配层权重失败: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+def wrap_policy_with_adapter(policy: GrootPolicy, adapter: DistributionAdapter):
+    """
+    包装 GrootPolicy，使其在推理时使用适配层
+    
+    Args:
+        policy: GrootPolicy 实例
+        adapter: DistributionAdapter 实例
+    """
+    if adapter is None:
+        return
+    
+    # 保存原始的 get_action 方法
+    original_get_action = policy._groot_model.get_action
+    
+    # 定义新的 get_action 方法（使用适配层）
+    def get_action_with_adapter(inputs: dict, **kwargs):
+        # 准备输入
+        backbone_inputs, action_inputs = policy._groot_model.prepare_input(inputs)
+        
+        # 通过 backbone
+        backbone_outputs = policy._groot_model.backbone(backbone_inputs)
+        
+        # 通过适配层
+        backbone_features = backbone_outputs[BACKBONE_FEATURE_KEY]
+        adapted_features = adapter(backbone_features)
+        # 直接修改 BatchFeature 中的数据（BatchFeature 支持字典式赋值）
+        backbone_outputs[BACKBONE_FEATURE_KEY] = adapted_features
+        
+        # 通过 action_head
+        action_head_outputs = policy._groot_model.action_head.get_action(
+            backbone_outputs, 
+            action_inputs, 
+            rtc_enabled=policy._groot_model._rtc_enabled(),
+            **kwargs
+        )
+        
+        return action_head_outputs
+    
+    # 替换 get_action 方法
+    policy._groot_model.get_action = get_action_with_adapter
+    
+    print(f"   ✅ Policy 已包装，适配层将在推理时使用")
 
 
 def eval_on_dataset(
@@ -176,6 +343,11 @@ def eval_on_dataset(
         pretrained_path=model_path,
     )
     print("✅ 模型加载完成")
+    
+    # ⚠️ 关键：如果是 two_stage_adapter 方法，需要加载适配层
+    adapter = load_adapter_if_needed(policy, model_path, merge_config)
+    if adapter is not None:
+        wrap_policy_with_adapter(policy, adapter)
     
     policy.reset()
     

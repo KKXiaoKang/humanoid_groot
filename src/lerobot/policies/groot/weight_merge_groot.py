@@ -1368,6 +1368,85 @@ class MergedModelWithAdapter(nn.Module):
         action_outputs = self.model.action_head.get_action(backbone_outputs, action_inputs, **kwargs)
         
         return action_outputs
+    
+    def forward_with_direct_loss(self, inputs: dict, gt_action: torch.Tensor) -> dict:
+        """
+        使用直接 action MSE loss 进行训练（推荐！）
+        
+        ⚠️ 关键改进：
+        - 直接比较预测 action 和 ground truth action
+        - 梯度直接流向适配层，比 Flow Matching loss 强得多
+        
+        Args:
+            inputs: 模型输入（不需要 action 字段）
+            gt_action: ground truth action (B, action_dim) 或 (B, T, action_dim)
+        
+        Returns:
+            dict with:
+            - 'loss': action MSE loss
+            - 'action_pred': predicted action
+            - 'left_arm_loss', 'right_arm_loss', 'claw_loss': per-component losses
+        """
+        device = next(self.model.parameters()).device
+        use_bf16 = getattr(self.model, "compute_dtype", None) == "bfloat16"
+        
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16):
+            # 1. 通过 backbone
+            backbone_inputs, action_inputs = self.model.prepare_input(inputs)
+            backbone_outputs = self.model.backbone(backbone_inputs)
+            
+            # 2. 通过适配层（保留梯度！）
+            backbone_features = backbone_outputs[BACKBONE_FEATURE_KEY]
+            adapted_features = self.adapter(backbone_features)
+            backbone_outputs[BACKBONE_FEATURE_KEY] = adapted_features
+            
+            # 3. 通过 action_head 获取预测 action
+            # 注意：get_action 是推理方法，但会保留梯度因为我们没有用 no_grad
+            action_outputs = self.model.action_head.get_action(backbone_outputs, action_inputs)
+            action_pred = action_outputs.get('action_pred')  # (B, T, action_dim)
+        
+        # 4. 计算直接 action MSE loss
+        # 确保维度匹配
+        if gt_action.dim() == 2:
+            # gt_action: (B, action_dim) -> 只取预测的第一个时间步
+            pred_first = action_pred[:, 0, :]  # (B, action_dim)
+            total_loss = F.mse_loss(pred_first, gt_action)
+            
+            # 分组计算 loss（假设 action 结构为 [left_arm:7, right_arm:7, left_claw:1, right_claw:1, ...]）
+            # 根据 GROOT 的默认配置
+            if gt_action.shape[-1] >= 16:
+                left_arm_loss = F.mse_loss(pred_first[:, :7], gt_action[:, :7])
+                right_arm_loss = F.mse_loss(pred_first[:, 7:14], gt_action[:, 7:14])
+                claw_loss = F.mse_loss(pred_first[:, 14:16], gt_action[:, 14:16])
+            else:
+                left_arm_loss = right_arm_loss = claw_loss = total_loss
+        else:
+            # gt_action: (B, T, action_dim)
+            total_loss = F.mse_loss(action_pred, gt_action)
+            
+            if gt_action.shape[-1] >= 16:
+                left_arm_loss = F.mse_loss(action_pred[:, :, :7], gt_action[:, :, :7])
+                right_arm_loss = F.mse_loss(action_pred[:, :, 7:14], gt_action[:, :, 7:14])
+                claw_loss = F.mse_loss(action_pred[:, :, 14:16], gt_action[:, :, 14:16])
+            else:
+                left_arm_loss = right_arm_loss = claw_loss = total_loss
+        
+        # 5. 计算双臂协调 loss（左右臂差异的一致性）
+        if gt_action.dim() == 2 and gt_action.shape[-1] >= 14:
+            gt_diff = gt_action[:, :7] - gt_action[:, 7:14]
+            pred_diff = pred_first[:, :7] - pred_first[:, 7:14]
+            arm_coordination_loss = F.mse_loss(pred_diff, gt_diff)
+        else:
+            arm_coordination_loss = torch.tensor(0.0, device=device)
+        
+        return {
+            'loss': total_loss,
+            'action_pred': action_pred,
+            'left_arm_loss': left_arm_loss.item() if isinstance(left_arm_loss, torch.Tensor) else left_arm_loss,
+            'right_arm_loss': right_arm_loss.item() if isinstance(right_arm_loss, torch.Tensor) else right_arm_loss,
+            'claw_loss': claw_loss.item() if isinstance(claw_loss, torch.Tensor) else claw_loss,
+            'arm_coordination_loss': arm_coordination_loss.item() if isinstance(arm_coordination_loss, torch.Tensor) else arm_coordination_loss,
+        }
 
 
 class TwoStageExpertMerger:
@@ -1535,36 +1614,34 @@ class TwoStageExpertMerger:
         train_dataloader,
         num_epochs: int = 20,
         learning_rate: float = 1e-4,
+        use_direct_loss: bool = True,  # ⭐ 新增：使用直接 action loss
     ):
         """
         阶段 2：训练分布适配层
         
+        ⚠️ 重要更新 (2025-01)：
+        - 默认使用直接 action MSE loss（use_direct_loss=True）
+        - 这比 Flow Matching loss 梯度更强，适配层能真正被训练！
+        
         基于 kai0 Model Arithmetic 的思想：
-        使用 action loss（Flow Matching loss）来优化适配层
-        
-        ⚠️ 关键洞察（来自 kai0）：
-        - 他们使用 on-policy 数据（真实执行数据）来优化融合权重
-        - 这里我们使用训练数据集的 action 作为目标
-        - 虽然不是真正的 on-policy，但足以让适配层学习分布映射
-        
-        技术细节：
-        - GROOT 使用 Flow Matching 训练，loss 是预测 velocity 与真实 velocity 的 MSE
-        - action_head.forward() 会自动计算这个 loss
-        - 我们只需要提供正确格式的输入，然后优化适配层参数
+        使用 action loss 来优化适配层
         """
+        loss_type = "Direct Action MSE" if use_direct_loss else "Flow Matching"
+        
         print(f"\n{'='*60}")
         print(f"🏋️ Stage 2: Training Distribution Adapter")
         print(f"   Epochs: {num_epochs}")
         print(f"   Learning rate: {learning_rate}")
+        print(f"   Loss type: {loss_type} {'⭐ (recommended)' if use_direct_loss else ''}")
         print(f"   Optimizer: AdamW")
-        print(f"   💡 基于 kai0 Model Arithmetic 思想")
-        print(f"   📚 使用训练数据集的 action 作为校准目标")
         print(f"{'='*60}\n")
         
-        # 只优化适配层
+        # 只优化适配层 - 使用更大的学习率（如果使用直接 loss）
+        effective_lr = learning_rate * (10 if use_direct_loss else 1)  # 直接 loss 可以用更大学习率
+        
         optimizer = torch.optim.AdamW(
             self.merged_model.adapter.parameters(),
-            lr=learning_rate,
+            lr=effective_lr,
             weight_decay=1e-4,
         )
         
@@ -1580,22 +1657,21 @@ class TwoStageExpertMerger:
         
         for epoch in range(num_epochs):
             epoch_losses = []
-            epoch_details = {}  # 记录各组件 loss
+            epoch_component_losses = {'left_arm': [], 'right_arm': [], 'claw': [], 'coord': []}
             
             for batch_idx, batch in enumerate(train_dataloader):
                 total_batches += 1
                 optimizer.zero_grad()
                 
-                # 准备输入：将 LeRobot batch 转换为 GROOT 格式
+                # 准备输入
                 observation = self._prepare_observation(batch)
                 
+                # 获取 ground truth action（在预处理之前）
+                gt_action = batch.get('action')
+                if gt_action is not None and isinstance(gt_action, torch.Tensor):
+                    gt_action = gt_action.to(self.device)
+                
                 # 使用预处理器处理输入
-                # 预处理器会：
-                # 1. 处理图像 -> video 格式
-                # 2. 处理 state -> (B, 1, max_state_dim) 并归一化
-                # 3. 处理 action -> (B, action_horizon, max_action_dim) 并创建 mask
-                # 4. 处理 language -> Eagle tokenization
-                # 5. 添加 embodiment_id
                 if self.preprocessor is not None:
                     try:
                         inputs = self.preprocessor(observation)
@@ -1610,23 +1686,45 @@ class TwoStageExpertMerger:
                     inputs = self._to_device(observation)
                 
                 # 检查输入是否包含必要的字段
-                if batch_idx == 0:
+                if batch_idx == 0 and epoch == 0:
                     print(f"\n   📋 Input keys: {list(inputs.keys())}")
                     if 'action' in inputs:
                         action_shape = inputs['action'].shape if hasattr(inputs['action'], 'shape') else type(inputs['action'])
                         print(f"   📋 Action shape: {action_shape}")
+                    if gt_action is not None:
+                        print(f"   📋 GT action shape: {gt_action.shape}")
                     if 'action_mask' in inputs:
                         mask_shape = inputs['action_mask'].shape if hasattr(inputs['action_mask'], 'shape') else type(inputs['action_mask'])
                         print(f"   📋 Action mask shape: {mask_shape}")
                 
-                # 前向传播
-                # MergedModelWithAdapter.forward() 会：
-                # 1. 通过融合后的 backbone
-                # 2. 通过分布适配层
-                # 3. 通过 narrower 的 action_head（计算 Flow Matching loss）
                 try:
-                    with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16):
-                        outputs = self.merged_model(inputs)
+                    if use_direct_loss and gt_action is not None:
+                        # ⭐ 使用直接 action loss（推荐）
+                        outputs_dict = self.merged_model.forward_with_direct_loss(inputs, gt_action)
+                        loss = outputs_dict['loss']
+                        
+                        # 记录组件 loss
+                        epoch_component_losses['left_arm'].append(outputs_dict.get('left_arm_loss', 0))
+                        epoch_component_losses['right_arm'].append(outputs_dict.get('right_arm_loss', 0))
+                        epoch_component_losses['claw'].append(outputs_dict.get('claw_loss', 0))
+                        epoch_component_losses['coord'].append(outputs_dict.get('arm_coordination_loss', 0))
+                    else:
+                        # 使用 Flow Matching loss（旧方法）
+                        with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16):
+                            outputs = self.merged_model(inputs)
+                        
+                        if hasattr(outputs, 'data'):
+                            outputs_dict = outputs.data
+                        elif isinstance(outputs, dict):
+                            outputs_dict = outputs
+                        else:
+                            continue
+                        
+                        if 'loss' in outputs_dict:
+                            loss = outputs_dict['loss']
+                        else:
+                            continue
+                    
                 except Exception as e:
                     if batch_idx == 0:
                         print(f"   ⚠️ Forward failed: {e}")
@@ -1634,41 +1732,13 @@ class TwoStageExpertMerger:
                         traceback.print_exc()
                     continue
                 
-                # 获取 loss
-                # GROOT action_head.forward() 返回 BatchFeature，包含：
-                # - 'loss': Flow Matching loss (MSE between predicted velocity and ground truth)
-                # - 其他组件 loss（如 left_arm_loss, right_arm_loss, claw_loss）
-                if hasattr(outputs, 'data'):
-                    outputs_dict = outputs.data
-                elif isinstance(outputs, dict):
-                    outputs_dict = outputs
-                else:
-                    print(f"   ⚠️ Unexpected outputs type: {type(outputs)}")
-                    continue
-                
-                if 'loss' in outputs_dict:
-                    loss = outputs_dict['loss']
-                    
-                    # 记录详细 loss（首次打印）
-                    if batch_idx == 0:
-                        for k, v in outputs_dict.items():
-                            if 'loss' in k.lower() and k != 'loss':
-                                if isinstance(v, (int, float)):
-                                    print(f"      {k}: {v:.4f}")
-                else:
-                    # 如果没有内置 loss，手动计算
-                    if 'action_pred' in outputs_dict and 'action' in inputs:
-                        pred_action = outputs_dict['action_pred']
-                        target_action = inputs['action']
-                        loss = F.mse_loss(pred_action, target_action)
-                        if batch_idx == 0:
-                            print(f"   ⚠️ Using manual MSE loss (no built-in loss)")
-                    else:
-                        if batch_idx == 0:
-                            print(f"   ⚠️ Cannot compute loss")
-                            print(f"      outputs keys: {list(outputs_dict.keys())}")
-                            print(f"      inputs keys: {list(inputs.keys())}")
-                        continue
+                # 首次打印详细 loss
+                if batch_idx == 0 and epoch == 0:
+                    print(f"\n   📊 Loss components:")
+                    for k, v in outputs_dict.items():
+                        if 'loss' in k.lower() and k != 'loss':
+                            if isinstance(v, (int, float)):
+                                print(f"      {k}: {v:.4f}")
                 
                 # 检查 NaN
                 if not torch.isfinite(loss):
@@ -1685,14 +1755,14 @@ class TwoStageExpertMerger:
                     max_norm=1.0,
                 )
                 
-                # 检查梯度
-                if batch_idx == 0:
-                    adapter_has_grad = any(
-                        p.grad is not None and p.grad.abs().sum() > 0
-                        for p in self.merged_model.adapter.parameters()
-                    )
-                    if adapter_has_grad:
-                        print(f"   ✅ Adapter gradients: OK")
+                # 检查梯度（首次）
+                if batch_idx == 0 and epoch == 0:
+                    grad_sum = 0
+                    for p in self.merged_model.adapter.parameters():
+                        if p.grad is not None:
+                            grad_sum += p.grad.abs().sum().item()
+                    if grad_sum > 0:
+                        print(f"   ✅ Adapter gradients: {grad_sum:.4f} (OK)")
                     else:
                         print(f"   ⚠️ Adapter has no gradients!")
                 
@@ -1709,11 +1779,22 @@ class TwoStageExpertMerger:
             if epoch_losses:
                 avg_loss = sum(epoch_losses) / len(epoch_losses)
                 print(f"\n📊 Epoch {epoch+1}/{num_epochs}: avg_loss = {avg_loss:.4f}")
+                
+                # 打印组件 loss 平均值
+                if use_direct_loss and epoch_component_losses['left_arm']:
+                    print(f"   Component losses:")
+                    print(f"      left_arm:  {sum(epoch_component_losses['left_arm'])/len(epoch_component_losses['left_arm']):.4f}")
+                    print(f"      right_arm: {sum(epoch_component_losses['right_arm'])/len(epoch_component_losses['right_arm']):.4f}")
+                    print(f"      claw:      {sum(epoch_component_losses['claw'])/len(epoch_component_losses['claw']):.4f}")
+                    print(f"      coord:     {sum(epoch_component_losses['coord'])/len(epoch_component_losses['coord']):.4f}")
             else:
                 print(f"\n⚠️ Epoch {epoch+1}/{num_epochs}: No successful batches!")
         
         print(f"\n✅ Stage 2 完成: 适配层训练完成")
         print(f"   成功批次: {successful_batches}/{total_batches}")
+        
+        # 打印适配层参数变化
+        self._print_adapter_stats()
         
         if successful_batches == 0:
             print(f"\n⚠️ 警告：没有成功训练的批次！")
@@ -1721,6 +1802,27 @@ class TwoStageExpertMerger:
             print(f"   1. 数据格式不正确")
             print(f"   2. 预处理器配置问题")
             print(f"   3. 模型配置不匹配")
+    
+    def _print_adapter_stats(self):
+        """打印适配层参数统计"""
+        import numpy as np
+        print(f"\n📊 Adapter parameter stats after training:")
+        
+        for name, param in self.merged_model.adapter.named_parameters():
+            p_np = param.detach().cpu().numpy()
+            print(f"   {name}:")
+            print(f"      Mean: {p_np.mean():.6f}, Std: {p_np.std():.6f}")
+            
+            # 检查 Linear weight 是否远离恒等矩阵
+            if 'adapter.0.weight' in name and len(p_np.shape) == 2:
+                if p_np.shape[0] == p_np.shape[1]:
+                    eye = np.eye(p_np.shape[0])
+                    diff = np.abs(p_np - eye).mean()
+                    print(f"      Distance from identity: {diff:.6f}")
+                    if diff < 0.01:
+                        print(f"      ⚠️ Still close to identity! May need more training")
+                    else:
+                        print(f"      ✅ Adapter has learned meaningful transformation")
     
     def _prepare_observation(self, batch: dict) -> dict:
         """
