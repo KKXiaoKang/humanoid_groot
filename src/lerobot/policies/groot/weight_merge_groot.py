@@ -1176,6 +1176,8 @@ class ExpertMerger:
             "expert_names": self.config.expert_names,
             "base_model_path": self.config.base_model_path,
             "coefficient_stats": self.coefficients.get_stats(),
+            "merge_backbone_only": self.config.merge_backbone_only,
+            "action_head_source": self.config.action_head_source,
         }
         with open(output_path / "merge_config.json", "w") as f:
             json.dump(merge_config, f, indent=2)
