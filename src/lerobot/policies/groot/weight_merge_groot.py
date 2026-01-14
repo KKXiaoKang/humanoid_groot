@@ -1365,7 +1365,9 @@ class MergedModelWithAdapter(nn.Module):
         backbone_outputs[BACKBONE_FEATURE_KEY] = adapted_features
         
         # 3. 通过 action_head (推理模式)
-        action_outputs = self.model.action_head.get_action(backbone_outputs, action_inputs, **kwargs)
+        # ⚠️ 修复：get_action 需要 rtc_enabled 参数
+        rtc_enabled = kwargs.pop('rtc_enabled', False)
+        action_outputs = self.model.action_head.get_action(backbone_outputs, action_inputs, rtc_enabled=rtc_enabled, **kwargs)
         
         return action_outputs
     
@@ -1401,9 +1403,11 @@ class MergedModelWithAdapter(nn.Module):
             backbone_outputs[BACKBONE_FEATURE_KEY] = adapted_features
             
             # 3. 通过 action_head 获取预测 action
-            # 注意：get_action 是推理方法，但会保留梯度因为我们没有用 no_grad
-            action_outputs = self.model.action_head.get_action(backbone_outputs, action_inputs)
+            # ⚠️ 注意：get_action 方法有 @torch.no_grad() 装饰器
+            # 所以这个方法的 loss 无法用于反向传播！推荐使用 Flow Matching loss
+            action_outputs = self.model.action_head.get_action(backbone_outputs, action_inputs, rtc_enabled=False)
             action_pred = action_outputs.get('action_pred')  # (B, T, action_dim)
+            # ⚠️ action_pred 没有梯度，此方法仅用于评估，不能用于训练！
         
         # 4. 计算直接 action MSE loss
         # 确保维度匹配
@@ -1614,25 +1618,33 @@ class TwoStageExpertMerger:
         train_dataloader,
         num_epochs: int = 20,
         learning_rate: float = 1e-4,
-        use_direct_loss: bool = True,  # ⭐ 新增：使用直接 action loss
+        use_direct_loss: bool = False,  # ⚠️ 修改：默认使用 Flow Matching loss
     ):
         """
         阶段 2：训练分布适配层
         
-        ⚠️ 重要更新 (2025-01)：
-        - 默认使用直接 action MSE loss（use_direct_loss=True）
-        - 这比 Flow Matching loss 梯度更强，适配层能真正被训练！
+        ⚠️ 重要说明：
+        - 默认使用 Flow Matching loss（use_direct_loss=False）
+        - 因为 get_action 方法有 @torch.no_grad() 装饰器，直接 action loss 无法反向传播
+        - Flow Matching loss 是训练 action head 的标准方式，有完整的梯度支持
         
         基于 kai0 Model Arithmetic 的思想：
         使用 action loss 来优化适配层
         """
         loss_type = "Direct Action MSE" if use_direct_loss else "Flow Matching"
         
+        # ⚠️ 警告：Direct Action MSE 由于 @torch.no_grad() 装饰器无法工作
+        if use_direct_loss:
+            print(f"\n⚠️ 警告：Direct Action MSE loss 由于 get_action 方法的 @torch.no_grad() 装饰器无法反向传播！")
+            print(f"   自动切换到 Flow Matching loss...")
+            use_direct_loss = False
+            loss_type = "Flow Matching"
+        
         print(f"\n{'='*60}")
         print(f"🏋️ Stage 2: Training Distribution Adapter")
         print(f"   Epochs: {num_epochs}")
         print(f"   Learning rate: {learning_rate}")
-        print(f"   Loss type: {loss_type} {'⭐ (recommended)' if use_direct_loss else ''}")
+        print(f"   Loss type: {loss_type}")
         print(f"   Optimizer: AdamW")
         print(f"{'='*60}\n")
         
