@@ -91,16 +91,18 @@ case $METHOD in
         echo ""
         echo "📚 校准数据：将使用 lerobot_data/split_dataset 文件夹中的训练数据集"
         echo ""
+        # ⚠️ 关键改进：使用 MLP adapter + 更大学习率 + 更多数据
+        # 原因：Flow Matching loss 对适配层的梯度太弱，需要更强的训练策略
         python scripts/train_weight_merge.py \
             --method two_stage_adapter \
             --narrower_path "$NARROWER_PATH" \
             --wider_path "$WIDER_PATH" \
             --use_default_datasets \
             --alpha 0.5 \
-            --adapter_type linear \
-            --adapter_epochs 20 \
-            --adapter_lr 1e-4 \
-            --num_samples 20 \
+            --adapter_type mlp \
+            --adapter_epochs 50 \
+            --adapter_lr 1e-3 \
+            --num_samples 100 \
             --batch_size 1 \
             --device "$DEVICE" \
             --output_path "$OUTPUT_PATH"

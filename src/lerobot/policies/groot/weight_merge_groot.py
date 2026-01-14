@@ -1221,6 +1221,10 @@ class DistributionAdapter(nn.Module):
         self.adapter_type = adapter_type
         
         if adapter_type == "linear":
+            # ⚠️ 警告：Linear adapter 表达能力不够，可能导致训练失败
+            # 建议使用 MLP adapter
+            print(f"   ⚠️ Warning: Linear adapter may not have enough capacity!")
+            print(f"      Consider using 'mlp' adapter_type for better results.")
             # 简单线性变换 + LayerNorm（最轻量）
             self.adapter = nn.Sequential(
                 nn.Linear(hidden_size, hidden_size, bias=True),
@@ -1231,7 +1235,7 @@ class DistributionAdapter(nn.Module):
             nn.init.zeros_(self.adapter[0].bias)
             
         elif adapter_type == "mlp":
-            # 两层 MLP（更强表达能力）
+            # 两层 MLP（更强表达能力）+ 残差连接
             self.adapter = nn.Sequential(
                 nn.Linear(hidden_size, hidden_size * 2),
                 nn.GELU(),
@@ -1239,7 +1243,11 @@ class DistributionAdapter(nn.Module):
                 nn.Linear(hidden_size * 2, hidden_size),
                 nn.LayerNorm(hidden_size),
             )
-            # 初始化最后一层接近零（残差风格）
+            # ⚠️ 关键改进：更好的初始化策略
+            # 第一层：Xavier 初始化，小 gain（接近恒等映射但允许变化）
+            nn.init.xavier_uniform_(self.adapter[0].weight, gain=0.1)
+            nn.init.zeros_(self.adapter[0].bias)
+            # 最后一层：初始化为接近零（残差风格，更容易学习）
             nn.init.zeros_(self.adapter[-2].weight)
             nn.init.zeros_(self.adapter[-2].bias)
             
@@ -1261,7 +1269,9 @@ class DistributionAdapter(nn.Module):
             适配后的特征 [B, T, hidden_size]
         """
         if self.adapter_type == "mlp":
-            # 残差连接
+            # ⚠️ 关键：残差连接让适配层更容易学习
+            # 初始时 residual_scale=1.0，adapter 输出接近 0，所以输出 ≈ x
+            # 训练时 adapter 学习到有用的变换，residual_scale 可以调整强度
             return x + self.residual_scale * self.adapter(x)
         else:
             return self.adapter(x)
@@ -1648,18 +1658,33 @@ class TwoStageExpertMerger:
         print(f"   Optimizer: AdamW")
         print(f"{'='*60}\n")
         
-        # 只优化适配层 - 使用更大的学习率（如果使用直接 loss）
-        effective_lr = learning_rate * (10 if use_direct_loss else 1)  # 直接 loss 可以用更大学习率
+        # ⚠️ 关键改进：使用更大的学习率（Flow Matching loss 梯度弱）
+        # 默认学习率 1e-4 太小，建议使用 1e-3 或更大
+        effective_lr = learning_rate
+        if learning_rate <= 1e-4:
+            print(f"   ⚠️ Warning: Learning rate {learning_rate} may be too small!")
+            print(f"      Recommended: 1e-3 or larger for adapter training")
+            print(f"      Flow Matching loss has weak gradients, need larger LR")
         
         optimizer = torch.optim.AdamW(
             self.merged_model.adapter.parameters(),
             lr=effective_lr,
             weight_decay=1e-4,
+            betas=(0.9, 0.999),
         )
         
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=num_epochs
-        )
+        # ⚠️ 关键改进：使用 Warmup + CosineAnnealing
+        # Warmup 让适配层先适应，然后逐步学习
+        warmup_epochs = max(1, num_epochs // 10)  # 10% warmup
+        def lr_lambda(epoch):
+            if epoch < warmup_epochs:
+                return (epoch + 1) / warmup_epochs  # Linear warmup
+            else:
+                # Cosine annealing after warmup
+                progress = (epoch - warmup_epochs) / (num_epochs - warmup_epochs)
+                return 0.5 * (1 + np.cos(np.pi * progress))
+        
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
         
         self.merged_model.train()
         
@@ -1767,24 +1792,33 @@ class TwoStageExpertMerger:
                     max_norm=1.0,
                 )
                 
-                # 检查梯度（首次）
-                if batch_idx == 0 and epoch == 0:
+                # 检查梯度（每个 epoch 的前几个 batch）
+                if batch_idx < 3 and epoch == 0:
                     grad_sum = 0
-                    for p in self.merged_model.adapter.parameters():
+                    grad_max = 0
+                    param_count = 0
+                    for name, p in self.merged_model.adapter.named_parameters():
                         if p.grad is not None:
                             grad_sum += p.grad.abs().sum().item()
+                            grad_max = max(grad_max, p.grad.abs().max().item())
+                            param_count += p.numel()
+                    
                     if grad_sum > 0:
-                        print(f"   ✅ Adapter gradients: {grad_sum:.4f} (OK)")
+                        grad_mean = grad_sum / param_count if param_count > 0 else 0
+                        print(f"   ✅ Adapter gradients: mean={grad_mean:.6f}, max={grad_max:.6f}")
+                        if grad_mean < 1e-6:
+                            print(f"   ⚠️ Warning: Gradients are very small! May need larger learning rate")
                     else:
-                        print(f"   ⚠️ Adapter has no gradients!")
+                        print(f"   ⚠️ Adapter has no gradients! Check computation graph!")
                 
                 optimizer.step()
                 epoch_losses.append(loss.item())
                 successful_batches += 1
                 
                 if batch_idx % 10 == 0:
+                    current_lr = optimizer.param_groups[0]['lr']
                     print(f"   Epoch {epoch+1}/{num_epochs}, Batch {batch_idx}: "
-                          f"loss = {loss.item():.4f}, grad_norm = {grad_norm:.4f}")
+                          f"loss = {loss.item():.4f}, grad_norm = {grad_norm:.4f}, lr = {current_lr:.2e}")
             
             scheduler.step()
             
@@ -1820,6 +1854,8 @@ class TwoStageExpertMerger:
         import numpy as np
         print(f"\n📊 Adapter parameter stats after training:")
         
+        adapter_trained = False
+        
         for name, param in self.merged_model.adapter.named_parameters():
             p_np = param.detach().cpu().numpy()
             print(f"   {name}:")
@@ -1832,9 +1868,34 @@ class TwoStageExpertMerger:
                     diff = np.abs(p_np - eye).mean()
                     print(f"      Distance from identity: {diff:.6f}")
                     if diff < 0.01:
-                        print(f"      ⚠️ Still close to identity! May need more training")
+                        print(f"      ⚠️ Still close to identity! Training failed!")
+                        print(f"      Possible reasons:")
+                        print(f"        1. Learning rate too small (try 1e-3)")
+                        print(f"        2. Not enough training epochs (try 50+)")
+                        print(f"        3. Not enough data (try 100+ samples)")
+                        print(f"        4. Flow Matching loss gradients too weak")
                     else:
                         print(f"      ✅ Adapter has learned meaningful transformation")
+                        adapter_trained = True
+            
+            # 检查 residual_scale
+            if 'residual_scale' in name:
+                scale_val = p_np.item()
+                print(f"      Residual scale: {scale_val:.6f}")
+                if abs(scale_val - 1.0) < 0.01:
+                    print(f"      ⚠️ Residual scale unchanged! Adapter may not be learning")
+                else:
+                    print(f"      ✅ Residual scale adjusted")
+                    adapter_trained = True
+        
+        if not adapter_trained:
+            print(f"\n⚠️ 警告：适配层可能没有被训练！")
+            print(f"   建议：")
+            print(f"   1. 使用 MLP adapter: --adapter_type mlp")
+            print(f"   2. 增大学习率: --adapter_lr 1e-3")
+            print(f"   3. 增加训练轮数: --adapter_epochs 50")
+            print(f"   4. 增加样本数: --num_samples 100")
+            print(f"   5. 或者尝试不使用适配层的方法（见下方）")
     
     def _prepare_observation(self, batch: dict) -> dict:
         """
