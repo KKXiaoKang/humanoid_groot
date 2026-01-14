@@ -29,8 +29,8 @@ set -e
 METHOD=${1:-expert_merge}
 
 # 模型路径
-NARROWER_PATH="/home/kangkk/humanoid_groot/outputs/0112_h100x4_groot_cross_attention_narrower_very_conservative/checkpoints/020000/pretrained_model"
-WIDER_PATH="/home/kangkk/humanoid_groot/outputs/0113_h100x4_groot_cross_attention_wider_very_conservative_mix_dense/checkpoints/014000/pretrained_model"
+NARROWER_PATH="/home/kangkk/humanoid_groot_base/outputs/0112_h100x4_groot_cross_attention_narrower_very_conservative/checkpoints/020000/pretrained_model"
+WIDER_PATH="/home/kangkk/humanoid_groot_base/outputs/0113_h100x4_groot_cross_attention_wider_very_conservative_mix_dense/checkpoints/014000/pretrained_model"
 OUTPUT_PATH="./outputs/merged_groot/pretrained_model"
 
 # ⚠️ 重要：Base 模型必须与专家模型有相同的架构！
@@ -38,8 +38,8 @@ OUTPUT_PATH="./outputs/merged_groot/pretrained_model"
 BASE_MODEL_PATH="$NARROWER_PATH"
 
 # GPU 控制：第二个参数指定 GPU ID
-# 如果指定了多个 GPU（用逗号分隔），使用 CUDA_VISIBLE_DEVICES
-# 如果指定了单个 GPU，传递给 --device 参数
+# ⚠️ 重要：始终使用 CUDA_VISIBLE_DEVICES 来确保只使用指定的 GPU
+# 这样不会影响其他 GPU 上的任务，也不会被之前的 CUDA_VISIBLE_DEVICES 影响
 if [ -n "$2" ]; then
     GPU_ARG="$2"
     # 检查是否包含逗号（多个 GPU）
@@ -49,14 +49,17 @@ if [ -n "$2" ]; then
         DEVICE="cuda:0"  # 在可见的 GPU 中，使用第一个
         GPU_INFO="GPU: $GPU_ARG (CUDA_VISIBLE_DEVICES)"
     else
-        # 单个 GPU：直接传递给 --device
-        DEVICE="cuda:$GPU_ARG"
-        GPU_INFO="GPU: $DEVICE"
+        # 单个 GPU：也使用 CUDA_VISIBLE_DEVICES 来限制只使用这个 GPU
+        export CUDA_VISIBLE_DEVICES="$GPU_ARG"
+        DEVICE="cuda:0"  # 在可见的 GPU 中，使用第一个（逻辑上就是指定的 GPU）
+        GPU_INFO="GPU: $GPU_ARG (CUDA_VISIBLE_DEVICES, device=cuda:0)"
     fi
 else
-    # 默认使用 cuda:0
+    # 默认使用 cuda:0，但不设置 CUDA_VISIBLE_DEVICES（使用系统默认）
+    # 如果之前环境中有 CUDA_VISIBLE_DEVICES，需要清理
+    unset CUDA_VISIBLE_DEVICES
     DEVICE="cuda:0"
-    GPU_INFO="GPU: $DEVICE (默认)"
+    GPU_INFO="GPU: $DEVICE (默认，未限制 CUDA_VISIBLE_DEVICES)"
 fi
 
 echo "======================================"
@@ -64,6 +67,9 @@ echo "🚀 GROOT 模型权重融合"
 echo "   方法: ${METHOD}"
 echo "   ${GPU_INFO}"
 echo "   输出: ${OUTPUT_PATH}"
+if [ -n "$CUDA_VISIBLE_DEVICES" ]; then
+    echo "   ⚠️ CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} (只使用这些 GPU)"
+fi
 echo "======================================"
 
 case $METHOD in
@@ -81,6 +87,9 @@ case $METHOD in
         echo "   - N (num_samples) = 5: 性能饱和点"
         echo "   - epochs = 10: 足够收敛"
         echo ""
+        echo "⚠️ 重要：只融合 Backbone，Action Head (DiT) 使用 narrower 模型的！"
+        echo "   DiT 对参数变化非常敏感，不能直接线性插值。"
+        echo ""
         echo "💡 注意：Hidden loss 不下降是正常的！这是多目标优化问题。"
         echo "   真正的评估应该在实际任务上进行。"
         echo ""
@@ -96,13 +105,14 @@ case $METHOD in
             --regularization_weight 0.8 \
             --initial_coefficient 0.5 \
             --merge_backbone_only \
-            --action_head_source interpolate \
+            --action_head_source first_expert \
             --device "$DEVICE" \
             --output_path "$OUTPUT_PATH"
         ;;
     
     task_arithmetic)
         echo "使用 Task Arithmetic 方法（无需训练，快速）..."
+        echo "⚠️ 重要：只融合 Backbone，Action Head (DiT) 使用 narrower 模型的！"
         python scripts/train_weight_merge.py \
             --method task_arithmetic \
             --narrower_path "$NARROWER_PATH" \
@@ -110,12 +120,14 @@ case $METHOD in
             --base_model_path "$BASE_MODEL_PATH" \
             --narrower_weight 0.5 \
             --wider_weight 0.5 \
+            --skip_action_head \
             --device "$DEVICE" \
             --output_path "$OUTPUT_PATH"
         ;;
     
     ties)
         echo "使用 TIES Merging 方法..."
+        echo "⚠️ 重要：只融合 Backbone，Action Head (DiT) 使用 narrower 模型的！"
         python scripts/train_weight_merge.py \
             --method ties \
             --narrower_path "$NARROWER_PATH" \
@@ -123,12 +135,14 @@ case $METHOD in
             --base_model_path "$BASE_MODEL_PATH" \
             --ties_trim_ratio 0.2 \
             --ties_scale 1.0 \
+            --skip_action_head \
             --device "$DEVICE" \
             --output_path "$OUTPUT_PATH"
         ;;
     
     dare)
         echo "使用 DARE Merging 方法..."
+        echo "⚠️ 重要：只融合 Backbone，Action Head (DiT) 使用 narrower 模型的！"
         python scripts/train_weight_merge.py \
             --method dare \
             --narrower_path "$NARROWER_PATH" \
@@ -137,17 +151,20 @@ case $METHOD in
             --dare_drop_rate 0.1 \
             --narrower_weight 0.5 \
             --wider_weight 0.5 \
+            --skip_action_head \
             --device "$DEVICE" \
             --output_path "$OUTPUT_PATH"
         ;;
     
     interpolation)
         echo "使用直接插值方法（最简单）..."
+        echo "⚠️ 重要：只融合 Backbone，Action Head (DiT) 使用 narrower 模型的！"
         python scripts/train_weight_merge.py \
             --method interpolation \
             --narrower_path "$NARROWER_PATH" \
             --wider_path "$WIDER_PATH" \
             --alpha 0.5 \
+            --skip_action_head \
             --device "$DEVICE" \
             --output_path "$OUTPUT_PATH"
         ;;

@@ -53,9 +53,9 @@ logger = logging.getLogger(__name__)
 
 # 模型路径
 MODEL_NARROW_PATH = \
-    "/home/kangkk/humanoid_groot/outputs/0112_h100x4_groot_cross_attention_narrower_very_conservative/checkpoints/020000/pretrained_model"
+    "/home/kangkk/humanoid_groot_base/outputs/0112_h100x4_groot_cross_attention_narrower_very_conservative/checkpoints/020000/pretrained_model"
 MODEL_WIDE_PATH = \
-    "/home/kangkk/humanoid_groot/outputs/0113_h100x4_groot_cross_attention_wider_very_conservative_mix_dense/checkpoints/014000/pretrained_model"
+    "/home/kangkk/humanoid_groot_base/outputs/0113_h100x4_groot_cross_attention_wider_very_conservative_mix_dense/checkpoints/014000/pretrained_model"
 
 # ⚠️ 重要：Base 模型必须与专家模型有相同的架构！
 # 不能使用 nvidia/GR00T-N1.5-3B，因为原始预训练模型的 action_head 结构不同
@@ -67,15 +67,15 @@ BASE_MODEL_PATH = MODEL_NARROW_PATH
 # 混合使用窄箱子和宽箱子的数据，以确保融合模型能处理两种任务
 DEFAULT_CALIBRATION_DATASETS = [
     # 窄箱子相关数据集 (narrower)
-    "/home/kangkk/humanoid_groot/lerobot_data/split_dataset/narrower/four",
-    "/home/kangkk/humanoid_groot/lerobot_data/split_dataset/narrower/random",
-    "/home/kangkk/humanoid_groot/lerobot_data/split_dataset/narrower/dense",
-    "/home/kangkk/humanoid_groot/lerobot_data/split_dataset/narrower/mix",
+    "/home/kangkk/humanoid_groot_base/lerobot_data/split_dataset/narrower/four",
+    "/home/kangkk/humanoid_groot_base/lerobot_data/split_dataset/narrower/random",
+    "/home/kangkk/humanoid_groot_base/lerobot_data/split_dataset/narrower/dense",
+    "/home/kangkk/humanoid_groot_base/lerobot_data/split_dataset/narrower/mix",
     # 宽箱子相关数据集 (wider)
-    "/home/kangkk/humanoid_groot/lerobot_data/split_dataset/wider/four",
-    "/home/kangkk/humanoid_groot/lerobot_data/split_dataset/wider/random",
-    "/home/kangkk/humanoid_groot/lerobot_data/split_dataset/wider/dense",
-    "/home/kangkk/humanoid_groot/lerobot_data/split_dataset/wider/mix",
+    "/home/kangkk/humanoid_groot_base/lerobot_data/split_dataset/wider/four",
+    "/home/kangkk/humanoid_groot_base/lerobot_data/split_dataset/wider/random",
+    "/home/kangkk/humanoid_groot_base/lerobot_data/split_dataset/wider/dense",
+    "/home/kangkk/humanoid_groot_base/lerobot_data/split_dataset/wider/mix",
 ]
 
 
@@ -412,6 +412,9 @@ def run_task_arithmetic_merge(args):
     运行 Task Arithmetic 融合
     
     θ_merged = θ_base + α_narrow * (θ_narrow - θ_base) + α_wide * (θ_wide - θ_base)
+    
+    ⚠️ 重要：如果 skip_action_head=True，只融合 backbone，action_head 使用 narrower 的
+    DiT 对参数变化非常敏感，不能直接线性插值！
     """
     from lerobot.policies.groot.weight_merge_groot import simple_task_arithmetic_merge
     
@@ -422,6 +425,7 @@ def run_task_arithmetic_merge(args):
         base_model_path=args.base_model_path,
         narrower_weight=args.narrower_weight,
         wider_weight=args.wider_weight,
+        skip_action_head=args.skip_action_head,
     )
 
 
@@ -430,6 +434,9 @@ def run_interpolation_merge(args):
     运行直接插值融合
     
     θ_merged = α * θ_narrow + (1-α) * θ_wide
+    
+    ⚠️ 重要：如果 skip_action_head=True，只融合 backbone，action_head 使用 narrower 的
+    DiT 对参数变化非常敏感，不能直接线性插值！
     """
     from lerobot.policies.groot.weight_merge_groot import direct_interpolation_merge
     
@@ -438,6 +445,7 @@ def run_interpolation_merge(args):
         wider_path=args.wider_path,
         output_path=args.output_path,
         alpha=args.alpha,
+        skip_action_head=args.skip_action_head,
     )
 
 
@@ -521,6 +529,9 @@ def run_ties_merge(args):
     1. Trim: 剪枝小的参数变化
     2. Elect Sign: 解决符号冲突
     3. Scale: 重缩放
+    
+    ⚠️ 重要：如果 skip_action_head=True，只融合 backbone，action_head 使用 narrower 的
+    DiT 对参数变化非常敏感，不能直接线性插值！
     """
     from pathlib import Path
     import glob
@@ -533,6 +544,8 @@ def run_ties_merge(args):
     print(f"🔧 TIES Merging")
     print(f"   Trim ratio: {args.ties_trim_ratio}")
     print(f"   Scale: {args.ties_scale}")
+    if args.skip_action_head:
+        print(f"   ⚠️ Skip action_head: True (使用 narrower 的 DiT)")
     print(f"{'='*60}\n")
     
     def load_weights(path: str) -> dict:
@@ -603,12 +616,25 @@ def run_ties_merge(args):
     )
     
     # 应用到 base
+    # ⚠️ 重要：如果 skip_action_head=True，跳过 action_head 层的融合
     merged_state_dict = {}
+    skipped_action_head_layers = 0
     for k in base_state_dict:
-        if k in merged_task_vector:
+        # 检查是否是 action_head 层
+        if args.skip_action_head and k.startswith('action_head.'):
+            # 使用 narrower 的 action_head
+            if k in narrower_state_dict:
+                merged_state_dict[k] = narrower_state_dict[k]
+                skipped_action_head_layers += 1
+            else:
+                merged_state_dict[k] = base_state_dict[k]
+        elif k in merged_task_vector:
             merged_state_dict[k] = base_state_dict[k] + merged_task_vector[k]
         else:
             merged_state_dict[k] = base_state_dict[k]
+    
+    if args.skip_action_head:
+        print(f"⚠️ Skipped {skipped_action_head_layers} action_head layers (使用 narrower 的 DiT)")
     
     # 保存
     output_path = Path(args.output_path)
@@ -634,6 +660,8 @@ def run_ties_merge(args):
         "base_model_path": args.base_model_path,
         "trim_ratio": args.ties_trim_ratio,
         "scale": args.ties_scale,
+        "skip_action_head": args.skip_action_head,
+        "action_head_source": "narrower" if args.skip_action_head else "merged",
     }
     with open(output_path / "merge_config.json", "w") as f:
         json.dump(merge_config, f, indent=2)
@@ -647,6 +675,9 @@ def run_dare_merge(args):
     
     DARE: Drop And REscale
     随机丢弃部分参数变化，然后重新缩放
+    
+    ⚠️ 重要：如果 skip_action_head=True，只融合 backbone，action_head 使用 narrower 的
+    DiT 对参数变化非常敏感，不能直接线性插值！
     """
     from pathlib import Path
     import glob
@@ -658,6 +689,8 @@ def run_dare_merge(args):
     print(f"\n{'='*60}")
     print(f"🔧 DARE Merging")
     print(f"   Drop rate: {args.dare_drop_rate}")
+    if args.skip_action_head:
+        print(f"   ⚠️ Skip action_head: True (使用 narrower 的 DiT)")
     print(f"{'='*60}\n")
     
     def load_weights(path: str) -> dict:
@@ -702,14 +735,28 @@ def run_dare_merge(args):
     τ_wide_dare = dare_process(τ_wide, args.dare_drop_rate)
     
     # 融合
+    # ⚠️ 重要：如果 skip_action_head=True，跳过 action_head 层的融合
     merged_state_dict = {}
+    skipped_action_head_layers = 0
     for k in base_state_dict:
-        merged = base_state_dict[k].clone()
-        if k in τ_narrow_dare:
-            merged = merged + args.narrower_weight * τ_narrow_dare[k]
-        if k in τ_wide_dare:
-            merged = merged + args.wider_weight * τ_wide_dare[k]
-        merged_state_dict[k] = merged
+        # 检查是否是 action_head 层
+        if args.skip_action_head and k.startswith('action_head.'):
+            # 使用 narrower 的 action_head
+            if k in narrower_state_dict:
+                merged_state_dict[k] = narrower_state_dict[k]
+                skipped_action_head_layers += 1
+            else:
+                merged_state_dict[k] = base_state_dict[k]
+        else:
+            merged = base_state_dict[k].clone()
+            if k in τ_narrow_dare:
+                merged = merged + args.narrower_weight * τ_narrow_dare[k]
+            if k in τ_wide_dare:
+                merged = merged + args.wider_weight * τ_wide_dare[k]
+            merged_state_dict[k] = merged
+    
+    if args.skip_action_head:
+        print(f"⚠️ Skipped {skipped_action_head_layers} action_head layers (使用 narrower 的 DiT)")
     
     # 保存
     output_path = Path(args.output_path)
@@ -736,6 +783,8 @@ def run_dare_merge(args):
         "drop_rate": args.dare_drop_rate,
         "narrower_weight": args.narrower_weight,
         "wider_weight": args.wider_weight,
+        "skip_action_head": args.skip_action_head,
+        "action_head_source": "narrower" if args.skip_action_head else "merged",
     }
     with open(output_path / "merge_config.json", "w") as f:
         json.dump(merge_config, f, indent=2)
@@ -811,6 +860,9 @@ def main():
     parser.add_argument("--action_head_source", type=str, default="first_expert",
                        choices=["first_expert", "second_expert", "interpolate"],
                        help="Action head source when merge_backbone_only=True: first_expert (narrower), second_expert (wider), or interpolate")
+    parser.add_argument("--skip_action_head", action="store_true", default=False,
+                       help="⚠️ 重要：跳过 action_head (DiT) 的融合，使用 narrower 模型的 action_head。"
+                            "DiT 对参数变化非常敏感，不能直接线性插值！")
     
     # TIES 参数
     parser.add_argument("--ties_trim_ratio", type=float, default=0.2,

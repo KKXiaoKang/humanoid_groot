@@ -1236,11 +1236,15 @@ def simple_task_arithmetic_merge(
     base_model_path: str = "nvidia/GR00T-N1.5-3B",
     narrower_weight: float = 0.5,
     wider_weight: float = 0.5,
+    skip_action_head: bool = False,
 ) -> None:
     """
     简单的 Task Arithmetic 融合（无需训练）
     
     θ_merged = θ_base + α_narrow * τ_narrow + α_wide * τ_wide
+    
+    ⚠️ 重要：如果 skip_action_head=True，只融合 backbone，action_head 使用 narrower 的
+    DiT 对参数变化非常敏感，不能直接线性插值！
     
     Args:
         narrower_path: 窄箱子模型路径
@@ -1249,11 +1253,14 @@ def simple_task_arithmetic_merge(
         base_model_path: Base 模型路径
         narrower_weight: 窄箱子模型权重
         wider_weight: 宽箱子模型权重
+        skip_action_head: 是否跳过 action_head (DiT) 的融合
     """
     print(f"\n{'='*60}")
     print(f"🔧 Simple Task Arithmetic Merge")
     print(f"   narrower weight: {narrower_weight}")
     print(f"   wider weight: {wider_weight}")
+    if skip_action_head:
+        print(f"   ⚠️ Skip action_head: True (使用 narrower 的 DiT)")
     print(f"{'='*60}\n")
     
     # 加载权重
@@ -1285,14 +1292,28 @@ def simple_task_arithmetic_merge(
     τ_wide = {k: wider_state_dict[k] - base_state_dict[k] for k in base_state_dict if k in wider_state_dict}
     
     # 融合
+    # ⚠️ 重要：如果 skip_action_head=True，跳过 action_head 层的融合
     merged_state_dict = {}
+    skipped_action_head_layers = 0
     for k in base_state_dict:
-        merged = base_state_dict[k].clone()
-        if k in τ_narrow:
-            merged = merged + narrower_weight * τ_narrow[k]
-        if k in τ_wide:
-            merged = merged + wider_weight * τ_wide[k]
-        merged_state_dict[k] = merged
+        # 检查是否是 action_head 层
+        if skip_action_head and k.startswith('action_head.'):
+            # 使用 narrower 的 action_head
+            if k in narrower_state_dict:
+                merged_state_dict[k] = narrower_state_dict[k]
+                skipped_action_head_layers += 1
+            else:
+                merged_state_dict[k] = base_state_dict[k]
+        else:
+            merged = base_state_dict[k].clone()
+            if k in τ_narrow:
+                merged = merged + narrower_weight * τ_narrow[k]
+            if k in τ_wide:
+                merged = merged + wider_weight * τ_wide[k]
+            merged_state_dict[k] = merged
+    
+    if skip_action_head:
+        print(f"⚠️ Skipped {skipped_action_head_layers} action_head layers (使用 narrower 的 DiT)")
     
     # 保存
     output_path = Path(output_path)
@@ -1320,6 +1341,8 @@ def simple_task_arithmetic_merge(
         "base_model_path": base_model_path,
         "narrower_weight": narrower_weight,
         "wider_weight": wider_weight,
+        "skip_action_head": skip_action_head,
+        "action_head_source": "narrower" if skip_action_head else "merged",
     }
     with open(output_path / "merge_config.json", "w") as f:
         json.dump(merge_config, f, indent=2)
@@ -1332,22 +1355,29 @@ def direct_interpolation_merge(
     wider_path: str,
     output_path: str,
     alpha: float = 0.5,
+    skip_action_head: bool = False,
 ) -> None:
     """
     直接权重插值（最简单的方法）
     
     θ_merged = α * θ_narrow + (1-α) * θ_wide
     
+    ⚠️ 重要：如果 skip_action_head=True，只融合 backbone，action_head 使用 narrower 的
+    DiT 对参数变化非常敏感，不能直接线性插值！
+    
     Args:
         narrower_path: 窄箱子模型路径
         wider_path: 宽箱子模型路径
         output_path: 输出路径
         alpha: 插值系数 (0=全用wider, 1=全用narrower)
+        skip_action_head: 是否跳过 action_head (DiT) 的融合
     """
     print(f"\n{'='*60}")
     print(f"🔧 Direct Interpolation Merge")
     print(f"   alpha (narrower): {alpha}")
     print(f"   1-alpha (wider): {1-alpha}")
+    if skip_action_head:
+        print(f"   ⚠️ Skip action_head: True (使用 narrower 的 DiT)")
     print(f"{'='*60}\n")
     
     def load_weights(path: str) -> dict:
@@ -1362,12 +1392,22 @@ def direct_interpolation_merge(
     wider_state_dict = load_weights(wider_path)
     
     # 直接插值
+    # ⚠️ 重要：如果 skip_action_head=True，跳过 action_head 层的融合
     merged_state_dict = {}
+    skipped_action_head_layers = 0
     for k in narrower_state_dict:
-        if k in wider_state_dict:
+        # 检查是否是 action_head 层
+        if skip_action_head and k.startswith('action_head.'):
+            # 使用 narrower 的 action_head（不进行插值！）
+            merged_state_dict[k] = narrower_state_dict[k]
+            skipped_action_head_layers += 1
+        elif k in wider_state_dict:
             merged_state_dict[k] = alpha * narrower_state_dict[k] + (1 - alpha) * wider_state_dict[k]
         else:
             merged_state_dict[k] = narrower_state_dict[k]
+    
+    if skip_action_head:
+        print(f"⚠️ Skipped {skipped_action_head_layers} action_head layers (使用 narrower 的 DiT)")
     
     # 保存
     output_path = Path(output_path)
@@ -1392,6 +1432,8 @@ def direct_interpolation_merge(
         "narrower_path": str(narrower_path),
         "wider_path": str(wider_path),
         "alpha": alpha,
+        "skip_action_head": skip_action_head,
+        "action_head_source": "narrower" if skip_action_head else "interpolated",
     }
     with open(output_path / "merge_config.json", "w") as f:
         json.dump(merge_config, f, indent=2)
