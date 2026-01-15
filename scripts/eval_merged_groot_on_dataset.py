@@ -181,14 +181,29 @@ def load_adapter_if_needed(policy: GrootPolicy, model_path: str, merge_config: d
             state_dict.update(load_file(f))
         
         # 提取适配层权重
+        # ⚠️ 关键修复：支持两种键名格式
+        # 1. 新格式：`_groot_model.distribution_adapter.*`
+        # 2. 旧格式：`distribution_adapter.*`（向后兼容）
         adapter_state_dict = {}
         for key, value in state_dict.items():
-            if key.startswith('distribution_adapter.'):
-                new_key = key[len('distribution_adapter.'):]  # 去掉前缀
+            if key.startswith('_groot_model.distribution_adapter.'):
+                # 新格式：去掉 `_groot_model.distribution_adapter.` 前缀
+                new_key = key[len('_groot_model.distribution_adapter.'):]
+                adapter_state_dict[new_key] = value
+            elif key.startswith('distribution_adapter.'):
+                # 旧格式：去掉 `distribution_adapter.` 前缀
+                new_key = key[len('distribution_adapter.'):]
                 adapter_state_dict[new_key] = value
         
         if not adapter_state_dict:
             print(f"   ⚠️ Warning: 未找到 distribution_adapter.* 权重")
+            print(f"   📋 可用的权重键前缀:")
+            prefixes = set()
+            for k in state_dict.keys():
+                prefix = k.split('.')[0]
+                prefixes.add(prefix)
+            for p in sorted(prefixes):
+                print(f"      - {p}")
             return None
         
         # 加载适配层权重

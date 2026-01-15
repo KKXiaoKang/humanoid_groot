@@ -1255,7 +1255,21 @@ class SparseLoRAAdapter(nn.Module):
         # 任务掩码：每个任务激活哪些参数
         # mask: (num_tasks, hidden_size) - 二进制掩码
         # 使用可学习的掩码（通过 sigmoid 实现软掩码）
-        self.task_masks = nn.Parameter(torch.ones(num_tasks, hidden_size))
+        # ⚠️ 关键修复：初始化掩码以实现稀疏度
+        # 如果 sparsity=0.5，我们希望 sigmoid(mask) 后约 50% 的参数被激活
+        # 使用伯努利分布初始化：约 sparsity 比例的参数初始化为较大的值
+        mask_init = torch.zeros(num_tasks, hidden_size)
+        num_active = int(hidden_size * sparsity)
+        for t in range(num_tasks):
+            # 随机选择 sparsity 比例的参数初始化为较大的值（经过 sigmoid 后接近 1）
+            # 其余参数保持为较小的值（经过 sigmoid 后接近 0）
+            indices = torch.randperm(hidden_size)[:num_active]
+            mask_init[t, indices] = 5.0  # sigmoid(5.0) ≈ 0.993，表示激活
+            # 其余位置初始化为 -5.0（sigmoid(-5.0) ≈ 0.007，表示不激活）
+            inactive_mask = torch.ones(hidden_size, dtype=torch.bool)
+            inactive_mask[indices] = False
+            mask_init[t, inactive_mask] = -5.0
+        self.task_masks = nn.Parameter(mask_init)
         
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
         self.residual_scale = nn.Parameter(torch.ones(1))
@@ -2026,27 +2040,65 @@ class MergeVLAMerger:
         return result
     
     def save(self, output_path: str):
-        """保存融合后的模型（包含适配层）"""
+        """
+        保存融合后的模型（包含适配层）
+        
+        ⚠️ 关键修复：
+        1. 权重键名必须添加 `_groot_model.` 前缀（GrootPolicy.from_pretrained 期望的格式）
+        2. config.json 中的 `base_model_path` 必须指向本地路径，而不是 HuggingFace
+        """
         output_path = Path(output_path)
         output_path.mkdir(parents=True, exist_ok=True)
         
         # 获取完整的 state_dict
-        state_dict = self.merged_model.model.state_dict()
+        model_state_dict = self.merged_model.model.state_dict()
         
-        # 添加适配层权重
+        # ⚠️ 关键修复：添加 `_groot_model.` 前缀
+        # GrootPolicy.from_pretrained 期望的键名格式是 `_groot_model.xxx`
+        # 而 GR00TN15.state_dict() 返回的是 `backbone.xxx` 和 `action_head.xxx`
+        state_dict = {}
+        for k, v in model_state_dict.items():
+            # 添加 _groot_model. 前缀
+            new_key = f"_groot_model.{k}"
+            state_dict[new_key] = v
+        
+        # 添加适配层权重（也需要前缀）
         adapter_state = self.merged_model.adapter.state_dict()
         for k, v in adapter_state.items():
-            state_dict[f"distribution_adapter.{k}"] = v
+            state_dict[f"_groot_model.distribution_adapter.{k}"] = v
         
         # 克隆以处理共享内存
         state_dict_cloned = {k: v.clone().contiguous() for k, v in state_dict.items()}
         
+        print(f"\n📊 保存的权重统计:")
+        print(f"   总键数: {len(state_dict_cloned)}")
+        print(f"   前5个键: {list(state_dict_cloned.keys())[:5]}")
+        
         save_file(state_dict_cloned, str(output_path / "model.safetensors"))
         
-        # 复制配置文件
+        # ⚠️ 关键修复：修改 config.json 中的 base_model_path
+        # 让它指向 narrower 模型的本地路径，而不是 HuggingFace
         import shutil
         narrower_path = Path(self.narrower_path)
-        for config_file in ["config.json", "policy_preprocessor.json", "policy_postprocessor.json"]:
+        
+        # 复制并修改 config.json
+        config_src = narrower_path / "config.json"
+        if config_src.exists():
+            with open(config_src, 'r') as f:
+                config = json.load(f)
+            
+            # ⚠️ 关键：修改 base_model_path 指向本地 narrower 路径
+            # 这样加载时会使用 narrower 的模型结构（包括正确的 num_target_vision_tokens）
+            config['base_model_path'] = str(narrower_path.resolve())
+            
+            print(f"\n⚠️ 修改 config.json:")
+            print(f"   base_model_path: {config['base_model_path']}")
+            
+            with open(output_path / "config.json", 'w') as f:
+                json.dump(config, f, indent=4)
+        
+        # 复制其他配置文件
+        for config_file in ["policy_preprocessor.json", "policy_postprocessor.json"]:
             src = narrower_path / config_file
             if src.exists():
                 shutil.copy(src, output_path / config_file)
@@ -2066,6 +2118,7 @@ class MergeVLAMerger:
             "adapter_type": self.adapter_type,
             "lora_rank": self.lora_rank,
             "sparsity": self.sparsity,
+            "num_tasks": 2,
             "merge_action_head": self.merge_action_head,
             "action_head_source": "merged" if self.merge_action_head else "narrower",
         }
@@ -2073,8 +2126,8 @@ class MergeVLAMerger:
             json.dump(merge_config, f, indent=2)
         
         print(f"\n✅ MergeVLA model saved to {output_path}")
-        print(f"   - model.safetensors (包含 distribution_adapter 权重)")
-        print(f"   - config.json")
+        print(f"   - model.safetensors (包含 _groot_model.* 和 distribution_adapter 权重)")
+        print(f"   - config.json (base_model_path 已修改为本地路径)")
         print(f"   - merge_config.json")
 
 
@@ -2751,27 +2804,60 @@ class TwoStageExpertMerger:
         return result
     
     def save(self, output_path: str):
-        """保存融合后的模型（包含适配层）"""
+        """
+        保存融合后的模型（包含适配层）
+        
+        ⚠️ 关键修复：
+        1. 权重键名必须添加 `_groot_model.` 前缀（GrootPolicy.from_pretrained 期望的格式）
+        2. config.json 中的 `base_model_path` 必须指向本地路径，而不是 HuggingFace
+        """
         output_path = Path(output_path)
         output_path.mkdir(parents=True, exist_ok=True)
         
         # 获取完整的 state_dict
-        state_dict = self.merged_model.model.state_dict()
+        model_state_dict = self.merged_model.model.state_dict()
         
-        # 添加适配层权重（使用特殊前缀）
+        # ⚠️ 关键修复：添加 `_groot_model.` 前缀
+        state_dict = {}
+        for k, v in model_state_dict.items():
+            new_key = f"_groot_model.{k}"
+            state_dict[new_key] = v
+        
+        # 添加适配层权重（也需要前缀）
         adapter_state = self.merged_model.adapter.state_dict()
         for k, v in adapter_state.items():
-            state_dict[f"distribution_adapter.{k}"] = v
+            state_dict[f"_groot_model.distribution_adapter.{k}"] = v
         
         # 克隆以处理共享内存
         state_dict_cloned = {k: v.clone().contiguous() for k, v in state_dict.items()}
         
+        print(f"\n📊 保存的权重统计:")
+        print(f"   总键数: {len(state_dict_cloned)}")
+        print(f"   前5个键: {list(state_dict_cloned.keys())[:5]}")
+        
         save_file(state_dict_cloned, str(output_path / "model.safetensors"))
         
-        # 复制配置文件
+        # ⚠️ 关键修复：修改 config.json 中的 base_model_path
         import shutil
         narrower_path = Path(self.narrower_path)
-        for config_file in ["config.json", "policy_preprocessor.json", "policy_postprocessor.json"]:
+        
+        # 复制并修改 config.json
+        config_src = narrower_path / "config.json"
+        if config_src.exists():
+            with open(config_src, 'r') as f:
+                config = json.load(f)
+            
+            # 修改 base_model_path 指向本地 narrower 路径
+            config['base_model_path'] = str(narrower_path.resolve())
+            
+            print(f"\n⚠️ 修改 config.json:")
+            print(f"   base_model_path: {config['base_model_path']}")
+            
+            with open(output_path / "config.json", 'w') as f:
+                json.dump(config, f, indent=4)
+        
+        # 复制其他配置文件
+        for config_file in ["policy_preprocessor.json", "policy_postprocessor.json"]:
             src = narrower_path / config_file
             if src.exists():
                 shutil.copy(src, output_path / config_file)
@@ -2786,7 +2872,7 @@ class TwoStageExpertMerger:
             "backbone_merge_method": self.merge_method,
             "backbone_alpha": self.alpha,
             "adapter_type": self.adapter_type,
-            "lora_rank": self.lora_rank,  # ⚠️ 关键：保存 lora_rank 以便评估时正确加载
+            "lora_rank": self.lora_rank,
             "narrower_path": str(self.narrower_path),
             "wider_path": str(self.wider_path),
             "action_head_source": "narrower",
@@ -2795,8 +2881,8 @@ class TwoStageExpertMerger:
             json.dump(merge_config, f, indent=2)
         
         print(f"\n✅ Model saved to {output_path}")
-        print(f"   - model.safetensors (包含 distribution_adapter 权重)")
-        print(f"   - config.json")
+        print(f"   - model.safetensors (包含 _groot_model.* 和 distribution_adapter 权重)")
+        print(f"   - config.json (base_model_path 已修改为本地路径)")
         print(f"   - merge_config.json")
 
 
