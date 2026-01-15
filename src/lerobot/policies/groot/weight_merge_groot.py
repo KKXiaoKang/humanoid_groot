@@ -1190,11 +1190,27 @@ class ExpertMerger:
 
 
 # ============================================================
+# MergeVLA 风格的融合方法
+# ============================================================
+# 
+# 基于论文 "MergeVLA: Cross-Skill Model Merging Toward a Generalist Vision-Language-Action Agent"
+# https://arxiv.org/pdf/2511.18810
+# 
+# 核心思想：
+# 1. 稀疏激活的 LoRA 适配器（通过任务掩码）
+# 2. Cross-attention-only action head（GROOT 已满足）
+# 3. 测试时任务路由
+# 
+# 对于全量微调的模型：
+# - 计算 Task Vectors: τ = θ_expert - θ_base
+# - 使用稀疏 LoRA 适配器对齐 backbone 分布
+# - Action head 使用 cross-attention，可以尝试直接融合或任务特定头
+
+# ============================================================
 # 分布适配层 (Distribution Adapter)
 # ============================================================
 # 
-# 基于 kai0 Model Arithmetic 方法的思想：
-# https://mmlab.hk/research/kai0
+# 基于 MergeVLA 的思想：使用稀疏激活的 LoRA 适配器
 # 
 # 问题：融合 backbone 后，输出分布发生漂移，导致 action_head 崩溃
 # 解决：在 backbone 和 action_head 之间插入一个轻量级适配层
@@ -1204,9 +1220,104 @@ class ExpertMerger:
 #                          ↑
 #                   只训练这一层！
 
+class SparseLoRAAdapter(nn.Module):
+    """
+    稀疏激活的 LoRA 适配层（MergeVLA 风格）
+    
+    使用任务掩码来稀疏激活不同的 LoRA 参数子集
+    这样可以减少不同任务之间的冲突
+    
+    参考 MergeVLA 论文：Sparsely activated LoRA adapters via task masks
+    """
+    
+    def __init__(
+        self,
+        hidden_size: int = 1024,
+        rank: int = 16,
+        alpha: float = 16.0,
+        num_tasks: int = 2,  # 任务数量（narrower, wider）
+        sparsity: float = 0.5,  # 稀疏度：每个任务激活的参数比例
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.rank = rank
+        self.alpha = alpha
+        self.num_tasks = num_tasks
+        self.sparsity = sparsity
+        
+        # 为每个任务创建独立的 LoRA 参数
+        # A: (num_tasks, hidden_size, rank)
+        # B: (num_tasks, rank, hidden_size)
+        self.lora_A = nn.Parameter(torch.randn(num_tasks, hidden_size, rank) * 0.02)
+        self.lora_B = nn.Parameter(torch.zeros(num_tasks, rank, hidden_size))
+        
+        # 任务掩码：每个任务激活哪些参数
+        # mask: (num_tasks, hidden_size) - 二进制掩码
+        # 使用可学习的掩码（通过 sigmoid 实现软掩码）
+        self.task_masks = nn.Parameter(torch.ones(num_tasks, hidden_size))
+        
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        self.residual_scale = nn.Parameter(torch.ones(1))
+        
+        print(f"   Sparse LoRA Adapter (MergeVLA style):")
+        print(f"      rank={rank}, alpha={alpha}, num_tasks={num_tasks}")
+        print(f"      sparsity={sparsity}, params={self._count_params():,}")
+    
+    def _count_params(self):
+        return self.lora_A.numel() + self.lora_B.numel() + self.task_masks.numel() + 1
+    
+    def forward(self, x: torch.Tensor, task_id: torch.Tensor = None) -> torch.Tensor:
+        """
+        Args:
+            x: (B, T, hidden_size)
+            task_id: (B,) - 任务ID，0=narrower, 1=wider。如果为 None，使用所有任务的平均
+        """
+        lora_A = self.lora_A.to(dtype=x.dtype)
+        lora_B = self.lora_B.to(dtype=x.dtype)
+        task_masks = torch.sigmoid(self.task_masks).to(dtype=x.dtype)  # 软掩码
+        residual_scale = self.residual_scale.to(dtype=x.dtype)
+        
+        B, T, H = x.shape
+        
+        if task_id is not None:
+            # 使用指定任务的 LoRA 参数
+            # task_id: (B,)
+            task_id = task_id.long()
+            
+            # 选择每个样本对应的任务参数
+            # A_selected: (B, H, rank)
+            A_selected = lora_A[task_id]  # (B, H, rank)
+            B_selected = lora_B[task_id]  # (B, rank, H)
+            mask_selected = task_masks[task_id]  # (B, H)
+            
+            # 应用任务掩码到 LoRA A
+            # mask_selected: (B, H) -> (B, H, 1) for broadcasting
+            A_masked = A_selected * mask_selected.unsqueeze(-1)  # (B, H, rank)
+            
+            # LoRA 变换: x @ A @ B
+            # x: (B, T, H), A_masked: (B, H, rank), B_selected: (B, rank, H)
+            lora_output = torch.bmm(torch.bmm(self.dropout(x), A_masked), B_selected)  # (B, T, H)
+        else:
+            # 使用所有任务的平均（测试时任务未知）
+            # 对所有任务的输出进行加权平均
+            outputs = []
+            for t in range(self.num_tasks):
+                A_t = lora_A[t] * task_masks[t].unsqueeze(-1)  # (H, rank)
+                B_t = lora_B[t]  # (rank, H)
+                output_t = self.dropout(x) @ A_t @ B_t  # (B, T, H)
+                outputs.append(output_t)
+            
+            # 平均所有任务的输出
+            lora_output = torch.stack(outputs, dim=0).mean(dim=0)  # (B, T, H)
+        
+        # 缩放并添加到输入
+        return x + residual_scale * (self.alpha / self.rank) * lora_output
+
+
 class LoRAAdapter(nn.Module):
     """
-    LoRA 适配层（基于 MergeVLA 的思想）
+    LoRA 适配层（标准版本，用于向后兼容）
     
     使用低秩分解：W = W_base + A @ B
     其中 A: (hidden_size, rank), B: (rank, hidden_size)
@@ -1258,28 +1369,42 @@ class DistributionAdapter(nn.Module):
     """
     分布适配层：将融合后的 backbone 输出分布映射回 action_head 期望的分布
     
-    参考 kai0 的 Model Arithmetic 方法，使用 on-policy loss 优化适配层
+    基于 MergeVLA 的思想：使用稀疏激活的 LoRA 适配器
     
     支持多种适配层类型：
+    - "sparse_lora": 稀疏激活的 LoRA（MergeVLA 风格，推荐）⭐
+    - "lora": 标准 LoRA 适配层
     - "linear": 简单线性层
     - "mlp": 两层 MLP
-    - "lora": LoRA 适配层（基于 MergeVLA，推荐）⭐
     - "layernorm_only": 只用 LayerNorm
     """
     
     def __init__(
         self,
         hidden_size: int = 1024,
-        adapter_type: str = "linear",  # "linear", "mlp", "lora", "layernorm_only"
+        adapter_type: str = "sparse_lora",  # "sparse_lora", "lora", "linear", "mlp", "layernorm_only"
         dropout: float = 0.0,
-        lora_rank: int = 16,  # LoRA rank（仅用于 lora 类型）
+        lora_rank: int = 16,  # LoRA rank（仅用于 lora/sparse_lora 类型）
+        num_tasks: int = 2,  # 任务数量（仅用于 sparse_lora）
+        sparsity: float = 0.5,  # 稀疏度（仅用于 sparse_lora）
     ):
         super().__init__()
         self.hidden_size = hidden_size
         self.adapter_type = adapter_type
         
-        if adapter_type == "lora":
-            # ⭐ 推荐：使用 LoRA 适配层（基于 MergeVLA）
+        if adapter_type == "sparse_lora":
+            # ⭐ MergeVLA 风格：稀疏激活的 LoRA 适配器
+            self.adapter = SparseLoRAAdapter(
+                hidden_size=hidden_size,
+                rank=lora_rank,
+                alpha=16.0,
+                num_tasks=num_tasks,
+                sparsity=sparsity,
+                dropout=dropout,
+            )
+            self.residual_scale = None
+        elif adapter_type == "lora":
+            # 标准 LoRA 适配层
             self.adapter = LoRAAdapter(
                 hidden_size=hidden_size,
                 rank=lora_rank,
@@ -1333,14 +1458,18 @@ class DistributionAdapter(nn.Module):
         else:
             self.residual_scale = None
         
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, task_id: torch.Tensor = None) -> torch.Tensor:
         """
         Args:
             x: backbone 输出 [B, T, hidden_size]
+            task_id: (B,) - 任务ID，0=narrower, 1=wider（仅用于 sparse_lora）
         Returns:
             适配后的特征 [B, T, hidden_size]
         """
-        if self.adapter_type == "lora":
+        if self.adapter_type == "sparse_lora":
+            # MergeVLA 风格：稀疏激活的 LoRA（需要 task_id）
+            return self.adapter(x, task_id=task_id)
+        elif self.adapter_type == "lora":
             # LoRA 适配层（内置残差连接）
             return self.adapter(x)
         elif self.adapter_type == "mlp":
@@ -1370,6 +1499,8 @@ class MergedModelWithAdapter(nn.Module):
         adapter_type: str = "linear",
         hidden_size: int = 1024,
         lora_rank: int = 16,
+        num_tasks: int = 2,  # 任务数量（用于 sparse_lora）
+        sparsity: float = 0.5,  # 稀疏度（用于 sparse_lora）
     ):
         super().__init__()
         
@@ -1395,13 +1526,15 @@ class MergedModelWithAdapter(nn.Module):
             hidden_size=hidden_size,
             adapter_type=adapter_type,
             lora_rank=lora_rank,
+            num_tasks=num_tasks,
+            sparsity=sparsity,
         )
         
         print(f"✅ MergedModelWithAdapter initialized")
         print(f"   Adapter type: {adapter_type}")
         print(f"   Adapter params: {sum(p.numel() for p in self.adapter.parameters()):,}")
     
-    def forward(self, inputs: dict) -> dict:
+    def forward(self, inputs: dict, task_id: torch.Tensor = None) -> dict:
         """
         前向传播（用于训练适配层）
         
@@ -1411,6 +1544,10 @@ class MergedModelWithAdapter(nn.Module):
         - state: (B, 1, state_dim) - 状态观测
         - embodiment_id: (B,) - embodiment ID
         - video 或图像数据 - 视觉输入
+        
+        Args:
+            inputs: 模型输入
+            task_id: (B,) - 任务ID，0=narrower, 1=wider（用于 sparse_lora）
         """
         # 获取计算设备和数据类型
         device = next(self.model.parameters()).device
@@ -1425,9 +1562,9 @@ class MergedModelWithAdapter(nn.Module):
             # 2. 通过 backbone
             backbone_outputs = self.model.backbone(backbone_inputs)
             
-            # 3. 通过适配层
+            # 3. 通过适配层（传递 task_id 用于 sparse_lora）
             backbone_features = backbone_outputs[BACKBONE_FEATURE_KEY]
-            adapted_features = self.adapter(backbone_features)
+            adapted_features = self.adapter(backbone_features, task_id=task_id)
             backbone_outputs[BACKBONE_FEATURE_KEY] = adapted_features
             
             # 4. 通过 action_head（计算 Flow Matching loss）
@@ -1438,17 +1575,22 @@ class MergedModelWithAdapter(nn.Module):
         
         return action_outputs
     
-    def get_action(self, inputs: dict, **kwargs) -> dict:
+    def get_action(self, inputs: dict, task_id: torch.Tensor = None, **kwargs) -> dict:
         """
         推理时获取动作
+        
+        Args:
+            inputs: 模型输入
+            task_id: (B,) - 任务ID，0=narrower, 1=wider（用于 sparse_lora，如果为 None 则使用平均）
+            **kwargs: 其他参数（如 rtc_enabled）
         """
         # 1. 通过 backbone
         backbone_inputs, action_inputs = self.model.prepare_input(inputs)
         backbone_outputs = self.model.backbone(backbone_inputs)
         
-        # 2. 通过适配层
+        # 2. 通过适配层（传递 task_id，如果为 None 则使用所有任务的平均）
         backbone_features = backbone_outputs[BACKBONE_FEATURE_KEY]
-        adapted_features = self.adapter(backbone_features)
+        adapted_features = self.adapter(backbone_features, task_id=task_id)
         backbone_outputs[BACKBONE_FEATURE_KEY] = adapted_features
         
         # 3. 通过 action_head (推理模式)
@@ -1540,6 +1682,402 @@ class MergedModelWithAdapter(nn.Module):
         }
 
 
+class MergeVLAMerger:
+    """
+    MergeVLA 风格的融合器 ⭐
+    
+    基于论文 "MergeVLA: Cross-Skill Model Merging Toward a Generalist Vision-Language-Action Agent"
+    https://arxiv.org/pdf/2511.18810
+    
+    核心思想：
+    1. 计算 Task Vectors: τ = θ_expert - θ_base
+    2. 使用稀疏激活的 LoRA 适配器对齐 backbone 分布
+    3. Action head 使用 cross-attention（GROOT 已满足），可以尝试直接融合
+    
+    对于全量微调的模型：
+    - 如果 base_model_path == narrower_path，则 τ_narrower = 0，τ_wider = wider - narrower
+    - 融合公式：θ_merged = θ_base + α_narrower * τ_narrower + α_wider * τ_wider
+    - 使用稀疏 LoRA 适配器处理分布漂移
+    """
+    
+    def __init__(
+        self,
+        narrower_path: str,
+        wider_path: str,
+        base_model_path: str = None,
+        narrower_weight: float = 0.5,
+        wider_weight: float = 0.5,
+        adapter_type: str = "sparse_lora",  # "sparse_lora" (MergeVLA), "lora", "mlp"
+        device: str = "cuda:0",
+        lora_rank: int = 16,
+        sparsity: float = 0.5,  # 稀疏度（仅用于 sparse_lora）
+        merge_action_head: bool = False,  # 是否融合 action_head（GROOT 使用 cross-attention，可以尝试）
+    ):
+        self.narrower_path = narrower_path
+        self.wider_path = wider_path
+        self.base_model_path = base_model_path or narrower_path
+        self.narrower_weight = narrower_weight
+        self.wider_weight = wider_weight
+        self.adapter_type = adapter_type
+        self.lora_rank = lora_rank
+        self.sparsity = sparsity
+        self.merge_action_head = merge_action_head
+        self.device = torch.device(device)
+        
+        self.merged_model = None
+        self.preprocessor = None
+        self.postprocessor = None
+    
+    def load_and_merge(self):
+        """
+        MergeVLA 风格的融合：
+        1. 计算 Task Vectors
+        2. 融合权重（backbone + 可选的 action_head）
+        3. 创建稀疏 LoRA 适配器
+        """
+        print(f"\n{'='*60}")
+        print(f"🚀 MergeVLA-Style Merging")
+        print(f"   基于论文: https://arxiv.org/pdf/2511.18810")
+        print(f"   Narrower weight: {self.narrower_weight}")
+        print(f"   Wider weight: {self.wider_weight}")
+        print(f"   Adapter type: {self.adapter_type}")
+        print(f"{'='*60}\n")
+        
+        # 加载权重
+        def load_weights(path: str) -> dict:
+            path = Path(path)
+            safetensors_files = glob.glob(str(path / "model*.safetensors"))
+            state_dict = {}
+            for f in sorted(safetensors_files):
+                state_dict.update(load_file(f))
+            return state_dict
+        
+        base_state_dict = load_weights(self.base_model_path)
+        narrower_state_dict = load_weights(self.narrower_path)
+        wider_state_dict = load_weights(self.wider_path)
+        
+        print(f"✅ Loaded weights")
+        print(f"   Base: {len(base_state_dict)} tensors")
+        print(f"   Narrower: {len(narrower_state_dict)} tensors")
+        print(f"   Wider: {len(wider_state_dict)} tensors")
+        
+        # 计算 Task Vectors
+        print(f"\n📐 Computing Task Vectors...")
+        τ_narrower = {}
+        τ_wider = {}
+        
+        for k in base_state_dict:
+            if k in narrower_state_dict:
+                τ_narrower[k] = narrower_state_dict[k] - base_state_dict[k]
+            if k in wider_state_dict:
+                τ_wider[k] = wider_state_dict[k] - base_state_dict[k]
+        
+        # 融合权重
+        merged_state_dict = {}
+        backbone_count = 0
+        action_head_count = 0
+        
+        for k in base_state_dict:
+            if k.startswith('backbone.'):
+                # 融合 backbone
+                merged = base_state_dict[k].clone()
+                if k in τ_narrower:
+                    merged = merged + self.narrower_weight * τ_narrower[k]
+                if k in τ_wider:
+                    merged = merged + self.wider_weight * τ_wider[k]
+                merged_state_dict[k] = merged
+                backbone_count += 1
+            elif k.startswith('action_head.'):
+                # Action head 处理
+                if self.merge_action_head:
+                    # 融合 action_head（GROOT 使用 cross-attention，可以尝试）
+                    merged = base_state_dict[k].clone()
+                    if k in τ_narrower:
+                        merged = merged + self.narrower_weight * τ_narrower[k]
+                    if k in τ_wider:
+                        merged = merged + self.wider_weight * τ_wider[k]
+                    merged_state_dict[k] = merged
+                else:
+                    # 使用 narrower 的 action_head（更安全）
+                    merged_state_dict[k] = narrower_state_dict.get(k, base_state_dict[k])
+                action_head_count += 1
+            else:
+                merged_state_dict[k] = base_state_dict[k]
+        
+        print(f"\n📊 Merging completed:")
+        print(f"   Backbone layers: {backbone_count} (merged)")
+        print(f"   Action head layers: {action_head_count} ({'merged' if self.merge_action_head else 'using narrower'})")
+        
+        # 加载 base 模型结构
+        from lerobot.policies.groot.modeling_groot import GrootPolicy
+        policy = GrootPolicy.from_pretrained(Path(self.narrower_path), strict=False)
+        base_model = policy._groot_model
+        
+        # 获取 hidden_size
+        hidden_size = None
+        if hasattr(base_model, 'action_head') and hasattr(base_model.action_head, 'config'):
+            hidden_size = getattr(base_model.action_head.config, 'backbone_embedding_dim', None)
+        if hidden_size is None and hasattr(base_model.config, 'action_head_cfg'):
+            hidden_size = base_model.config.action_head_cfg.get('backbone_embedding_dim', None)
+        if hidden_size is None:
+            try:
+                if hasattr(base_model.backbone, 'eagle_linear'):
+                    if isinstance(base_model.backbone.eagle_linear, torch.nn.Identity):
+                        hidden_size = 2048
+                    elif isinstance(base_model.backbone.eagle_linear, torch.nn.Linear):
+                        hidden_size = base_model.backbone.eagle_linear.out_features
+                    else:
+                        hidden_size = 2048
+                else:
+                    hidden_size = 2048
+            except Exception as e:
+                print(f"   ⚠️ Warning: Failed to infer hidden_size: {e}")
+                hidden_size = 2048
+        
+        print(f"   📐 Detected backbone hidden_size: {hidden_size}")
+        
+        # 创建带适配层的模型
+        self.merged_model = MergedModelWithAdapter(
+            merged_backbone_state_dict=merged_state_dict,
+            narrower_action_head_state_dict=narrower_state_dict,
+            base_model=base_model,
+            adapter_type=self.adapter_type,
+            hidden_size=hidden_size,
+            lora_rank=self.lora_rank,
+            num_tasks=2,  # narrower, wider
+            sparsity=self.sparsity,
+        ).to(self.device)
+        
+        # 加载预处理器
+        self._load_processors(self.narrower_path)
+        
+        print(f"\n✅ MergeVLA merging completed, ready for adapter training")
+    
+    def _load_processors(self, model_path: str):
+        """加载预处理器和后处理器"""
+        from lerobot.policies.factory import make_pre_post_processors
+        from lerobot.configs.policies import PreTrainedConfig
+        
+        try:
+            config = PreTrainedConfig.from_pretrained(model_path)
+            self.preprocessor, self.postprocessor = make_pre_post_processors(
+                policy_cfg=config,
+                pretrained_path=model_path,
+                preprocessor_overrides={
+                    "device_processor": {"device": str(self.device)},
+                },
+            )
+            print(f"   ✅ Preprocessor and postprocessor loaded")
+        except Exception as e:
+            print(f"   ⚠️  Warning: Failed to load processors: {e}")
+    
+    def train_adapter(
+        self,
+        train_dataloader,
+        num_epochs: int = 20,
+        learning_rate: float = 1e-3,  # MergeVLA 使用较大的学习率
+    ):
+        """
+        训练稀疏 LoRA 适配器（MergeVLA 风格）
+        
+        使用 action loss 来优化适配层
+        """
+        print(f"\n{'='*60}")
+        print(f"🏋️ Training MergeVLA Adapter")
+        print(f"   Epochs: {num_epochs}")
+        print(f"   Learning rate: {learning_rate}")
+        print(f"   Adapter type: {self.adapter_type}")
+        print(f"{'='*60}\n")
+        
+        optimizer = torch.optim.AdamW(
+            self.merged_model.adapter.parameters(),
+            lr=learning_rate,
+            weight_decay=1e-4,
+            betas=(0.9, 0.999),
+        )
+        
+        # MergeVLA 使用固定学习率
+        scheduler = None
+        
+        self.merged_model.train()
+        
+        for epoch in range(num_epochs):
+            epoch_losses = []
+            
+            for batch_idx, batch in enumerate(train_dataloader):
+                optimizer.zero_grad()
+                
+                # 准备输入
+                observation = self._prepare_observation(batch)
+                
+                # 获取任务ID（如果可用）
+                task_id = None
+                if 'task_source' in batch:
+                    task_source = batch['task_source']
+                    if isinstance(task_source, torch.Tensor):
+                        task_id = task_source.to(self.device)
+                    elif isinstance(task_source, (list, tuple)):
+                        task_id = torch.tensor(task_source[0], device=self.device).unsqueeze(0)
+                
+                # 使用预处理器处理输入
+                if self.preprocessor is not None:
+                    try:
+                        inputs = self.preprocessor(observation)
+                        inputs = self._to_device(inputs)
+                    except Exception as e:
+                        if batch_idx == 0:
+                            print(f"   ⚠️ Preprocessor failed: {e}")
+                        continue
+                else:
+                    inputs = self._to_device(observation)
+                
+                try:
+                    # 前向传播（使用 Flow Matching loss）
+                    with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16):
+                        outputs = self.merged_model(inputs, task_id=task_id)
+                    
+                    if hasattr(outputs, 'data'):
+                        outputs_dict = outputs.data
+                    elif isinstance(outputs, dict):
+                        outputs_dict = outputs
+                    else:
+                        continue
+                    
+                    if 'loss' not in outputs_dict:
+                        continue
+                    
+                    loss = outputs_dict['loss']
+                    
+                except Exception as e:
+                    if batch_idx == 0:
+                        print(f"   ⚠️ Forward failed: {e}")
+                        import traceback
+                        traceback.print_exc()
+                    continue
+                
+                # 检查 NaN
+                if not torch.isfinite(loss):
+                    if batch_idx < 3:
+                        print(f"   ⚠️ Non-finite loss: {loss.item()}")
+                    continue
+                
+                # 反向传播
+                loss.backward()
+                
+                # 梯度裁剪
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    self.merged_model.adapter.parameters(),
+                    max_norm=1.0,
+                )
+                
+                optimizer.step()
+                epoch_losses.append(loss.item())
+                
+                if batch_idx % 10 == 0:
+                    current_lr = optimizer.param_groups[0]['lr']
+                    print(f"   Epoch {epoch+1}/{num_epochs}, Batch {batch_idx}: "
+                          f"loss = {loss.item():.4f}, grad_norm = {grad_norm:.4f}, lr = {current_lr:.2e}")
+            
+            if epoch_losses:
+                avg_loss = sum(epoch_losses) / len(epoch_losses)
+                print(f"\n📊 Epoch {epoch+1}/{num_epochs}: avg_loss = {avg_loss:.4f}")
+        
+        print(f"\n✅ Adapter training completed")
+    
+    def _prepare_observation(self, batch: dict) -> dict:
+        """将 LeRobot batch 转换为预处理器期望的格式"""
+        result = {}
+        
+        for key, value in batch.items():
+            if key.startswith('observation.'):
+                if isinstance(value, torch.Tensor):
+                    result[key] = value.to(self.device)
+                else:
+                    result[key] = value
+        
+        if 'action' in batch:
+            action = batch['action']
+            if isinstance(action, torch.Tensor):
+                result['action'] = action.to(self.device)
+        
+        if 'task' in batch:
+            task_value = batch['task']
+            if isinstance(task_value, (list, tuple)) and len(task_value) > 0:
+                result['task'] = task_value[0]
+            elif isinstance(task_value, str):
+                result['task'] = task_value
+            else:
+                result['task'] = "Depalletize the box"
+        else:
+            result['task'] = "Depalletize the box"
+        
+        return result
+    
+    def _to_device(self, inputs: dict) -> dict:
+        """将输入移动到设备"""
+        result = {}
+        for key, value in inputs.items():
+            if isinstance(value, torch.Tensor):
+                result[key] = value.to(self.device)
+            elif isinstance(value, dict):
+                result[key] = self._to_device(value)
+            else:
+                result[key] = value
+        return result
+    
+    def save(self, output_path: str):
+        """保存融合后的模型（包含适配层）"""
+        output_path = Path(output_path)
+        output_path.mkdir(parents=True, exist_ok=True)
+        
+        # 获取完整的 state_dict
+        state_dict = self.merged_model.model.state_dict()
+        
+        # 添加适配层权重
+        adapter_state = self.merged_model.adapter.state_dict()
+        for k, v in adapter_state.items():
+            state_dict[f"distribution_adapter.{k}"] = v
+        
+        # 克隆以处理共享内存
+        state_dict_cloned = {k: v.clone().contiguous() for k, v in state_dict.items()}
+        
+        save_file(state_dict_cloned, str(output_path / "model.safetensors"))
+        
+        # 复制配置文件
+        import shutil
+        narrower_path = Path(self.narrower_path)
+        for config_file in ["config.json", "policy_preprocessor.json", "policy_postprocessor.json"]:
+            src = narrower_path / config_file
+            if src.exists():
+                shutil.copy(src, output_path / config_file)
+        
+        for pattern in ["policy_preprocessor*.safetensors", "policy_postprocessor*.safetensors"]:
+            for src in narrower_path.glob(pattern):
+                shutil.copy(src, output_path / src.name)
+        
+        # 保存融合配置
+        merge_config = {
+            "merge_method": "mergevla",
+            "narrower_path": str(self.narrower_path),
+            "wider_path": str(self.wider_path),
+            "base_model_path": str(self.base_model_path),
+            "narrower_weight": self.narrower_weight,
+            "wider_weight": self.wider_weight,
+            "adapter_type": self.adapter_type,
+            "lora_rank": self.lora_rank,
+            "sparsity": self.sparsity,
+            "merge_action_head": self.merge_action_head,
+            "action_head_source": "merged" if self.merge_action_head else "narrower",
+        }
+        with open(output_path / "merge_config.json", "w") as f:
+            json.dump(merge_config, f, indent=2)
+        
+        print(f"\n✅ MergeVLA model saved to {output_path}")
+        print(f"   - model.safetensors (包含 distribution_adapter 权重)")
+        print(f"   - config.json")
+        print(f"   - merge_config.json")
+
+
 class TwoStageExpertMerger:
     """
     两阶段融合器（推荐方法）⭐
@@ -1560,8 +2098,8 @@ class TwoStageExpertMerger:
         narrower_path: str,
         wider_path: str,
         base_model_path: str = None,
-        merge_method: str = "interpolation",  # "interpolation", "task_arithmetic"
-        alpha: float = 0.5,  # 融合系数
+        merge_method: str = "interpolation",  # "interpolation", "task_arithmetic", "expert_merge"
+        alpha: float = 0.5,  # 融合系数（仅用于 interpolation）
         adapter_type: str = "lora",  # "linear", "mlp", "lora", "layernorm_only"
         device: str = "cuda:0",
         lora_rank: int = 16,  # LoRA rank（仅用于 lora 类型）
@@ -1631,6 +2169,10 @@ class TwoStageExpertMerger:
         print(f"\n📊 Stage 1 完成: Backbone 融合")
         print(f"   Backbone 层: {backbone_count} (融合比例 {self.alpha:.1%} narrower + {1-self.alpha:.1%} wider)")
         print(f"   Action head 层: {action_head_count} (使用 narrower)")
+        print(f"\n   ⚠️ 警告：简单插值融合 backbone 可能导致分布漂移！")
+        print(f"      如果推理时动作震荡，说明融合后的 backbone 输出分布与")
+        print(f"      narrower 的 action_head 期望的分布不匹配。")
+        print(f"      建议：使用 Expert Merging 方法（更可靠）")
         
         # 加载 base 模型结构
         from lerobot.policies.groot.modeling_groot import GrootPolicy
@@ -1678,6 +2220,8 @@ class TwoStageExpertMerger:
             adapter_type=self.adapter_type,
             hidden_size=hidden_size,
             lora_rank=self.lora_rank,
+            num_tasks=getattr(self, 'num_tasks', 2),  # 默认2个任务
+            sparsity=getattr(self, 'sparsity', 0.5),  # 默认稀疏度
         ).to(self.device)
         
         # 加载预处理器
@@ -2242,6 +2786,7 @@ class TwoStageExpertMerger:
             "backbone_merge_method": self.merge_method,
             "backbone_alpha": self.alpha,
             "adapter_type": self.adapter_type,
+            "lora_rank": self.lora_rank,  # ⚠️ 关键：保存 lora_rank 以便评估时正确加载
             "narrower_path": str(self.narrower_path),
             "wider_path": str(self.wider_path),
             "action_head_source": "narrower",

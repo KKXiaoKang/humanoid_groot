@@ -819,9 +819,72 @@ def run_dare_merge(args):
     print(f"\n✅ DARE merged model saved to {output_path}")
 
 
+def run_mergevla_merge(args):
+    """
+    运行 MergeVLA 风格的融合（推荐方法）⭐
+    
+    基于论文 "MergeVLA: Cross-Skill Model Merging Toward a Generalist Vision-Language-Action Agent"
+    https://arxiv.org/pdf/2511.18810
+    
+    核心思想：
+    1. 计算 Task Vectors: τ = θ_expert - θ_base
+    2. 使用稀疏激活的 LoRA 适配器对齐 backbone 分布
+    3. Action head 使用 cross-attention（GROOT 已满足）
+    """
+    from lerobot.policies.groot.weight_merge_groot import MergeVLAMerger
+    
+    print(f"\n{'='*60}")
+    print(f"⭐ MergeVLA-Style Merging")
+    print(f"   基于论文: https://arxiv.org/pdf/2511.18810")
+    print(f"{'='*60}")
+    print(f"\n📋 方法说明：")
+    print(f"   1. 计算 Task Vectors: τ = θ_expert - θ_base")
+    print(f"   2. 融合权重: θ_merged = θ_base + α_narrower * τ_narrower + α_wider * τ_wider")
+    print(f"   3. 使用稀疏激活的 LoRA 适配器对齐分布（MergeVLA 核心）")
+    print(f"   4. Action head 使用 cross-attention（GROOT 已满足）")
+    print(f"\n")
+    
+    # 创建 MergeVLA 融合器
+    merger = MergeVLAMerger(
+        narrower_path=args.narrower_path,
+        wider_path=args.wider_path,
+        base_model_path=args.base_model_path,
+        narrower_weight=args.narrower_weight,
+        wider_weight=args.wider_weight,
+        adapter_type=args.adapter_type,
+        device=args.device,
+        lora_rank=args.lora_rank,
+        sparsity=getattr(args, 'sparsity', 0.5),
+        merge_action_head=getattr(args, 'merge_action_head', False),
+    )
+    
+    # 加载并融合
+    merger.load_and_merge()
+    
+    # 创建数据加载器
+    data_paths = args.data_path.split(",") if args.data_path else None
+    
+    dataloader = create_calibration_dataloader(
+        data_paths=data_paths,
+        batch_size=args.batch_size,
+        num_samples=args.num_samples,
+        use_default_datasets=args.use_default_datasets,
+    )
+    
+    # 训练适配层
+    merger.train_adapter(
+        train_dataloader=dataloader,
+        num_epochs=args.adapter_epochs,
+        learning_rate=args.adapter_lr,
+    )
+    
+    # 保存
+    merger.save(args.output_path)
+
+
 def run_two_stage_merge(args):
     """
-    运行两阶段融合（推荐方法）⭐
+    运行两阶段融合（旧方法，保留用于兼容）
     
     基于 kai0 Model Arithmetic 的思想：
     https://mmlab.hk/research/kai0
@@ -836,8 +899,8 @@ def run_two_stage_merge(args):
     from lerobot.policies.groot.weight_merge_groot import TwoStageExpertMerger
     
     print(f"\n{'='*60}")
-    print(f"⭐ Two-Stage Adapter Merge (kai0 style)")
-    print(f"   基于 https://mmlab.hk/research/kai0 的 Model Arithmetic 方法")
+    print(f"⚠️ Two-Stage Adapter Merge (旧方法)")
+    print(f"   推荐使用 mergevla 方法（更可靠）")
     print(f"{'='*60}")
     print(f"\n📋 方法说明：")
     print(f"   阶段 1: 融合 backbone (插值比例 α={args.alpha})")
@@ -882,13 +945,14 @@ def run_two_stage_merge(args):
 def main():
     parser = argparse.ArgumentParser(description="GROOT Model Weight Merging")
     
-    # 融合方法 - 默认使用 two_stage_adapter（效果最好）⭐
+    # 融合方法 - 默认使用 mergevla（效果最好）⭐
     parser.add_argument(
         "--method", 
         type=str, 
-        default="two_stage_adapter",  # 默认使用两阶段融合
-        choices=["two_stage_adapter", "expert_merge", "task_arithmetic", "interpolation", "ties", "dare"],
-        help="Merge method: two_stage_adapter (best, default), expert_merge, task_arithmetic, "
+        default="mergevla",  # 默认使用 MergeVLA 融合
+        choices=["mergevla", "two_stage_adapter", "expert_merge", "task_arithmetic", "interpolation", "ties", "dare"],
+        help="Merge method: mergevla (best, default, based on https://arxiv.org/pdf/2511.18810), "
+             "two_stage_adapter (old), expert_merge, task_arithmetic, "
              "interpolation (simplest), ties, dare"
     )
     
@@ -961,17 +1025,21 @@ def main():
     parser.add_argument("--dare_drop_rate", type=float, default=0.1,
                        help="DARE drop rate")
     
-    # Two-Stage Adapter 参数 ⭐ 新增
-    parser.add_argument("--adapter_type", type=str, default="lora",
-                       choices=["linear", "mlp", "lora", "layernorm_only"],
-                       help="Distribution adapter type: lora (recommended, MergeVLA style), "
-                            "mlp (more capacity), linear (lightweight), layernorm_only (simplest)")
+    # MergeVLA / Two-Stage Adapter 参数 ⭐
+    parser.add_argument("--adapter_type", type=str, default="sparse_lora",
+                       choices=["sparse_lora", "lora", "linear", "mlp", "layernorm_only"],
+                       help="Distribution adapter type: sparse_lora (MergeVLA style, recommended), "
+                            "lora (standard), mlp (more capacity), linear (lightweight), layernorm_only (simplest)")
     parser.add_argument("--lora_rank", type=int, default=16,
-                       help="LoRA rank for lora adapter type (default: 16)")
+                       help="LoRA rank for lora/sparse_lora adapter type (default: 16)")
+    parser.add_argument("--sparsity", type=float, default=0.5,
+                       help="Sparsity for sparse_lora adapter (percentage of parameters activated per task, default: 0.5)")
+    parser.add_argument("--merge_action_head", action="store_true", default=False,
+                       help="Merge action_head weights (GROOT uses cross-attention, can try merging)")
     parser.add_argument("--adapter_epochs", type=int, default=20,
                        help="Number of epochs to train the distribution adapter")
-    parser.add_argument("--adapter_lr", type=float, default=1e-4,
-                       help="Learning rate for adapter training")
+    parser.add_argument("--adapter_lr", type=float, default=1e-3,
+                       help="Learning rate for adapter training (MergeVLA uses larger LR, default: 1e-3)")
     
     # 设备
     parser.add_argument("--device", type=str, default="cuda:0",
@@ -987,7 +1055,9 @@ def main():
     print(f"   Output: {args.output_path}")
     print(f"{'='*60}\n")
     
-    if args.method == "two_stage_adapter":
+    if args.method == "mergevla":
+        run_mergevla_merge(args)
+    elif args.method == "two_stage_adapter":
         run_two_stage_merge(args)
     elif args.method == "task_arithmetic":
         run_task_arithmetic_merge(args)

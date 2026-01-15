@@ -109,14 +109,17 @@ def load_adapter_if_needed(policy: GrootPolicy, model_path: str, merge_config: d
         return None
     
     merge_method = merge_config.get('merge_method', '')
-    if merge_method != 'two_stage_adapter':
+    if merge_method not in ['two_stage_adapter', 'mergevla']:
         return None
     
-    print(f"\n🔧 检测到 two_stage_adapter 融合方法，正在加载适配层...")
+    merge_method_name = "MergeVLA" if merge_method == 'mergevla' else "Two-Stage Adapter"
+    print(f"\n🔧 检测到 {merge_method_name} 融合方法，正在加载适配层...")
     
     # 加载适配层配置
-    adapter_type = merge_config.get('adapter_type', 'linear')
+    adapter_type = merge_config.get('adapter_type', 'sparse_lora' if merge_method == 'mergevla' else 'linear')
     lora_rank = merge_config.get('lora_rank', 16)  # ⚠️ 关键：从 merge_config 读取 lora_rank
+    num_tasks = merge_config.get('num_tasks', 2)  # 任务数量（用于 sparse_lora）
+    sparsity = merge_config.get('sparsity', 0.5)  # 稀疏度（用于 sparse_lora）
     
     # 获取 hidden_size
     groot_model = policy._groot_model
@@ -156,6 +159,8 @@ def load_adapter_if_needed(policy: GrootPolicy, model_path: str, merge_config: d
         hidden_size=hidden_size,
         adapter_type=adapter_type,
         lora_rank=lora_rank,  # ⚠️ 关键：传递 lora_rank
+        num_tasks=num_tasks,  # 任务数量（用于 sparse_lora）
+        sparsity=sparsity,  # 稀疏度（用于 sparse_lora）
     )
     
     # 加载适配层权重
@@ -268,7 +273,9 @@ def wrap_policy_with_adapter(policy: GrootPolicy, adapter: DistributionAdapter):
             if torch.isinf(backbone_features).any():
                 print(f"      ⚠️ Warning: Backbone features contain Inf!")
         
-        adapted_features = adapter(backbone_features)
+        # 对于 sparse_lora，如果没有 task_id，使用 None（会使用所有任务的平均）
+        task_id = None  # 推理时任务未知，使用平均
+        adapted_features = adapter(backbone_features, task_id=task_id)
         
         # ⚠️ 关键诊断：检查适配层是否过度改变了特征分布
         # 如果适配层改变了特征的统计特性（mean/std），可能导致迭代去噪不稳定
@@ -494,9 +501,26 @@ def eval_on_dataset(
         print(f"\n⚠️  DIAGNOSIS: Adapter disabled but actions still oscillatory")
         print(f"   This suggests the problem is NOT in the adapter layer!")
         print(f"   Possible causes:")
-        print(f"   1. Backbone fusion itself is problematic")
+        print(f"   1. Backbone fusion itself is problematic (simple interpolation may not work)")
         print(f"   2. Action head configuration mismatch (future_tokens, etc.)")
         print(f"   3. Model weights not properly merged")
+        print(f"\n   💡 建议解决方案：")
+        print(f"      ⭐ 使用 Expert Merging 方法（不依赖适配层，更可靠）：")
+        print(f"         ./merge_groot_models.sh expert_merge")
+        print(f"      或者使用 Task Arithmetic（无需训练，快速）：")
+        print(f"         ./merge_groot_models.sh task_arithmetic")
+    
+    # 如果适配层加载失败，也给出诊断
+    if adapter is None and merge_config and merge_config.get('merge_method') in ['two_stage_adapter', 'mergevla']:
+        print(f"\n⚠️  CRITICAL: Adapter layer failed to load!")
+        print(f"   This means the model is using raw fused backbone features")
+        print(f"   without distribution adaptation.")
+        print(f"   If actions are oscillatory, this confirms the problem:")
+        print(f"   Fused backbone output distribution doesn't match action_head expectations.")
+        print(f"\n   💡 解决方案：")
+        print(f"      1. 重新训练适配层（确保 merge_config.json 包含 lora_rank）")
+        print(f"      2. ⭐ 使用 Expert Merging 方法（推荐，不依赖适配层）")
+        print(f"         ./merge_groot_models.sh expert_merge")
     
     policy.reset()
     
