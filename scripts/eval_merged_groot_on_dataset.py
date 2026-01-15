@@ -116,6 +116,7 @@ def load_adapter_if_needed(policy: GrootPolicy, model_path: str, merge_config: d
     
     # 加载适配层配置
     adapter_type = merge_config.get('adapter_type', 'linear')
+    lora_rank = merge_config.get('lora_rank', 16)  # ⚠️ 关键：从 merge_config 读取 lora_rank
     
     # 获取 hidden_size
     groot_model = policy._groot_model
@@ -147,11 +148,14 @@ def load_adapter_if_needed(policy: GrootPolicy, model_path: str, merge_config: d
     
     print(f"   📐 Detected backbone hidden_size: {hidden_size}")
     print(f"   📐 Adapter type: {adapter_type}")
+    if adapter_type == 'lora':
+        print(f"   📐 LoRA rank: {lora_rank} (from merge_config.json)")
     
     # 创建适配层
     adapter = DistributionAdapter(
         hidden_size=hidden_size,
         adapter_type=adapter_type,
+        lora_rank=lora_rank,  # ⚠️ 关键：传递 lora_rank
     )
     
     # 加载适配层权重
@@ -470,6 +474,29 @@ def eval_on_dataset(
             print(f"\n⚠️  WARNING: Adapter layer is DISABLED for testing!")
             print(f"   Using raw backbone features (without adapter)")
             print(f"   This helps diagnose if the adapter is causing instability")
+    
+    # ⚠️ 关键诊断：检查模型配置是否匹配
+    print(f"\n🔍 模型配置诊断:")
+    print(f"   Action chunk size: {n_actions}")
+    print(f"   Policy config chunk_size: {policy.config.chunk_size}")
+    print(f"   Policy config n_action_steps: {policy.config.n_action_steps}")
+    
+    # 检查 future_tokens 配置（从之前的警告信息看，可能存在不匹配）
+    if hasattr(policy._groot_model, 'action_head') and hasattr(policy._groot_model.action_head, 'future_tokens'):
+        future_tokens_shape = policy._groot_model.action_head.future_tokens.weight.shape
+        print(f"   Action head future_tokens shape: {future_tokens_shape}")
+        if future_tokens_shape[0] != n_actions:
+            print(f"   ⚠️ WARNING: future_tokens shape ({future_tokens_shape[0]}) != action chunk size ({n_actions})!")
+            print(f"      This mismatch may cause instability!")
+    
+    # 如果禁用适配层后仍然震荡，说明问题可能在 backbone 融合
+    if disable_adapter and adapter is not None:
+        print(f"\n⚠️  DIAGNOSIS: Adapter disabled but actions still oscillatory")
+        print(f"   This suggests the problem is NOT in the adapter layer!")
+        print(f"   Possible causes:")
+        print(f"   1. Backbone fusion itself is problematic")
+        print(f"   2. Action head configuration mismatch (future_tokens, etc.)")
+        print(f"   3. Model weights not properly merged")
     
     policy.reset()
     
@@ -913,9 +940,9 @@ if __name__ == "__main__":
                        help='Path to the LeRobot dataset root directory (if not using --use-default-datasets)')
     parser.add_argument('--episode', type=int, default=0,
                        help='Episode number to evaluate (default: 0, only used if --dataset-root is specified)')
-    parser.add_argument('--action-chunk-size', type=int, default=50,
+    parser.add_argument('--action-chunk-size', type=int, default=32,
                        dest='action_chunk_size',
-                       help='Action chunk size (default: 50, should match training config)')
+                       help='Action chunk size (default: 32 for GROOT, should match training config)')
     parser.add_argument('--no-progress', action='store_true',
                        help='Disable progress bar')
     parser.add_argument('--use-default-datasets', action='store_true',
