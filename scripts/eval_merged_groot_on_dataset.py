@@ -183,12 +183,15 @@ def load_adapter_if_needed(policy: GrootPolicy, model_path: str, merge_config: d
             return None
         
         # 加载适配层权重
-        adapter.load_state_dict(adapter_state_dict)
+        adapter.load_state_dict(adapter_state_dict, strict=True)
         adapter.eval()  # 设置为评估模式
         adapter.to(next(policy.parameters()).device)
         
         print(f"   ✅ 适配层权重加载成功")
         print(f"   📊 适配层参数数量: {sum(p.numel() for p in adapter.parameters()):,}")
+        
+        # 验证加载的权重键名
+        print(f"   📋 加载的适配层权重键: {list(adapter_state_dict.keys())}")
         
         return adapter
         
@@ -223,17 +226,65 @@ def wrap_policy_with_adapter(policy: GrootPolicy, adapter: DistributionAdapter):
         
         # 通过适配层
         backbone_features = backbone_outputs[BACKBONE_FEATURE_KEY]
+        
+        # ⚠️ 诊断：检查适配层输入输出的统计信息（前几次调用）
+        if not hasattr(get_action_with_adapter, '_call_count'):
+            get_action_with_adapter._call_count = 0
+        get_action_with_adapter._call_count += 1
+        
+        if get_action_with_adapter._call_count <= 5:
+            print(f"\n   🔍 适配层诊断 (调用 #{get_action_with_adapter._call_count}):")
+            print(f"      Backbone features: mean={backbone_features.mean().item():.6f}, "
+                  f"std={backbone_features.std().item():.6f}, "
+                  f"min={backbone_features.min().item():.6f}, "
+                  f"max={backbone_features.max().item():.6f}")
+            # 检查是否有异常值
+            if torch.isnan(backbone_features).any():
+                print(f"      ⚠️ Warning: Backbone features contain NaN!")
+            if torch.isinf(backbone_features).any():
+                print(f"      ⚠️ Warning: Backbone features contain Inf!")
+        
         adapted_features = adapter(backbone_features)
+        
+        if get_action_with_adapter._call_count <= 5:
+            print(f"      Adapted features: mean={adapted_features.mean().item():.6f}, "
+                  f"std={adapted_features.std().item():.6f}, "
+                  f"min={adapted_features.min().item():.6f}, "
+                  f"max={adapted_features.max().item():.6f}")
+            # 检查适配层是否改变了分布
+            feature_diff = (adapted_features - backbone_features).abs().mean().item()
+            print(f"      Feature change (|adapted - backbone|): {feature_diff:.6f}")
+            if feature_diff < 1e-6:
+                print(f"      ⚠️ Warning: Adapter barely changes features! May not be working.")
+            if torch.isnan(adapted_features).any():
+                print(f"      ⚠️ Warning: Adapted features contain NaN!")
+            if torch.isinf(adapted_features).any():
+                print(f"      ⚠️ Warning: Adapted features contain Inf!")
+        
         # 直接修改 BatchFeature 中的数据（BatchFeature 支持字典式赋值）
         backbone_outputs[BACKBONE_FEATURE_KEY] = adapted_features
         
         # 通过 action_head
+        # ⚠️ 关键：如果 kwargs 中没有 rtc_enabled，使用模型的默认值
+        rtc_enabled = kwargs.pop('rtc_enabled', policy._groot_model._rtc_enabled())
         action_head_outputs = policy._groot_model.action_head.get_action(
             backbone_outputs, 
             action_inputs, 
-            rtc_enabled=policy._groot_model._rtc_enabled(),
+            rtc_enabled=rtc_enabled,
             **kwargs
         )
+        
+        # ⚠️ 诊断：检查预测动作的统计信息
+        if get_action_with_adapter._call_count <= 5:
+            action_pred = action_head_outputs.get('action_pred')
+            if action_pred is not None:
+                print(f"      Predicted action: mean={action_pred.mean().item():.6f}, "
+                      f"std={action_pred.std().item():.6f}, "
+                      f"min={action_pred.min().item():.6f}, "
+                      f"max={action_pred.max().item():.6f}")
+                # 检查动作是否异常大
+                if action_pred.abs().max().item() > 10.0:
+                    print(f"      ⚠️ Warning: Action values are very large! May cause instability.")
         
         return action_head_outputs
     

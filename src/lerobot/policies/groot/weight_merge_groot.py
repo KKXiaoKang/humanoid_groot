@@ -26,6 +26,7 @@ import glob
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 from safetensors.torch import load_file, save_file
 from huggingface_hub import snapshot_download
 from huggingface_hub.errors import HFValidationError, RepositoryNotFoundError
@@ -1203,24 +1204,92 @@ class ExpertMerger:
 #                          ↑
 #                   只训练这一层！
 
-class DistributionAdapter(nn.Module):
+class LoRAAdapter(nn.Module):
     """
-    分布适配层：将融合后的 backbone 输出分布映射回 action_head 期望的分布
+    LoRA 适配层（基于 MergeVLA 的思想）
     
-    参考 kai0 的 Model Arithmetic 方法，使用 on-policy loss 优化适配层
+    使用低秩分解：W = W_base + A @ B
+    其中 A: (hidden_size, rank), B: (rank, hidden_size)
+    rank << hidden_size，参数量小但表达能力足够
     """
     
     def __init__(
         self,
         hidden_size: int = 1024,
-        adapter_type: str = "linear",  # "linear", "mlp", "layernorm_only"
+        rank: int = 16,  # LoRA rank，通常 8-32
+        alpha: float = 16.0,  # LoRA scaling factor
         dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.rank = rank
+        self.alpha = alpha
+        
+        # LoRA 参数：A 和 B
+        self.lora_A = nn.Parameter(torch.randn(hidden_size, rank) * 0.02)
+        self.lora_B = nn.Parameter(torch.zeros(rank, hidden_size))
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        
+        # 残差连接的系数
+        self.residual_scale = nn.Parameter(torch.ones(1))
+        
+        print(f"   LoRA Adapter: rank={rank}, alpha={alpha}, params={self._count_params():,}")
+    
+    def _count_params(self):
+        return self.lora_A.numel() + self.lora_B.numel() + 1
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        LoRA forward: x + residual_scale * (alpha/rank) * dropout(x) @ A @ B
+        """
+        # ⚠️ 关键修复：确保 LoRA 参数与输入 x 的 dtype 匹配
+        # 因为 x 可能是 bfloat16（在 autocast 中），而 LoRA 参数默认是 float32
+        lora_A = self.lora_A.to(dtype=x.dtype)
+        lora_B = self.lora_B.to(dtype=x.dtype)
+        residual_scale = self.residual_scale.to(dtype=x.dtype)
+        
+        # LoRA 变换
+        lora_output = self.dropout(x) @ lora_A @ lora_B
+        # 缩放并添加到输入（使用 residual_scale 控制强度）
+        return x + residual_scale * (self.alpha / self.rank) * lora_output
+
+
+class DistributionAdapter(nn.Module):
+    """
+    分布适配层：将融合后的 backbone 输出分布映射回 action_head 期望的分布
+    
+    参考 kai0 的 Model Arithmetic 方法，使用 on-policy loss 优化适配层
+    
+    支持多种适配层类型：
+    - "linear": 简单线性层
+    - "mlp": 两层 MLP
+    - "lora": LoRA 适配层（基于 MergeVLA，推荐）⭐
+    - "layernorm_only": 只用 LayerNorm
+    """
+    
+    def __init__(
+        self,
+        hidden_size: int = 1024,
+        adapter_type: str = "linear",  # "linear", "mlp", "lora", "layernorm_only"
+        dropout: float = 0.0,
+        lora_rank: int = 16,  # LoRA rank（仅用于 lora 类型）
     ):
         super().__init__()
         self.hidden_size = hidden_size
         self.adapter_type = adapter_type
         
-        if adapter_type == "linear":
+        if adapter_type == "lora":
+            # ⭐ 推荐：使用 LoRA 适配层（基于 MergeVLA）
+            self.adapter = LoRAAdapter(
+                hidden_size=hidden_size,
+                rank=lora_rank,
+                alpha=16.0,
+                dropout=dropout,
+            )
+            # LoRA 不需要额外的 residual_scale（已经在 LoRAAdapter 中）
+            self.residual_scale = None
+        
+        elif adapter_type == "linear":
             # ⚠️ 警告：Linear adapter 表达能力不够，可能导致训练失败
             # 建议使用 MLP adapter
             print(f"   ⚠️ Warning: Linear adapter may not have enough capacity!")
@@ -1258,8 +1327,11 @@ class DistributionAdapter(nn.Module):
         else:
             raise ValueError(f"Unknown adapter type: {adapter_type}")
         
-        # 残差连接的系数（可学习）
-        self.residual_scale = nn.Parameter(torch.ones(1))
+        # 残差连接的系数（可学习，仅用于非 LoRA 类型）
+        if adapter_type != "lora":
+            self.residual_scale = nn.Parameter(torch.ones(1))
+        else:
+            self.residual_scale = None
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -1268,7 +1340,10 @@ class DistributionAdapter(nn.Module):
         Returns:
             适配后的特征 [B, T, hidden_size]
         """
-        if self.adapter_type == "mlp":
+        if self.adapter_type == "lora":
+            # LoRA 适配层（内置残差连接）
+            return self.adapter(x)
+        elif self.adapter_type == "mlp":
             # ⚠️ 关键：残差连接让适配层更容易学习
             # 初始时 residual_scale=1.0，adapter 输出接近 0，所以输出 ≈ x
             # 训练时 adapter 学习到有用的变换，residual_scale 可以调整强度
@@ -1294,6 +1369,7 @@ class MergedModelWithAdapter(nn.Module):
         base_model: GR00TN15,
         adapter_type: str = "linear",
         hidden_size: int = 1024,
+        lora_rank: int = 16,
     ):
         super().__init__()
         
@@ -1318,6 +1394,7 @@ class MergedModelWithAdapter(nn.Module):
         self.adapter = DistributionAdapter(
             hidden_size=hidden_size,
             adapter_type=adapter_type,
+            lora_rank=lora_rank,
         )
         
         print(f"✅ MergedModelWithAdapter initialized")
@@ -1485,8 +1562,9 @@ class TwoStageExpertMerger:
         base_model_path: str = None,
         merge_method: str = "interpolation",  # "interpolation", "task_arithmetic"
         alpha: float = 0.5,  # 融合系数
-        adapter_type: str = "linear",  # "linear", "mlp", "layernorm_only"
+        adapter_type: str = "lora",  # "linear", "mlp", "lora", "layernorm_only"
         device: str = "cuda:0",
+        lora_rank: int = 16,  # LoRA rank（仅用于 lora 类型）
     ):
         self.narrower_path = narrower_path
         self.wider_path = wider_path
@@ -1494,6 +1572,7 @@ class TwoStageExpertMerger:
         self.merge_method = merge_method
         self.alpha = alpha
         self.adapter_type = adapter_type
+        self.lora_rank = lora_rank
         self.device = torch.device(device)
         
         self.merged_model = None
@@ -1598,6 +1677,7 @@ class TwoStageExpertMerger:
             base_model=base_model,
             adapter_type=self.adapter_type,
             hidden_size=hidden_size,
+            lora_rank=self.lora_rank,
         ).to(self.device)
         
         # 加载预处理器
@@ -1673,18 +1753,30 @@ class TwoStageExpertMerger:
             betas=(0.9, 0.999),
         )
         
-        # ⚠️ 关键改进：使用 Warmup + CosineAnnealing
-        # Warmup 让适配层先适应，然后逐步学习
-        warmup_epochs = max(1, num_epochs // 10)  # 10% warmup
-        def lr_lambda(epoch):
-            if epoch < warmup_epochs:
-                return (epoch + 1) / warmup_epochs  # Linear warmup
-            else:
-                # Cosine annealing after warmup
-                progress = (epoch - warmup_epochs) / (num_epochs - warmup_epochs)
-                return 0.5 * (1 + np.cos(np.pi * progress))
+        # ⚠️ 关键修复：使用固定学习率或非常缓慢的衰减
+        # 问题：CosineAnnealing 会让学习率降得太低（最后降到 1e-6），导致适配层无法学习
+        # 解决方案：使用固定学习率，或者非常缓慢的线性衰减
+        use_constant_lr = True  # 改为 True 使用固定学习率
         
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        if use_constant_lr:
+            # 使用固定学习率（推荐！）
+            print(f"   ⚠️ Using CONSTANT learning rate (no decay)")
+            print(f"      This is critical for adapter training!")
+            print(f"      CosineAnnealing was causing LR to drop too low (1e-6)")
+            print(f"      which prevented the adapter from learning!")
+            scheduler = None  # 不使用 scheduler
+        else:
+            # 使用非常缓慢的线性衰减（如果必须使用衰减）
+            warmup_epochs = max(1, num_epochs // 10)  # 10% warmup
+            def lr_lambda(epoch):
+                if epoch < warmup_epochs:
+                    return (epoch + 1) / warmup_epochs  # Linear warmup
+                else:
+                    # 非常缓慢的线性衰减：从 1.0 降到 0.5（而不是 0）
+                    progress = (epoch - warmup_epochs) / (num_epochs - warmup_epochs)
+                    return 1.0 - 0.5 * progress  # 线性衰减到 0.5
+            
+            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
         
         self.merged_model.train()
         
@@ -1783,6 +1875,11 @@ class TwoStageExpertMerger:
                         print(f"   ⚠️ Non-finite loss: {loss.item()}")
                     continue
                 
+                # ⚠️ 关键：在反向传播之前，确保适配层参数与 loss 的 dtype 匹配
+                # 如果 loss 是 bfloat16，适配层参数也应该是 bfloat16（在 autocast 中）
+                # 但适配层参数默认是 float32，这可能导致问题
+                # 实际上，PyTorch 的自动混合精度会处理这个问题，但我们需要确保梯度能正确传播
+                
                 # 反向传播
                 loss.backward()
                 
@@ -1792,24 +1889,78 @@ class TwoStageExpertMerger:
                     max_norm=1.0,
                 )
                 
-                # 检查梯度（每个 epoch 的前几个 batch）
+                # ⚠️ 关键诊断：详细检查梯度传播
                 if batch_idx < 3 and epoch == 0:
+                    print(f"\n   🔍 详细梯度诊断 (Batch {batch_idx}):")
+                    
+                    # 1. 检查 loss 是否有梯度
+                    if hasattr(loss, 'grad_fn') and loss.grad_fn is not None:
+                        print(f"      ✅ Loss has grad_fn: {type(loss.grad_fn).__name__}")
+                    else:
+                        print(f"      ⚠️ CRITICAL: Loss has NO grad_fn! Cannot backpropagate!")
+                    
+                    # 2. 检查适配层输入是否有梯度
+                    # 注意：backbone 是冻结的，所以 backbone_features 不需要梯度（这是正常的）
+                    # 但我们需要检查适配层是否能正常工作
+                    with torch.no_grad():
+                        backbone_inputs, _ = self.merged_model.model.prepare_input(inputs)
+                        backbone_outputs = self.merged_model.model.backbone(backbone_inputs)
+                        backbone_features = backbone_outputs[BACKBONE_FEATURE_KEY]
+                    
+                    print(f"      Backbone features: shape={backbone_features.shape}, dtype={backbone_features.dtype}")
+                    print(f"      Backbone features require grad: {backbone_features.requires_grad} (expected: False, backbone is frozen)")
+                    
+                    # 3. 检查适配层输出是否有梯度
+                    # 适配层是可训练的，所以输出应该有梯度
+                    adapted_features = self.merged_model.adapter(backbone_features)
+                    if adapted_features.requires_grad:
+                        print(f"      ✅ Adapted features require grad (adapter is trainable)")
+                    else:
+                        print(f"      ⚠️ CRITICAL: Adapted features do NOT require grad!")
+                        print(f"         This means the adapter computation graph is broken!")
+                    
+                    # 4. 检查适配层参数的梯度
                     grad_sum = 0
                     grad_max = 0
                     param_count = 0
+                    has_any_grad = False
+                    
                     for name, p in self.merged_model.adapter.named_parameters():
                         if p.grad is not None:
+                            has_any_grad = True
                             grad_sum += p.grad.abs().sum().item()
                             grad_max = max(grad_max, p.grad.abs().max().item())
                             param_count += p.numel()
+                            print(f"      ✅ {name}: grad_norm={p.grad.norm().item():.6f}, "
+                                  f"grad_mean={p.grad.abs().mean().item():.6f}")
+                        else:
+                            print(f"      ⚠️ {name}: NO gradient!")
                     
-                    if grad_sum > 0:
+                    if has_any_grad:
                         grad_mean = grad_sum / param_count if param_count > 0 else 0
-                        print(f"   ✅ Adapter gradients: mean={grad_mean:.6f}, max={grad_max:.6f}")
+                        print(f"      📊 Overall: grad_mean={grad_mean:.6f}, grad_max={grad_max:.6f}")
                         if grad_mean < 1e-6:
-                            print(f"   ⚠️ Warning: Gradients are very small! May need larger learning rate")
+                            print(f"      ⚠️ CRITICAL: Gradients are extremely small!")
+                            print(f"         This means the adapter cannot learn effectively!")
+                            print(f"         Possible causes:")
+                            print(f"         1. Flow Matching loss gradients are too weak")
+                            print(f"         2. Computation graph is broken")
+                            print(f"         3. Need to use Expert Merging instead")
                     else:
-                        print(f"   ⚠️ Adapter has no gradients! Check computation graph!")
+                        print(f"      ⚠️ CRITICAL: Adapter has NO gradients at all!")
+                        print(f"         The computation graph is broken!")
+                        print(f"         Recommendation: Use Expert Merging method instead")
+                    
+                    # 5. 检查 action_head 输出是否有梯度
+                    if hasattr(outputs_dict, 'get'):
+                        loss_tensor = outputs_dict.get('loss')
+                        if loss_tensor is not None and hasattr(loss_tensor, 'requires_grad'):
+                            if loss_tensor.requires_grad:
+                                print(f"      ✅ Loss tensor requires grad")
+                            else:
+                                print(f"      ⚠️ Loss tensor does NOT require grad!")
+                    
+                    print()  # 空行
                 
                 optimizer.step()
                 epoch_losses.append(loss.item())
@@ -1820,7 +1971,56 @@ class TwoStageExpertMerger:
                     print(f"   Epoch {epoch+1}/{num_epochs}, Batch {batch_idx}: "
                           f"loss = {loss.item():.4f}, grad_norm = {grad_norm:.4f}, lr = {current_lr:.2e}")
             
-            scheduler.step()
+            if scheduler is not None:
+                scheduler.step()
+            
+            # ⚠️ 关键诊断：每个 epoch 检查适配层权重是否在学习
+            if epoch % 10 == 0 or epoch == num_epochs - 1:
+                with torch.no_grad():
+                    print(f"\n   🔍 Adapter learning check (Epoch {epoch+1}):")
+                    
+                    # 检查适配层类型
+                    if self.adapter_type == "lora":
+                        # LoRA 适配层
+                        if hasattr(self.merged_model.adapter, 'adapter') and hasattr(self.merged_model.adapter.adapter, 'lora_A'):
+                            lora_A = self.merged_model.adapter.adapter.lora_A
+                            lora_B = self.merged_model.adapter.adapter.lora_B
+                            lora_A_abs_mean = lora_A.abs().mean().item()
+                            lora_B_abs_mean = lora_B.abs().mean().item()
+                            
+                            print(f"      LoRA A weight abs mean: {lora_A_abs_mean:.6f}")
+                            print(f"      LoRA B weight abs mean: {lora_B_abs_mean:.6f}")
+                            
+                            if lora_A_abs_mean < 0.001 or lora_B_abs_mean < 0.001:
+                                print(f"      ⚠️ CRITICAL: LoRA adapter is NOT learning!")
+                                print(f"         Current LR: {optimizer.param_groups[0]['lr']:.2e}")
+                                print(f"         Recommendation: Try Expert Merging method instead!")
+                            elif lora_A_abs_mean < 0.01 or lora_B_abs_mean < 0.01:
+                                print(f"      ⚠️ Warning: LoRA adapter learning is weak")
+                            else:
+                                print(f"      ✅ LoRA adapter is learning (weights are changing)")
+                    else:
+                        # MLP 或其他适配层
+                        if hasattr(self.merged_model.adapter, 'adapter') and len(self.merged_model.adapter.adapter) > 0:
+                            adapter_0_weight = self.merged_model.adapter.adapter[0].weight
+                            adapter_0_abs_mean = adapter_0_weight.abs().mean().item()
+                            
+                            if len(self.merged_model.adapter.adapter) > 3:
+                                adapter_3_weight = self.merged_model.adapter.adapter[3].weight
+                                adapter_3_abs_mean = adapter_3_weight.abs().mean().item()
+                                print(f"      Layer 0 weight abs mean: {adapter_0_abs_mean:.6f}")
+                                print(f"      Layer 3 weight abs mean: {adapter_3_abs_mean:.6f}")
+                            else:
+                                print(f"      Layer 0 weight abs mean: {adapter_0_abs_mean:.6f}")
+                            
+                            if adapter_0_abs_mean < 0.01:
+                                print(f"      ⚠️ CRITICAL: Adapter is NOT learning! Weights are almost zero!")
+                                print(f"         Current LR: {optimizer.param_groups[0]['lr']:.2e}")
+                                print(f"         Recommendation: Try LoRA adapter or Expert Merging!")
+                            elif adapter_0_abs_mean < 0.05:
+                                print(f"      ⚠️ Warning: Adapter learning is weak")
+                            else:
+                                print(f"      ✅ Adapter is learning (weights are changing)")
             
             if epoch_losses:
                 avg_loss = sum(epoch_losses) / len(epoch_losses)
@@ -1840,7 +2040,7 @@ class TwoStageExpertMerger:
         print(f"   成功批次: {successful_batches}/{total_batches}")
         
         # 打印适配层参数变化
-        self._print_adapter_stats()
+        self._print_adapter_stats(optimizer)
         
         if successful_batches == 0:
             print(f"\n⚠️ 警告：没有成功训练的批次！")
@@ -1849,10 +2049,14 @@ class TwoStageExpertMerger:
             print(f"   2. 预处理器配置问题")
             print(f"   3. 模型配置不匹配")
     
-    def _print_adapter_stats(self):
+    def _print_adapter_stats(self, optimizer=None):
         """打印适配层参数统计"""
         import numpy as np
         print(f"\n📊 Adapter parameter stats after training:")
+        
+        if optimizer is not None:
+            final_lr = optimizer.param_groups[0]['lr']
+            print(f"   Final learning rate: {final_lr:.2e}")
         
         adapter_trained = False
         
@@ -1861,22 +2065,60 @@ class TwoStageExpertMerger:
             print(f"   {name}:")
             print(f"      Mean: {p_np.mean():.6f}, Std: {p_np.std():.6f}")
             
-            # 检查 Linear weight 是否远离恒等矩阵
+            # 检查 LoRA 参数（如果使用 LoRA 适配层）
+            if 'lora_A' in name or 'lora_B' in name:
+                weight_abs_mean = np.abs(p_np).mean()
+                weight_std = p_np.std()
+                print(f"      Weight abs mean: {weight_abs_mean:.6f}, Std: {weight_std:.6f}")
+                
+                if weight_abs_mean < 0.001:
+                    print(f"      ⚠️ CRITICAL: LoRA weights are almost zero!")
+                    print(f"         This means the adapter is NOT learning!")
+                elif weight_abs_mean < 0.01:
+                    print(f"      ⚠️ Warning: LoRA weights are very small!")
+                else:
+                    print(f"      ✅ LoRA adapter has learned meaningful weights")
+                    adapter_trained = True
+            
+            # 检查 Linear weight 是否远离初始值（对于 MLP，第一层是 hidden_size -> hidden_size*2）
             if 'adapter.0.weight' in name and len(p_np.shape) == 2:
-                if p_np.shape[0] == p_np.shape[1]:
-                    eye = np.eye(p_np.shape[0])
-                    diff = np.abs(p_np - eye).mean()
-                    print(f"      Distance from identity: {diff:.6f}")
-                    if diff < 0.01:
-                        print(f"      ⚠️ Still close to identity! Training failed!")
-                        print(f"      Possible reasons:")
-                        print(f"        1. Learning rate too small (try 1e-3)")
-                        print(f"        2. Not enough training epochs (try 50+)")
-                        print(f"        3. Not enough data (try 100+ samples)")
-                        print(f"        4. Flow Matching loss gradients too weak")
-                    else:
-                        print(f"      ✅ Adapter has learned meaningful transformation")
-                        adapter_trained = True
+                # 对于 MLP adapter，第一层是 (hidden_size*2, hidden_size)
+                # 检查权重是否远离零（初始化为 Xavier，gain=0.1，所以初始值应该很小但非零）
+                weight_abs_mean = np.abs(p_np).mean()
+                weight_std = p_np.std()
+                print(f"      Weight abs mean: {weight_abs_mean:.6f}, Std: {weight_std:.6f}")
+                
+                # 如果权重几乎为零，说明没有学习
+                if weight_abs_mean < 0.01:
+                    print(f"      ⚠️ CRITICAL: Adapter layer 0 weights are almost zero!")
+                    print(f"         This means the adapter is NOT learning!")
+                    print(f"         The model will collapse during inference!")
+                    print(f"      Possible reasons:")
+                    print(f"        1. Learning rate too small (need 1e-2 or larger)")
+                    print(f"        2. Flow Matching loss gradients too weak")
+                    print(f"        3. Learning rate decay too aggressive (use constant LR)")
+                    print(f"        4. Not enough training epochs or data")
+                elif weight_abs_mean < 0.05:
+                    print(f"      ⚠️ Warning: Adapter layer 0 weights are very small!")
+                    print(f"         Adapter may not be learning effectively")
+                else:
+                    print(f"      ✅ Adapter layer 0 has learned meaningful weights")
+                    adapter_trained = True
+            
+            # 检查中间层（adapter.3，第二层 Linear）
+            if 'adapter.3.weight' in name and len(p_np.shape) == 2:
+                weight_abs_mean = np.abs(p_np).mean()
+                weight_std = p_np.std()
+                print(f"      Weight abs mean: {weight_abs_mean:.6f}, Std: {weight_std:.6f}")
+                
+                if weight_abs_mean < 0.01:
+                    print(f"      ⚠️ CRITICAL: Adapter layer 3 weights are almost zero!")
+                    print(f"         This means the adapter is NOT learning!")
+                elif weight_abs_mean < 0.05:
+                    print(f"      ⚠️ Warning: Adapter layer 3 weights are very small!")
+                else:
+                    print(f"      ✅ Adapter layer 3 has learned meaningful weights")
+                    adapter_trained = True
             
             # 检查 residual_scale
             if 'residual_scale' in name:
@@ -1891,11 +2133,14 @@ class TwoStageExpertMerger:
         if not adapter_trained:
             print(f"\n⚠️ 警告：适配层可能没有被训练！")
             print(f"   建议：")
-            print(f"   1. 使用 MLP adapter: --adapter_type mlp")
-            print(f"   2. 增大学习率: --adapter_lr 1e-3")
-            print(f"   3. 增加训练轮数: --adapter_epochs 50")
-            print(f"   4. 增加样本数: --num_samples 100")
-            print(f"   5. 或者尝试不使用适配层的方法（见下方）")
+            print(f"   1. 使用 LoRA adapter: --adapter_type lora --lora_rank 32")
+            print(f"   2. 增大学习率: --adapter_lr 1e-2")
+            print(f"   3. 增加训练轮数: --adapter_epochs 100")
+            print(f"   4. 增加样本数: --num_samples 500")
+            print(f"   5. ⭐ 推荐：使用 Expert Merging 方法（不依赖适配层）:")
+            print(f"      ./merge_groot_models.sh expert_merge")
+            print(f"   6. 或者使用 Task Arithmetic（无需训练）:")
+            print(f"      ./merge_groot_models.sh task_arithmetic")
     
     def _prepare_observation(self, batch: dict) -> dict:
         """

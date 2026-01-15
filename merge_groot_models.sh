@@ -91,19 +91,24 @@ case $METHOD in
         echo ""
         echo "📚 校准数据：将使用 lerobot_data/split_dataset 文件夹中的训练数据集"
         echo ""
-        # ⚠️ 关键改进：使用 MLP adapter + 更大学习率 + 更多数据
-        # 原因：Flow Matching loss 对适配层的梯度太弱，需要更强的训练策略
+        # ⚠️ 关键改进：使用 LoRA adapter（基于 MergeVLA 方法）
+        # 原因：
+        # 1. LoRA 适配层更适合 VLA 模型（基于 MergeVLA 2025 研究）
+        # 2. 参数量小但表达能力足够
+        # 3. 梯度传播更稳定
+        # 4. 如果仍然失败，建议使用 Expert Merging 方法（不依赖适配层）
         python scripts/train_weight_merge.py \
             --method two_stage_adapter \
             --narrower_path "$NARROWER_PATH" \
             --wider_path "$WIDER_PATH" \
             --use_default_datasets \
             --alpha 0.5 \
-            --adapter_type mlp \
+            --adapter_type lora \
+            --lora_rank 32 \
             --adapter_epochs 50 \
-            --adapter_lr 1e-3 \
-            --num_samples 100 \
-            --batch_size 1 \
+            --adapter_lr 1e-2 \
+            --num_samples 200 \
+            --batch_size 48 \
             --device "$DEVICE" \
             --output_path "$OUTPUT_PATH"
         ;;

@@ -852,6 +852,7 @@ def run_two_stage_merge(args):
         alpha=args.alpha,
         adapter_type=args.adapter_type,
         device=args.device,
+        lora_rank=args.lora_rank,
     )
     
     # 阶段 1: 加载并融合
@@ -961,10 +962,12 @@ def main():
                        help="DARE drop rate")
     
     # Two-Stage Adapter 参数 ⭐ 新增
-    parser.add_argument("--adapter_type", type=str, default="linear",
-                       choices=["linear", "mlp", "layernorm_only"],
-                       help="Distribution adapter type: linear (default, lightweight), "
-                            "mlp (more capacity), layernorm_only (simplest)")
+    parser.add_argument("--adapter_type", type=str, default="lora",
+                       choices=["linear", "mlp", "lora", "layernorm_only"],
+                       help="Distribution adapter type: lora (recommended, MergeVLA style), "
+                            "mlp (more capacity), linear (lightweight), layernorm_only (simplest)")
+    parser.add_argument("--lora_rank", type=int, default=16,
+                       help="LoRA rank for lora adapter type (default: 16)")
     parser.add_argument("--adapter_epochs", type=int, default=20,
                        help="Number of epochs to train the distribution adapter")
     parser.add_argument("--adapter_lr", type=float, default=1e-4,
