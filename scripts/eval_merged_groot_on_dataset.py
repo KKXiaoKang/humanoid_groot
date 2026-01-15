@@ -193,6 +193,26 @@ def load_adapter_if_needed(policy: GrootPolicy, model_path: str, merge_config: d
         # 验证加载的权重键名
         print(f"   📋 加载的适配层权重键: {list(adapter_state_dict.keys())}")
         
+        # ⚠️ 关键诊断：检查适配层权重是否正常
+        with torch.no_grad():
+            for name, param in adapter.named_parameters():
+                param_mean = param.mean().item()
+                param_std = param.std().item()
+                param_abs_mean = param.abs().mean().item()
+                print(f"   📊 {name}: mean={param_mean:.6f}, std={param_std:.6f}, abs_mean={param_abs_mean:.6f}")
+                
+                # 检查权重是否异常
+                if 'lora_A' in name or 'lora_B' in name:
+                    if param_abs_mean < 0.01:
+                        print(f"      ⚠️ WARNING: {name} weights are very small! May not be effective.")
+                    elif param_abs_mean > 1.0:
+                        print(f"      ⚠️ WARNING: {name} weights are very large! May cause instability.")
+                elif 'residual_scale' in name:
+                    if param_abs_mean < 0.01:
+                        print(f"      ⚠️ WARNING: residual_scale is very small! Adapter contribution is minimal.")
+                    elif param_abs_mean > 1.0:
+                        print(f"      ⚠️ WARNING: residual_scale is large! May amplify features too much.")
+        
         return adapter
         
     except Exception as e:
@@ -246,8 +266,53 @@ def wrap_policy_with_adapter(policy: GrootPolicy, adapter: DistributionAdapter):
         
         adapted_features = adapter(backbone_features)
         
+        # ⚠️ 关键诊断：检查适配层是否过度改变了特征分布
+        # 如果适配层改变了特征的统计特性（mean/std），可能导致迭代去噪不稳定
+        # 因为 Flow Matching 的迭代去噪对输入特征分布很敏感
+        backbone_mean = backbone_features.mean()
+        backbone_std = backbone_features.std()
+        adapted_mean = adapted_features.mean()
+        adapted_std = adapted_features.std()
+        
         if get_action_with_adapter._call_count <= 5:
-            print(f"      Adapted features: mean={adapted_features.mean().item():.6f}, "
+            print(f"      Backbone features: mean={backbone_mean.item():.6f}, std={backbone_std.item():.6f}")
+            print(f"      Adapted features: mean={adapted_mean.item():.6f}, std={adapted_std.item():.6f}")
+            
+            # 检查分布变化
+            mean_diff_ratio = abs(adapted_mean - backbone_mean) / (abs(backbone_mean) + 1e-8)
+            std_diff_ratio = abs(adapted_std - backbone_std) / (abs(backbone_std) + 1e-8)
+            
+            print(f"      Distribution change: mean_diff={mean_diff_ratio.item()*100:.1f}%, std_diff={std_diff_ratio.item()*100:.1f}%")
+            
+            if mean_diff_ratio > 0.3 or std_diff_ratio > 0.3:
+                print(f"      ⚠️ WARNING: Adapter significantly changed feature distribution!")
+                print(f"         This may cause instability in iterative denoising!")
+                print(f"         Consider: 1) Re-training with feature normalization, 2) Using Expert Merging instead")
+        
+        # ⚠️ 关键修复：如果适配层过度改变了特征分布，应用温和的归一化
+        # 保持适配层的方向性变换，但稳定特征的统计特性
+        # 这样可以减少迭代去噪过程中的误差累积
+        if not hasattr(get_action_with_adapter, '_use_feature_stabilization'):
+            # 只在第一次调用时决定是否使用特征稳定化
+            mean_diff_ratio = abs(adapted_mean - backbone_mean) / (abs(backbone_mean) + 1e-8)
+            std_diff_ratio = abs(adapted_std - backbone_std) / (abs(backbone_std) + 1e-8)
+            
+            # 如果分布变化超过阈值，启用特征稳定化
+            if mean_diff_ratio > 0.5 or std_diff_ratio > 0.5:
+                get_action_with_adapter._use_feature_stabilization = True
+                print(f"      🔧 Enabling feature stabilization (distribution change too large)")
+            else:
+                get_action_with_adapter._use_feature_stabilization = False
+        
+        if get_action_with_adapter._use_feature_stabilization:
+            # 应用温和的归一化：保持适配层的方向性，但稳定统计特性
+            # 使用混合策略：adapted_features * (1-alpha) + normalized_features * alpha
+            alpha = 0.3  # 混合系数，30% 归一化，70% 保持适配层输出
+            normalized_features = (adapted_features - adapted_mean) / (adapted_std + 1e-8) * backbone_std + backbone_mean
+            adapted_features = (1 - alpha) * adapted_features + alpha * normalized_features
+        
+        if get_action_with_adapter._call_count <= 5:
+            print(f"      Adapted features (final): mean={adapted_features.mean().item():.6f}, "
                   f"std={adapted_features.std().item():.6f}, "
                   f"min={adapted_features.min().item():.6f}, "
                   f"max={adapted_features.max().item():.6f}")
@@ -302,6 +367,7 @@ def eval_on_dataset(
     show_progress: bool = True,
     use_default_datasets: bool = False,
     visualize: bool = False,
+    disable_adapter: bool = False,
 ):
     """
     在数据集上评估融合模型
@@ -398,7 +464,12 @@ def eval_on_dataset(
     # ⚠️ 关键：如果是 two_stage_adapter 方法，需要加载适配层
     adapter = load_adapter_if_needed(policy, model_path, merge_config)
     if adapter is not None:
-        wrap_policy_with_adapter(policy, adapter)
+        if not disable_adapter:
+            wrap_policy_with_adapter(policy, adapter)
+        else:
+            print(f"\n⚠️  WARNING: Adapter layer is DISABLED for testing!")
+            print(f"   Using raw backbone features (without adapter)")
+            print(f"   This helps diagnose if the adapter is causing instability")
     
     policy.reset()
     
@@ -851,6 +922,8 @@ if __name__ == "__main__":
                        help='Evaluate on default training datasets (narrower and wider)')
     parser.add_argument('--visualize', action='store_true',
                        help='Enable Rerun visualization')
+    parser.add_argument('--disable-adapter', action='store_true',
+                       help='Disable adapter layer for testing (use raw backbone features)')
     
     args = parser.parse_args()
     
@@ -875,4 +948,5 @@ if __name__ == "__main__":
         show_progress=not args.no_progress,
         use_default_datasets=args.use_default_datasets,
         visualize=args.visualize,
+        disable_adapter=args.disable_adapter,
     )
