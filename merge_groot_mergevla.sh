@@ -55,6 +55,21 @@ echo "=========================================="
 echo ""
 
 # 运行 MergeVLA 融合
+# ⚠️ 关键参数说明：
+#   --adapter_epochs: 增加到 100 以确保充分学习
+#   --lora_rank: 增加到 32 以提高适配器容量
+#   --sparsity: 降低到 0.3 以激活更多参数（减少稀疏性）
+#   --merge_action_head: 尝试融合 action_head（GROOT 使用 cross-attention，更安全）
+#
+# ⭐ Episode-based 采样模式（保持时序连续性）：
+#   --episode-based: 按 episode 组织数据，保持动作轨迹的时序关系
+#   --num-episodes: 每个数据集采样的 episode 数量（None=全部）
+#   这样适配层可以学习到完整的动作轨迹模式：接近→抓取→提起→移动
+#
+# 💡 采样模式选择：
+#   1. --episode-based --num-episodes 5：每个数据集采样 5 个完整 episode（推荐！）
+#   2. --use-all-frames：使用所有帧（数据量大，训练慢，但效果最好）
+#   3. 不加这些参数：随机帧采样（可能破坏时序关系）
 python scripts/train_weight_merge.py \
     --method mergevla \
     --narrower_path "${NARROWER_PATH}" \
@@ -62,14 +77,16 @@ python scripts/train_weight_merge.py \
     --base_model_path "${BASE_MODEL_PATH}" \
     --output_path "${OUTPUT_PATH}" \
     --adapter_type sparse_lora \
-    --lora_rank 16 \
-    --sparsity 0.5 \
-    --adapter_epochs 20 \
+    --lora_rank 32 \
+    --sparsity 0.6 \
+    --adapter_epochs 100 \
     --adapter_lr 1e-3 \
-    --num_samples 10 \
     --batch_size 1 \
     --device "${DEVICE}" \
-    --use_default_datasets
+    --use_default_datasets \
+    --merge_action_head \
+    --episode-based \
+    --num-episodes 120
 
 echo ""
 echo "=========================================="

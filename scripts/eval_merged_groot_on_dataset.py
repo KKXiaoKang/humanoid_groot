@@ -246,7 +246,12 @@ def load_adapter_if_needed(policy: GrootPolicy, model_path: str, merge_config: d
         return None
 
 
-def wrap_policy_with_adapter(policy: GrootPolicy, adapter: DistributionAdapter, task_type: str = None):
+def wrap_policy_with_adapter(
+    policy: GrootPolicy, 
+    adapter: DistributionAdapter, 
+    task_type: str = None,
+    use_smart_routing: bool = False,  # ⭐ 是否使用 MergeVLA 风格的智能任务路由
+):
     """
     包装 GrootPolicy，使其在推理时使用适配层
     
@@ -256,7 +261,10 @@ def wrap_policy_with_adapter(policy: GrootPolicy, adapter: DistributionAdapter, 
         task_type: 任务类型 ("narrower", "wider", None)
                    - "narrower": 使用 task_id=0 的适配器参数
                    - "wider": 使用 task_id=1 的适配器参数
-                   - None: 使用所有任务的平均（可能导致动作混乱！）
+                   - None: 如果 use_smart_routing=True，使用智能任务路由；
+                          否则使用所有任务的平均
+        use_smart_routing: ⭐ 是否使用 MergeVLA 风格的智能任务路由
+                          当 task_type=None 时，根据输入特征自动推断任务类型
     """
     if adapter is None:
         return
@@ -270,8 +278,13 @@ def wrap_policy_with_adapter(policy: GrootPolicy, adapter: DistributionAdapter, 
         print(f"   ⚠️ 使用任务路由: task_type=wider (task_id=1)")
     else:
         fixed_task_id = None
-        print(f"   ⚠️ 未指定任务类型，使用所有任务的平均（可能导致动作混乱！）")
-        print(f"      建议：使用 --task-type narrower 或 --task-type wider 指定任务类型")
+        if use_smart_routing:
+            print(f"   ⭐ 使用 MergeVLA 智能任务路由 (Test-Time Task Routing)")
+            print(f"      根据输入特征自动推断任务相关性，无需手动指定任务类型")
+        else:
+            print(f"   ⚠️ 未指定任务类型，使用所有任务的平均（可能导致动作混乱！）")
+            print(f"      建议：使用 --smart-routing 启用智能任务路由")
+            print(f"      或者：使用 --task-type narrower/wider 指定任务类型")
     
     # 保存原始的 get_action 方法
     original_get_action = policy._groot_model.get_action
@@ -304,8 +317,15 @@ def wrap_policy_with_adapter(policy: GrootPolicy, adapter: DistributionAdapter, 
             if torch.isinf(backbone_features).any():
                 print(f"      ⚠️ Warning: Backbone features contain Inf!")
         
-        # ⚠️ 关键修复：使用固定的 task_id 而不是 None
-        adapted_features = adapter(backbone_features, task_id=fixed_task_id)
+        # ⭐ 关键：使用适配层（支持智能任务路由）
+        # - 如果 fixed_task_id 不为 None，使用固定的任务 ID
+        # - 如果 fixed_task_id 为 None 且 use_smart_routing=True，使用智能任务路由
+        # - 如果 fixed_task_id 为 None 且 use_smart_routing=False，使用简单平均
+        adapted_features = adapter(
+            backbone_features, 
+            task_id=fixed_task_id, 
+            use_smart_routing=use_smart_routing
+        )
         
         # ⚠️ 关键诊断：检查适配层是否过度改变了特征分布
         # 如果适配层改变了特征的统计特性（mean/std），可能导致迭代去噪不稳定
@@ -397,7 +417,8 @@ def wrap_policy_with_adapter(policy: GrootPolicy, adapter: DistributionAdapter, 
     # 替换 get_action 方法
     policy._groot_model.get_action = get_action_with_adapter
     
-    print(f"   ✅ Policy 已包装，适配层将在推理时使用")
+    routing_mode = "智能任务路由" if use_smart_routing else ("固定任务" if fixed_task_id is not None else "简单平均")
+    print(f"   ✅ Policy 已包装，适配层将在推理时使用 (路由模式: {routing_mode})")
 
 
 def eval_on_dataset(
@@ -411,6 +432,7 @@ def eval_on_dataset(
     disable_adapter: bool = False,
     infer_per_frame: int = 1,
     task_type: str = None,
+    use_smart_routing: bool = False,  # ⭐ 是否使用 MergeVLA 智能任务路由
 ):
     """
     在数据集上评估融合模型
@@ -426,8 +448,11 @@ def eval_on_dataset(
         disable_adapter: 是否禁用适配层（用于测试）
         infer_per_frame: 每隔多少帧重新推理一次（>=1，默认1=每帧推理）
         task_type: 任务类型 ("narrower", "wider", None)
-                   ⚠️ 关键：对于 sparse_lora 适配器，必须指定任务类型！
-                   否则会使用所有任务的平均，导致动作混乱。
+                   ⚠️ 关键：对于 sparse_lora 适配器，如果不使用智能路由，
+                   必须指定任务类型！否则会使用所有任务的平均。
+        use_smart_routing: ⭐ 是否使用 MergeVLA 风格的智能任务路由
+                          当任务身份未知时，根据模型内部参数子空间
+                          自动推断任务相关性（参考 MergeVLA 论文 Section 3.3）
     """
     infer_per_frame = max(1, infer_per_frame)  # 至少每帧推理一次
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
@@ -515,7 +540,12 @@ def eval_on_dataset(
     adapter = load_adapter_if_needed(policy, model_path, merge_config)
     if adapter is not None:
         if not disable_adapter:
-            wrap_policy_with_adapter(policy, adapter, task_type=task_type)
+            wrap_policy_with_adapter(
+                policy, 
+                adapter, 
+                task_type=task_type,
+                use_smart_routing=use_smart_routing,  # ⭐ MergeVLA 智能任务路由
+            )
         else:
             print(f"\n⚠️  WARNING: Adapter layer is DISABLED for testing!")
             print(f"   Using raw backbone features (without adapter)")
@@ -634,6 +664,22 @@ def eval_on_dataset(
         # 打印总体结果
         print_results_summary(all_results)
         
+        # ⭐ 打印智能任务路由统计（如果使用了 smart_routing）
+        if use_smart_routing and adapter is not None:
+            routing_stats = adapter.get_routing_stats()
+            if routing_stats:
+                print(f"\n{'='*80}")
+                print(f"⭐ MergeVLA Smart Routing 统计")
+                print(f"{'='*80}")
+                print(f"   总调用次数: {routing_stats.get('total_calls', 0)}")
+                print(f"   倾向 Task 0 (narrower): {routing_stats.get('task_0', 0)} 次 "
+                      f"({routing_stats.get('task_0_ratio', 0)*100:.1f}%)")
+                print(f"   倾向 Task 1 (wider): {routing_stats.get('task_1', 0)} 次 "
+                      f"({routing_stats.get('task_1_ratio', 0)*100:.1f}%)")
+                print(f"   混合路由: {routing_stats.get('mixed', 0)} 次 "
+                      f"({routing_stats.get('mixed_ratio', 0)*100:.1f}%)")
+                print(f"{'='*80}")
+        
     else:
         # 评估单个数据集
         if not lerobot_dataset_path:
@@ -658,6 +704,22 @@ def eval_on_dataset(
         )
         
         print_single_result(result)
+    
+    # ⭐ 打印智能任务路由统计（如果使用了 smart_routing）
+    if use_smart_routing and adapter is not None:
+        routing_stats = adapter.get_routing_stats()
+        if routing_stats:
+            print(f"\n{'='*80}")
+            print(f"⭐ MergeVLA Smart Routing 统计")
+            print(f"{'='*80}")
+            print(f"   总调用次数: {routing_stats.get('total_calls', 0)}")
+            print(f"   倾向 Task 0 (narrower): {routing_stats.get('task_0', 0)} 次 "
+                  f"({routing_stats.get('task_0_ratio', 0)*100:.1f}%)")
+            print(f"   倾向 Task 1 (wider): {routing_stats.get('task_1', 0)} 次 "
+                  f"({routing_stats.get('task_1_ratio', 0)*100:.1f}%)")
+            print(f"   混合路由: {routing_stats.get('mixed', 0)} 次 "
+                  f"({routing_stats.get('mixed_ratio', 0)*100:.1f}%)")
+            print(f"{'='*80}")
     
     # 如果启用了可视化，等待用户退出
     if vizer is not None:
@@ -1085,10 +1147,17 @@ if __name__ == "__main__":
     parser.add_argument('--task-type', type=str, default=None,
                        choices=['narrower', 'wider'],
                        dest='task_type',
-                       help='⚠️ CRITICAL for sparse_lora adapter! Specify task type for routing. '
+                       help='Specify task type for fixed routing. '
                             '"narrower" for narrow box task (task_id=0), '
                             '"wider" for wide box task (task_id=1). '
-                            'If not specified, uses average of all tasks (may cause action confusion!)')
+                            'If not specified, uses --smart-routing or average.')
+    parser.add_argument('--smart-routing', action='store_true',
+                       dest='smart_routing',
+                       help='⭐ Enable MergeVLA-style Test-Time Task Routing. '
+                            'When task identity is unknown, automatically infer task relevance '
+                            'based on model internal parameter subspaces (value projection). '
+                            'This is the recommended mode for mixed-task evaluation! '
+                            '(Reference: MergeVLA paper Section 3.3)')
     
     args = parser.parse_args()
     
@@ -1104,10 +1173,15 @@ if __name__ == "__main__":
     print(f"Action Chunk Size: {args.action_chunk_size}")
     print(f"Visualization: {args.visualize}")
     print(f"Infer Every N Frames: {args.infer_per_frame}")
+    
+    # 打印任务路由模式
     if args.task_type:
-        print(f"⚠️ Task Type: {args.task_type} (使用任务特定的适配器路由)")
+        print(f"🎯 Task Routing: Fixed task_type={args.task_type}")
+    elif args.smart_routing:
+        print(f"⭐ Task Routing: MergeVLA Smart Routing (自动推断任务类型)")
     else:
-        print(f"⚠️ Task Type: None (使用所有任务的平均，可能导致动作混乱！)")
+        print(f"⚠️ Task Routing: Simple Average (可能导致动作混乱！)")
+        print(f"   建议：使用 --smart-routing 或 --task-type narrower/wider")
     print("="*80)
     
     eval_on_dataset(
@@ -1121,4 +1195,5 @@ if __name__ == "__main__":
         disable_adapter=args.disable_adapter,
         infer_per_frame=args.infer_per_frame,
         task_type=args.task_type,
+        use_smart_routing=args.smart_routing,  # ⭐ MergeVLA 智能任务路由
     )

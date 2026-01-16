@@ -84,6 +84,9 @@ def create_calibration_dataloader(
     batch_size: int = 1,
     num_samples: int = 10,
     use_default_datasets: bool = True,
+    use_all_frames: bool = False,
+    episode_based: bool = False,
+    num_episodes: int = None,
 ):
     """
     创建校准数据加载器
@@ -91,6 +94,11 @@ def create_calibration_dataloader(
     对于 Expert Merging，只需要少量无标签样本（5-10个）
     
     ⭐ 重要：校准数据应该混合来自两个任务的样本！
+    
+    ⭐ 新增：Episode-based 采样模式
+    - use_all_frames=True: 使用所有帧（保持 episode 内时序连续性）
+    - episode_based=True: 按 episode 组织数据
+    - num_episodes: 每个数据集采样的 episode 数量（None 表示全部）
     
     数据来源选项：
     1. 指定 data_paths：使用指定的数据集
@@ -100,8 +108,11 @@ def create_calibration_dataloader(
     Args:
         data_paths: 数据路径列表（可以是 LeRobot 数据集路径）
         batch_size: 批次大小
-        num_samples: 每个数据集采样数量
+        num_samples: 每个数据集采样数量（仅在 use_all_frames=False 时有效）
         use_default_datasets: 是否使用默认数据集
+        use_all_frames: 是否使用所有帧（而不是随机采样）
+        episode_based: 是否按 episode 组织数据（保持时序连续性）
+        num_episodes: 每个数据集采样的 episode 数量（None=全部，仅在 episode_based=True 时有效）
     
     Returns:
         DataLoader 或 生成器
@@ -131,7 +142,14 @@ def create_calibration_dataloader(
         return create_synthetic_dataloader(batch_size, num_samples)
     
     # 使用 LeRobot 数据集
-    return create_lerobot_dataloader(paths_to_use, batch_size, num_samples)
+    return create_lerobot_dataloader(
+        paths_to_use, 
+        batch_size, 
+        num_samples,
+        use_all_frames=use_all_frames,
+        episode_based=episode_based,
+        num_episodes=num_episodes,
+    )
 
 
 class TaskLabeledDataset:
@@ -156,15 +174,146 @@ class TaskLabeledDataset:
         return item
 
 
+class EpisodeSequentialDataset:
+    """
+    Episode 顺序数据集包装器
+    
+    ⭐ 关键改进：保持 episode 内帧的时序连续性
+    
+    不是随机采样帧，而是按 episode 组织数据：
+    - 每个 episode 内的帧按顺序排列
+    - 训练时按顺序遍历，保持时空关系
+    
+    ⚠️ 兼容 LeRobotDataset v3.0：使用 meta.episodes 而不是 episode_data_index
+    """
+    def __init__(self, dataset, task_source: int, episode_indices: list = None):
+        """
+        Args:
+            dataset: LeRobotDataset 实例
+            task_source: 任务来源 (0=narrower, 1=wider)
+            episode_indices: 要使用的 episode 索引列表（None 表示全部）
+        """
+        self.dataset = dataset
+        self.task_source = task_source
+        
+        # ⚠️ LeRobotDataset v3.0 兼容性：
+        # v3.0 使用 meta.episodes["dataset_from_index"] 和 meta.episodes["dataset_to_index"]
+        # 而不是 episode_data_index['from'] 和 episode_data_index['to']
+        
+        if hasattr(dataset, 'meta') and hasattr(dataset.meta, 'episodes') and dataset.meta.episodes is not None:
+            # 打印
+            print(" ==== 当前使用LeRobotDataset v3.0 格式 ==== ")
+            # LeRobotDataset v3.0 格式
+            self.num_episodes = dataset.meta.total_episodes
+            
+            # 获取所有 episode 的边界索引
+            # meta.episodes 可以按列访问（返回所有 episodes 的值）
+            from_indices = dataset.meta.episodes["dataset_from_index"]
+            to_indices = dataset.meta.episodes["dataset_to_index"]
+            
+            # 转换为列表格式以便统一处理
+            if hasattr(from_indices, 'tolist'):
+                from_indices = from_indices.tolist()
+            elif hasattr(from_indices, '__iter__') and not isinstance(from_indices, str):
+                from_indices = list(from_indices)
+            else:
+                from_indices = [from_indices]
+            
+            if hasattr(to_indices, 'tolist'):
+                to_indices = to_indices.tolist()
+            elif hasattr(to_indices, '__iter__') and not isinstance(to_indices, str):
+                to_indices = list(to_indices)
+            else:
+                to_indices = [to_indices]
+            
+            self.episode_from_indices = from_indices
+            self.episode_to_indices = to_indices
+            
+            logger.info(f"   LeRobotDataset v3.0 detected: {self.num_episodes} episodes")
+        elif hasattr(dataset, 'episode_data_index'):
+            # 旧版 LeRobotDataset v2.x 格式（向后兼容）
+            self.num_episodes = len(dataset.episode_data_index['from'])
+            self.episode_from_indices = dataset.episode_data_index['from'].tolist()
+            self.episode_to_indices = dataset.episode_data_index['to'].tolist()
+            logger.info(f"   LeRobotDataset v2.x detected: {self.num_episodes} episodes")
+        else:
+            # 兼容其他格式：假设整个数据集是一个 episode
+            self.num_episodes = 1
+            self.episode_from_indices = [0]
+            self.episode_to_indices = [dataset.num_frames]
+            logger.warning(f"   Unknown dataset format, treating as single episode with {dataset.num_frames} frames")
+        
+        # 选择要使用的 episode
+        if episode_indices is not None:
+            self.selected_episodes = episode_indices
+        else:
+            self.selected_episodes = list(range(self.num_episodes))
+        
+        # 构建帧索引列表（按 episode 顺序）
+        self.frame_indices = []
+        self.frame_to_episode = []  # 记录每个帧属于哪个 episode
+        
+        for ep_idx in self.selected_episodes:
+            # 使用新的索引格式
+            start_idx = self.episode_from_indices[ep_idx]
+            end_idx = self.episode_to_indices[ep_idx]
+            
+            # 处理可能的 tensor 或其他类型
+            if hasattr(start_idx, 'item'):
+                start_idx = start_idx.item()
+            if hasattr(end_idx, 'item'):
+                end_idx = end_idx.item()
+            
+            for frame_idx in range(int(start_idx), int(end_idx)):
+                self.frame_indices.append(frame_idx)
+                self.frame_to_episode.append(ep_idx)
+        
+        self.length = len(self.frame_indices)
+        logger.info(f"   Selected {len(self.selected_episodes)} episodes, {self.length} total frames")
+    
+    def __len__(self):
+        return self.length
+    
+    def __getitem__(self, idx):
+        # 获取实际的帧索引
+        frame_idx = self.frame_indices[idx]
+        episode_idx = self.frame_to_episode[idx]
+        
+        item = self.dataset[frame_idx]
+        
+        # 添加任务来源标签和 episode 信息
+        if isinstance(item, dict):
+            item = dict(item)
+            item['task_source'] = self.task_source
+            item['episode_idx'] = episode_idx
+            
+            # 计算当前帧在 episode 内的位置
+            # 使用 episode 的起始索引来计算
+            ep_start = self.episode_from_indices[episode_idx]
+            if hasattr(ep_start, 'item'):
+                ep_start = ep_start.item()
+            item['frame_in_episode'] = frame_idx - int(ep_start)
+        
+        return item
+
+
 def create_lerobot_dataloader(
     data_paths: list[str],
     batch_size: int = 1,
     num_samples: int = 10,
+    use_all_frames: bool = False,
+    episode_based: bool = False,
+    num_episodes: int = None,
 ):
     """
     从 LeRobot 数据集创建校准数据加载器
     
     ⚠️ 关键：为每个样本添加 task_source 标签，用于区分来自哪个专家任务
+    
+    ⭐ 新增：Episode-based 采样模式（保持时序连续性）
+    - use_all_frames=True: 使用所有帧
+    - episode_based=True: 按 episode 组织数据，保持时序顺序
+    - num_episodes: 每个数据集采样的 episode 数量
     
     参考 eval_on_dataset_lowpass.py 中的正确加载方式
     
@@ -177,7 +326,10 @@ def create_lerobot_dataloader(
     Args:
         data_paths: LeRobot 数据集路径列表
         batch_size: 批次大小
-        num_samples: 每个数据集采样数量
+        num_samples: 每个数据集采样数量（仅在 use_all_frames=False 且 episode_based=False 时有效）
+        use_all_frames: 是否使用所有帧
+        episode_based: 是否按 episode 组织数据
+        num_episodes: 每个数据集采样的 episode 数量（None=全部）
     
     Returns:
         DataLoader
@@ -188,7 +340,19 @@ def create_lerobot_dataloader(
     
     datasets = []
     total_samples = 0
+    total_episodes = 0
     first_sample_logged = False
+    
+    # 打印采样模式
+    if use_all_frames:
+        logger.info(f"\n⭐ 使用所有帧模式 (use_all_frames=True)")
+    elif episode_based:
+        logger.info(f"\n⭐ Episode-based 采样模式 (episode_based=True)")
+        logger.info(f"   每个数据集采样 {num_episodes if num_episodes else '全部'} 个 episode")
+        logger.info(f"   ✅ 保持 episode 内帧的时序连续性")
+    else:
+        logger.info(f"\n⚠️ 随机帧采样模式 (可能破坏时序关系)")
+        logger.info(f"   每个数据集采样 {num_samples} 帧")
     
     for data_path in data_paths:
         try:
@@ -196,7 +360,7 @@ def create_lerobot_dataloader(
             # repo_id 使用数据集路径的最后一部分作为标识符
             dataset_name = Path(data_path).name
             
-            logger.info(f"📂 Loading dataset from {data_path}")
+            logger.info(f"\n📂 Loading dataset from {data_path}")
             logger.info(f"   repo_id: {dataset_name}")
             
             # ⚠️ 关键：根据路径判断任务来源
@@ -217,9 +381,21 @@ def create_lerobot_dataloader(
             # 使用正确的参数加载 LeRobotDataset
             dataset = LeRobotDataset(repo_id=dataset_name, root=data_path)
             
-            # 获取数据集总帧数
+            # 获取数据集总帧数和 episode 数
             total_frames = dataset.num_frames
-            logger.info(f"   Total frames in dataset: {total_frames}")
+            
+            # ⚠️ LeRobotDataset v3.0 兼容性：使用 meta.total_episodes
+            if hasattr(dataset, 'meta') and hasattr(dataset.meta, 'total_episodes'):
+                # v3.0 格式
+                dataset_num_episodes = dataset.meta.total_episodes
+            elif hasattr(dataset, 'episode_data_index'):
+                # v2.x 格式（向后兼容）
+                dataset_num_episodes = len(dataset.episode_data_index['from'])
+            else:
+                dataset_num_episodes = 1
+            
+            logger.info(f"   Total frames: {total_frames}")
+            logger.info(f"   Total episodes: {dataset_num_episodes}")
             
             # 🔍 诊断：检查数据集的第一个样本
             if not first_sample_logged and total_frames > 0:
@@ -241,17 +417,47 @@ def create_lerobot_dataloader(
                 first_sample_logged = True
                 print()  # 空行
             
-            # 随机采样
-            sample_count = min(num_samples, total_frames)
-            indices = np.random.choice(total_frames, sample_count, replace=False)
-            subset = Subset(dataset, indices.tolist())
-            
-            # ⚠️ 关键：包装数据集以添加任务标签
-            labeled_subset = TaskLabeledDataset(subset, task_source)
-            datasets.append(labeled_subset)
-            total_samples += sample_count
-            
-            logger.info(f"✅ Loaded {sample_count} samples from {data_path} (task={task_label})")
+            # ⭐ 根据采样模式选择数据
+            if use_all_frames or episode_based:
+                # Episode-based 模式：使用所有帧或按 episode 采样
+                if episode_based and num_episodes is not None:
+                    # 随机选择指定数量的 episode
+                    selected_eps = list(range(dataset_num_episodes))
+                    if num_episodes < dataset_num_episodes:
+                        selected_eps = np.random.choice(
+                            dataset_num_episodes, 
+                            min(num_episodes, dataset_num_episodes), 
+                            replace=False
+                        ).tolist()
+                else:
+                    # 使用所有 episode
+                    selected_eps = None
+                
+                # 创建 Episode 顺序数据集
+                labeled_dataset = EpisodeSequentialDataset(
+                    dataset, 
+                    task_source, 
+                    episode_indices=selected_eps
+                )
+                datasets.append(labeled_dataset)
+                total_samples += len(labeled_dataset)
+                total_episodes += len(selected_eps) if selected_eps else dataset_num_episodes
+                
+                logger.info(f"✅ Loaded {len(labeled_dataset)} frames from "
+                           f"{len(selected_eps) if selected_eps else dataset_num_episodes} episodes "
+                           f"(task={task_label})")
+            else:
+                # 原始的随机帧采样模式
+                sample_count = min(num_samples, total_frames)
+                indices = np.random.choice(total_frames, sample_count, replace=False)
+                subset = Subset(dataset, indices.tolist())
+                
+                # ⚠️ 关键：包装数据集以添加任务标签
+                labeled_subset = TaskLabeledDataset(subset, task_source)
+                datasets.append(labeled_subset)
+                total_samples += sample_count
+                
+                logger.info(f"✅ Loaded {sample_count} samples from {data_path} (task={task_label})")
             
         except Exception as e:
             logger.warning(f"❌ Failed to load dataset {data_path}: {e}")
@@ -275,7 +481,11 @@ def create_lerobot_dataloader(
         logger.warning("No datasets loaded, using synthetic data")
         return create_synthetic_dataloader(batch_size, num_samples)
     
-    logger.info(f"📊 Total calibration samples: {total_samples}")
+    logger.info(f"\n📊 数据加载统计:")
+    logger.info(f"   总帧数: {total_samples}")
+    if episode_based or use_all_frames:
+        logger.info(f"   总 episode 数: {total_episodes}")
+        logger.info(f"   ✅ 时序连续性已保持")
     
     combined_dataset = ConcatDataset(datasets)
     
@@ -289,6 +499,7 @@ def create_lerobot_dataloader(
         - action: 动作
         - task: 任务描述
         - task_source: 任务来源 (0=narrower, 1=wider) ⚠️ 新增
+        - episode_idx: episode 索引（episode_based 模式）
         等字段
         """
         result = {}
@@ -308,10 +519,16 @@ def create_lerobot_dataloader(
                 result[key] = values
         return result
     
+    # ⚠️ 关键：Episode-based 模式下不 shuffle，保持时序顺序
+    should_shuffle = not (use_all_frames or episode_based)
+    
+    if not should_shuffle:
+        logger.info(f"   ⚠️ 禁用 shuffle 以保持时序顺序")
+    
     return DataLoader(
         combined_dataset, 
         batch_size=batch_size, 
-        shuffle=True,
+        shuffle=should_shuffle,  # Episode-based 模式下不 shuffle
         collate_fn=collate_fn,
         num_workers=0,  # 避免多进程问题
         pin_memory=torch.cuda.is_available(),
@@ -530,11 +747,19 @@ def run_expert_merge(args):
     # 优先使用用户指定的数据路径，否则使用默认数据集
     data_paths = args.data_path.split(",") if args.data_path else None
     
+    # ⭐ 使用 Episode-based 采样模式（保持时序连续性）
+    use_all_frames = getattr(args, 'use_all_frames', False)
+    episode_based = getattr(args, 'episode_based', False)
+    num_episodes = getattr(args, 'num_episodes', None)
+    
     dataloader = create_calibration_dataloader(
         data_paths=data_paths,
         batch_size=args.batch_size,
         num_samples=args.num_samples,
         use_default_datasets=args.use_default_datasets,
+        use_all_frames=use_all_frames,
+        episode_based=episode_based,
+        num_episodes=num_episodes,
     )
     
     # 训练
@@ -864,11 +1089,26 @@ def run_mergevla_merge(args):
     # 创建数据加载器
     data_paths = args.data_path.split(",") if args.data_path else None
     
+    # ⭐ 使用 Episode-based 采样模式（保持时序连续性）
+    use_all_frames = getattr(args, 'use_all_frames', False)
+    episode_based = getattr(args, 'episode_based', False)
+    num_episodes = getattr(args, 'num_episodes', None)
+    
+    if use_all_frames or episode_based:
+        print(f"\n⭐ 使用 Episode-based 采样模式")
+        print(f"   use_all_frames={use_all_frames}")
+        print(f"   episode_based={episode_based}")
+        print(f"   num_episodes={num_episodes}")
+        print(f"   ✅ 保持 episode 内帧的时序连续性，让适配层学习完整的动作轨迹")
+    
     dataloader = create_calibration_dataloader(
         data_paths=data_paths,
         batch_size=args.batch_size,
         num_samples=args.num_samples,
         use_default_datasets=args.use_default_datasets,
+        use_all_frames=use_all_frames,
+        episode_based=episode_based,
+        num_episodes=num_episodes,
     )
     
     # 训练适配层
@@ -924,11 +1164,19 @@ def run_two_stage_merge(args):
     # 创建数据加载器
     data_paths = args.data_path.split(",") if args.data_path else None
     
+    # ⭐ 使用 Episode-based 采样模式（保持时序连续性）
+    use_all_frames = getattr(args, 'use_all_frames', False)
+    episode_based = getattr(args, 'episode_based', False)
+    num_episodes = getattr(args, 'num_episodes', None)
+    
     dataloader = create_calibration_dataloader(
         data_paths=data_paths,
         batch_size=args.batch_size,
         num_samples=args.num_samples,
         use_default_datasets=args.use_default_datasets,
+        use_all_frames=use_all_frames,
+        episode_based=episode_based,
+        num_episodes=num_episodes,
     )
     
     # 阶段 2: 训练适配层
@@ -991,7 +1239,15 @@ def main():
     parser.add_argument("--batch_size", type=int, default=1,
                        help="Batch size for training")
     parser.add_argument("--num_samples", type=int, default=10,
-                       help="Number of calibration samples per dataset (5-10 recommended)")
+                       help="Number of calibration samples per dataset (5-10 recommended, only used when --use-all-frames is False)")
+    
+    # ⭐ 新增：Episode-based 采样模式（保持时序连续性）
+    parser.add_argument("--use-all-frames", action="store_true", default=False,
+                       help="Use all frames from datasets instead of random sampling")
+    parser.add_argument("--episode-based", action="store_true", default=False,
+                       help="Organize data by episodes to preserve temporal continuity (recommended for adapter training)")
+    parser.add_argument("--num-episodes", type=int, default=None,
+                       help="Number of episodes to sample per dataset (None=all, only used with --episode-based)")
     parser.add_argument("--regularization_weight", type=float, default=0.8,
                        help="Regularization weight (γ), controls coefficient drift")
     parser.add_argument("--initial_coefficient", type=float, default=0.5,

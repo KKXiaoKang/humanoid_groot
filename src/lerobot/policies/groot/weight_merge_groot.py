@@ -1228,6 +1228,10 @@ class SparseLoRAAdapter(nn.Module):
     这样可以减少不同任务之间的冲突
     
     参考 MergeVLA 论文：Sparsely activated LoRA adapters via task masks
+    
+    ⭐ MergeVLA 测试时任务路由（Test-Time Task Routing）：
+    当任务身份未知时，根据模型内部参数子空间（value projection）
+    直接推断任务相关性，无需训练。
     """
     
     def __init__(
@@ -1238,6 +1242,7 @@ class SparseLoRAAdapter(nn.Module):
         num_tasks: int = 2,  # 任务数量（narrower, wider）
         sparsity: float = 0.5,  # 稀疏度：每个任务激活的参数比例
         dropout: float = 0.0,
+        routing_temperature: float = 0.1,  # 路由分数的温度参数
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -1245,6 +1250,7 @@ class SparseLoRAAdapter(nn.Module):
         self.alpha = alpha
         self.num_tasks = num_tasks
         self.sparsity = sparsity
+        self.routing_temperature = routing_temperature
         
         # 为每个任务创建独立的 LoRA 参数
         # A: (num_tasks, hidden_size, rank)
@@ -1274,18 +1280,85 @@ class SparseLoRAAdapter(nn.Module):
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
         self.residual_scale = nn.Parameter(torch.ones(1))
         
+        # ⭐ 用于测试时任务路由的诊断计数器
+        self._routing_call_count = 0
+        self._routing_stats = {'task_0': 0, 'task_1': 0, 'mixed': 0}
+        
         print(f"   Sparse LoRA Adapter (MergeVLA style):")
         print(f"      rank={rank}, alpha={alpha}, num_tasks={num_tasks}")
         print(f"      sparsity={sparsity}, params={self._count_params():,}")
+        print(f"      ⭐ Test-Time Task Routing enabled (temperature={routing_temperature})")
     
     def _count_params(self):
         return self.lora_A.numel() + self.lora_B.numel() + self.task_masks.numel() + 1
     
-    def forward(self, x: torch.Tensor, task_id: torch.Tensor = None) -> torch.Tensor:
+    def compute_task_routing_scores(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        ⭐ MergeVLA 测试时任务路由（Test-Time Task Routing）
+        
+        当任务身份未知时，根据输入特征与各任务 LoRA 参数子空间的相似度
+        来推断任务相关性。
+        
+        核心思想（参考 MergeVLA 论文 Section 3.3）：
+        - 使用 LoRA A 参数作为各任务的"任务表示"（value projection 的代理）
+        - 将输入投影到各任务的 LoRA 子空间
+        - 投影后的范数越大，表示输入与该任务越相关
+        
+        Args:
+            x: (B, T, hidden_size) 输入特征
+        
+        Returns:
+            (B, num_tasks) 任务路由权重（softmax 归一化后的概率分布）
+        """
+        B, T, H = x.shape
+        
+        # 使用 LoRA A 参数作为任务表示
+        # lora_A: (num_tasks, hidden_size, rank)
+        lora_A = self.lora_A.to(dtype=x.dtype)
+        task_masks = torch.sigmoid(self.task_masks).to(dtype=x.dtype)  # (num_tasks, hidden_size)
+        
+        # 计算各任务的"任务表示"：使用掩码后的 LoRA A
+        # masked_A[t]: (hidden_size, rank) - 第 t 个任务的特征投影矩阵
+        
+        scores = []
+        for t in range(self.num_tasks):
+            # 应用任务掩码
+            A_t = lora_A[t] * task_masks[t].unsqueeze(-1)  # (hidden_size, rank)
+            
+            # 将输入投影到任务子空间
+            # x: (B, T, hidden_size), A_t: (hidden_size, rank)
+            # projection: (B, T, rank)
+            projection = x @ A_t
+            
+            # 计算投影的范数作为相似度分数
+            # 范数越大，表示输入在该任务子空间的投影越强，即越相关
+            # 使用 L2 范数，对时间维度取平均
+            score = projection.norm(dim=-1).mean(dim=-1)  # (B,)
+            scores.append(score)
+        
+        # 堆叠并归一化为概率分布
+        scores = torch.stack(scores, dim=-1)  # (B, num_tasks)
+        
+        # 使用 softmax 归一化，temperature 控制分布的锐度
+        # temperature 越小，分布越尖锐（更倾向于选择单一任务）
+        # temperature 越大，分布越平坦（更倾向于混合）
+        routing_weights = F.softmax(scores / self.routing_temperature, dim=-1)
+        
+        return routing_weights
+    
+    def forward(
+        self, 
+        x: torch.Tensor, 
+        task_id: torch.Tensor = None,
+        use_smart_routing: bool = True,  # ⭐ 是否使用智能任务路由
+    ) -> torch.Tensor:
         """
         Args:
             x: (B, T, hidden_size)
-            task_id: (B,) - 任务ID，0=narrower, 1=wider。如果为 None，使用所有任务的平均
+            task_id: (B,) - 任务ID，0=narrower, 1=wider。
+                     如果为 None 且 use_smart_routing=True，使用智能任务路由
+                     如果为 None 且 use_smart_routing=False，使用简单平均
+            use_smart_routing: 当 task_id=None 时，是否使用 MergeVLA 风格的智能任务路由
         """
         lora_A = self.lora_A.to(dtype=x.dtype)
         lora_B = self.lora_B.to(dtype=x.dtype)
@@ -1312,9 +1385,56 @@ class SparseLoRAAdapter(nn.Module):
             # LoRA 变换: x @ A @ B
             # x: (B, T, H), A_masked: (B, H, rank), B_selected: (B, rank, H)
             lora_output = torch.bmm(torch.bmm(self.dropout(x), A_masked), B_selected)  # (B, T, H)
+        
+        elif use_smart_routing:
+            # ⭐ MergeVLA 风格：测试时智能任务路由
+            # 根据输入特征推断任务相关性，动态加权各任务输出
+            
+            # 计算任务路由权重
+            routing_weights = self.compute_task_routing_scores(x)  # (B, num_tasks)
+            
+            # 诊断：记录路由统计
+            self._routing_call_count += 1
+            with torch.no_grad():
+                avg_weights = routing_weights.mean(dim=0)  # (num_tasks,)
+                dominant_task = avg_weights.argmax().item()
+                weight_diff = abs(avg_weights[0] - avg_weights[1]).item()
+                
+                if weight_diff > 0.3:  # 明显偏向某个任务
+                    if dominant_task == 0:
+                        self._routing_stats['task_0'] += 1
+                    else:
+                        self._routing_stats['task_1'] += 1
+                else:
+                    self._routing_stats['mixed'] += 1
+                
+                # 前几次调用打印诊断信息
+                if self._routing_call_count <= 5:
+                    print(f"\n   🎯 Smart Task Routing (call #{self._routing_call_count}):")
+                    print(f"      Routing weights: task_0={avg_weights[0].item():.4f}, "
+                          f"task_1={avg_weights[1].item():.4f}")
+                    if dominant_task == 0:
+                        print(f"      → Leaning towards task 0 (narrower)")
+                    else:
+                        print(f"      → Leaning towards task 1 (wider)")
+            
+            # 计算各任务的输出
+            outputs = []
+            for t in range(self.num_tasks):
+                A_t = lora_A[t] * task_masks[t].unsqueeze(-1)  # (H, rank)
+                B_t = lora_B[t]  # (rank, H)
+                output_t = self.dropout(x) @ A_t @ B_t  # (B, T, H)
+                outputs.append(output_t)
+            
+            outputs = torch.stack(outputs, dim=0)  # (num_tasks, B, T, H)
+            
+            # 使用路由权重加权各任务的输出
+            # routing_weights: (B, num_tasks) -> (num_tasks, B, 1, 1) for broadcasting
+            weights = routing_weights.permute(1, 0).unsqueeze(-1).unsqueeze(-1)  # (num_tasks, B, 1, 1)
+            lora_output = (outputs * weights).sum(dim=0)  # (B, T, H)
+        
         else:
-            # 使用所有任务的平均（测试时任务未知）
-            # 对所有任务的输出进行加权平均
+            # 简单平均（旧方法，不推荐）
             outputs = []
             for t in range(self.num_tasks):
                 A_t = lora_A[t] * task_masks[t].unsqueeze(-1)  # (H, rank)
@@ -1327,6 +1447,25 @@ class SparseLoRAAdapter(nn.Module):
         
         # 缩放并添加到输入
         return x + residual_scale * (self.alpha / self.rank) * lora_output
+    
+    def get_routing_stats(self) -> dict:
+        """获取任务路由统计信息"""
+        total = sum(self._routing_stats.values())
+        if total == 0:
+            return self._routing_stats
+        
+        return {
+            'task_0_ratio': self._routing_stats['task_0'] / total,
+            'task_1_ratio': self._routing_stats['task_1'] / total,
+            'mixed_ratio': self._routing_stats['mixed'] / total,
+            'total_calls': total,
+            **self._routing_stats,
+        }
+    
+    def reset_routing_stats(self):
+        """重置路由统计"""
+        self._routing_call_count = 0
+        self._routing_stats = {'task_0': 0, 'task_1': 0, 'mixed': 0}
 
 
 class LoRAAdapter(nn.Module):
@@ -1472,17 +1611,25 @@ class DistributionAdapter(nn.Module):
         else:
             self.residual_scale = None
         
-    def forward(self, x: torch.Tensor, task_id: torch.Tensor = None) -> torch.Tensor:
+    def forward(
+        self, 
+        x: torch.Tensor, 
+        task_id: torch.Tensor = None,
+        use_smart_routing: bool = True,  # ⭐ 是否使用智能任务路由
+    ) -> torch.Tensor:
         """
         Args:
             x: backbone 输出 [B, T, hidden_size]
             task_id: (B,) - 任务ID，0=narrower, 1=wider（仅用于 sparse_lora）
+                     如果为 None 且 use_smart_routing=True，使用智能任务路由
+            use_smart_routing: 当 task_id=None 时，是否使用 MergeVLA 风格的智能任务路由
         Returns:
             适配后的特征 [B, T, hidden_size]
         """
         if self.adapter_type == "sparse_lora":
-            # MergeVLA 风格：稀疏激活的 LoRA（需要 task_id）
-            return self.adapter(x, task_id=task_id)
+            # MergeVLA 风格：稀疏激活的 LoRA
+            # 支持智能任务路由（当 task_id=None 时）
+            return self.adapter(x, task_id=task_id, use_smart_routing=use_smart_routing)
         elif self.adapter_type == "lora":
             # LoRA 适配层（内置残差连接）
             return self.adapter(x)
@@ -1493,6 +1640,17 @@ class DistributionAdapter(nn.Module):
             return x + self.residual_scale * self.adapter(x)
         else:
             return self.adapter(x)
+    
+    def get_routing_stats(self) -> dict | None:
+        """获取任务路由统计信息（仅 sparse_lora 适配器支持）"""
+        if self.adapter_type == "sparse_lora" and hasattr(self.adapter, 'get_routing_stats'):
+            return self.adapter.get_routing_stats()
+        return None
+    
+    def reset_routing_stats(self):
+        """重置路由统计（仅 sparse_lora 适配器支持）"""
+        if self.adapter_type == "sparse_lora" and hasattr(self.adapter, 'reset_routing_stats'):
+            self.adapter.reset_routing_stats()
 
 
 class MergedModelWithAdapter(nn.Module):

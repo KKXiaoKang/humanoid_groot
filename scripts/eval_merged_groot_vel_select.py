@@ -724,16 +724,56 @@ def load_adapter(policy, model_path: str, merge_config: dict, device: str = "cud
     return adapter
 
 
-def wrap_policy_with_adapter(policy, adapter):
-    """包装 GrootPolicy，使其在推理时使用适配层"""
+def wrap_policy_with_adapter(
+    policy, 
+    adapter,
+    task_type: str = None,
+    use_smart_routing: bool = False,
+):
+    """
+    包装 GrootPolicy，使其在推理时使用适配层
+    
+    Args:
+        policy: GrootPolicy 实例
+        adapter: DistributionAdapter 实例
+        task_type: 任务类型 ("narrower", "wider", None)
+                   - "narrower": 使用 task_id=0 的适配器参数
+                   - "wider": 使用 task_id=1 的适配器参数
+                   - None: 如果 use_smart_routing=True，使用智能任务路由；
+                          否则使用所有任务的平均
+        use_smart_routing: ⭐ 是否使用 MergeVLA 风格的智能任务路由
+                          当 task_type=None 时，根据输入特征自动推断任务类型
+    """
+    import torch
+    
+    # ⚠️ 关键：根据任务类型设置 task_id
+    if task_type == "narrower":
+        fixed_task_id = torch.tensor([0], device=next(adapter.parameters()).device)
+        mergevla_logger.info(f"   ⚠️ 使用任务路由: task_type=narrower (task_id=0)")
+    elif task_type == "wider":
+        fixed_task_id = torch.tensor([1], device=next(adapter.parameters()).device)
+        mergevla_logger.info(f"   ⚠️ 使用任务路由: task_type=wider (task_id=1)")
+    else:
+        fixed_task_id = None
+        if use_smart_routing:
+            mergevla_logger.info(f"   ⭐ 使用 MergeVLA 智能任务路由 (Test-Time Task Routing)")
+            mergevla_logger.info(f"      根据输入特征自动推断任务相关性，无需手动指定任务类型")
+        else:
+            mergevla_logger.warning(f"   ⚠️ 未指定任务类型，使用所有任务的平均（可能导致动作混乱！）")
+            mergevla_logger.warning(f"      建议：使用 --smart-routing 启用智能任务路由")
+            mergevla_logger.warning(f"      或者：使用 --task-type narrower/wider 指定任务类型")
     
     def get_action_with_adapter(inputs: dict, **kwargs):
         backbone_inputs, action_inputs = policy._groot_model.prepare_input(inputs)
         backbone_outputs = policy._groot_model.backbone(backbone_inputs)
         
-        # 通过适配层
+        # 通过适配层（支持智能任务路由）
         backbone_features = backbone_outputs[BACKBONE_FEATURE_KEY]
-        adapted_features = adapter(backbone_features, task_id=None)
+        adapted_features = adapter(
+            backbone_features, 
+            task_id=fixed_task_id,
+            use_smart_routing=use_smart_routing
+        )
         backbone_outputs[BACKBONE_FEATURE_KEY] = adapted_features
         
         # 通过 action_head
@@ -743,10 +783,11 @@ def wrap_policy_with_adapter(policy, adapter):
         )
     
     policy._groot_model.get_action = get_action_with_adapter
-    mergevla_logger.info(f"   ✅ Policy 已包装适配层")
+    routing_mode = "智能任务路由" if use_smart_routing else ("固定任务" if fixed_task_id is not None else "简单平均")
+    mergevla_logger.info(f"   ✅ Policy 已包装适配层 (路由模式: {routing_mode})")
 
 
-def load_model_and_env(ckpt_path, model_type, action_chunk_size=50, enable_gui=False, rotate_head_camera=False, state_zero=False, task_description=None, claw_lock_threshold=50.0, claw_lock_count_threshold=5, claw_locked_value=90.0, disable_adapter=False):
+def load_model_and_env(ckpt_path, model_type, action_chunk_size=50, enable_gui=False, rotate_head_camera=False, state_zero=False, task_description=None, claw_lock_threshold=50.0, claw_lock_count_threshold=5, claw_locked_value=90.0, disable_adapter=False, task_type=None, use_smart_routing=False):
     """
     加载模型和环境（只执行一次，避免重复加载）
     
@@ -761,6 +802,12 @@ def load_model_and_env(ckpt_path, model_type, action_chunk_size=50, enable_gui=F
         state_zero: 是否将状态置零
         task_description: 任务描述字符串，如果为None则使用默认值
         disable_adapter: 是否禁用 MergeVLA 适配层（调试用）
+        task_type: 任务类型 ("narrower", "wider", None)
+                   ⚠️ 关键：对于 sparse_lora 适配器，如果不使用智能路由，
+                   必须指定任务类型！否则会使用所有任务的平均。
+        use_smart_routing: ⭐ 是否使用 MergeVLA 风格的智能任务路由
+                          当任务身份未知时，根据模型内部参数子空间
+                          自动推断任务相关性（参考 MergeVLA 论文 Section 3.3）
     
     Returns:
         tuple: (policy, preprocessor, postprocessor, env, task_description, device, adapter)
@@ -846,7 +893,12 @@ def load_model_and_env(ckpt_path, model_type, action_chunk_size=50, enable_gui=F
         else:
             try:
                 adapter = load_adapter(policy, ckpt_path, merge_config, device)
-                wrap_policy_with_adapter(policy, adapter)
+                wrap_policy_with_adapter(
+                    policy, 
+                    adapter,
+                    task_type=task_type,
+                    use_smart_routing=use_smart_routing,
+                )
                 print("=" * 60)
             except Exception as e:
                 print(f"   ❌ 适配层加载失败: {e}")
@@ -1986,7 +2038,7 @@ def final_reset_arm(json_path, env, control_arm=True, control_claw=True):
     rospy.loginfo("Arm reset completed!")
 
 
-def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chunk_size=50, enable_gui=False, rotate_head_camera=False, state_zero=False, task_description=None, chunk_start=None, chunk_end=None, model_action_dt=None, sync_mode=False, max_joint_velocity=None, constant_velocity=False, action_stride=1, claw_lock_threshold=50.0, claw_lock_count_threshold=5, claw_locked_value=90.0, disable_adapter=False):
+def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chunk_size=50, enable_gui=False, rotate_head_camera=False, state_zero=False, task_description=None, chunk_start=None, chunk_end=None, model_action_dt=None, sync_mode=False, max_joint_velocity=None, constant_velocity=False, action_stride=1, claw_lock_threshold=50.0, claw_lock_count_threshold=5, claw_locked_value=90.0, disable_adapter=False, task_type=None, use_smart_routing=False):
     """
     在这里和实机/仿真交互，做网络推理（depalletize任务）
     支持多次推理：按'q'退出当前推理，可以快速重新开始下一次推理而无需重新加载模型
@@ -2014,6 +2066,12 @@ def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chun
                        设置为1表示不跳过任何action（正常速度）。设置为N表示执行速度约为原来的N倍。
                        注意：这不会改变速度限制，只是减少执行的action数量。建议值：1-5。
         disable_adapter: 是否禁用 MergeVLA 适配层（调试用）
+        task_type: 任务类型 ("narrower", "wider", None)
+                   ⚠️ 关键：对于 sparse_lora 适配器，如果不使用智能路由，
+                   必须指定任务类型！否则会使用所有任务的平均。
+        use_smart_routing: ⭐ 是否使用 MergeVLA 风格的智能任务路由
+                          当任务身份未知时，根据模型内部参数子空间
+                          自动推断任务相关性（参考 MergeVLA 论文 Section 3.3）
     """
     
     # 加载模型和环境（只执行一次）
@@ -2028,7 +2086,9 @@ def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chun
         claw_lock_threshold=claw_lock_threshold,
         claw_lock_count_threshold=claw_lock_count_threshold,
         claw_locked_value=claw_locked_value,
-        disable_adapter=disable_adapter
+        disable_adapter=disable_adapter,
+        task_type=task_type,
+        use_smart_routing=use_smart_routing,
     )
     
     # 主循环：支持多次推理
@@ -2080,6 +2140,25 @@ def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chun
                 # 正常退出（按q），准备下一次推理
                 print(f"\n{'='*80}")
                 print(f"✅ Inference session #{inference_count} stopped by user (q pressed)")
+                
+                # ⭐ 打印智能任务路由统计（如果使用了 smart_routing）
+                if use_smart_routing and adapter is not None:
+                    routing_stats = adapter.get_routing_stats()
+                    if routing_stats:
+                        print(f"\n{'='*60}")
+                        print(f"⭐ MergeVLA Smart Routing 统计")
+                        print(f"{'='*60}")
+                        print(f"   总调用次数: {routing_stats.get('total_calls', 0)}")
+                        print(f"   倾向 Task 0 (narrower): {routing_stats.get('task_0', 0)} 次 "
+                              f"({routing_stats.get('task_0_ratio', 0)*100:.1f}%)")
+                        print(f"   倾向 Task 1 (wider): {routing_stats.get('task_1', 0)} 次 "
+                              f"({routing_stats.get('task_1_ratio', 0)*100:.1f}%)")
+                        print(f"   混合路由: {routing_stats.get('mixed', 0)} 次 "
+                              f"({routing_stats.get('mixed_ratio', 0)*100:.1f}%)")
+                        print(f"{'='*60}")
+                        
+                        # 重置路由统计（为下一次推理准备）
+                        adapter.reset_routing_stats()
                 
                 # 立即重置policy状态，确保策略状态干净
                 rospy.loginfo("Resetting policy state after inference stop...")
@@ -2190,6 +2269,20 @@ if __name__ == '__main__':
     parser.add_argument('--disable-adapter', action='store_true',
                         help='Disable MergeVLA distribution adapter (for debugging). '
                              'If set, the model will run without the adapter even if merge_config.json exists.')
+    parser.add_argument('--task-type', type=str, default=None,
+                        choices=['narrower', 'wider'],
+                        dest='task_type',
+                        help='Specify task type for fixed routing. '
+                             '"narrower" for narrow box task (task_id=0), '
+                             '"wider" for wide box task (task_id=1). '
+                             'If not specified, uses --smart-routing or average.')
+    parser.add_argument('--smart-routing', action='store_true',
+                        dest='smart_routing',
+                        help='⭐ Enable MergeVLA-style Test-Time Task Routing. '
+                             'When task identity is unknown, automatically infer task relevance '
+                             'based on model internal parameter subspaces (value projection). '
+                             'This is the recommended mode for mixed-task evaluation! '
+                             '(Reference: MergeVLA paper Section 3.3)')
     
     args = parser.parse_args()
     
@@ -2260,12 +2353,23 @@ if __name__ == '__main__':
     if args.action_stride > 1:
         print(f"⚡ Action stride: {args.action_stride} (executing every {args.action_stride}-th action, ~{args.action_stride}x speedup)")
     print(f"🔒 Claw lock mechanism: threshold={args.claw_lock_threshold}, count_threshold={args.claw_lock_count_threshold}, locked_value={args.claw_locked_value}")
+    
+    # 打印任务路由模式
+    if args.task_type:
+        print(f"🎯 Task Routing: Fixed task_type={args.task_type}")
+    elif args.smart_routing:
+        print(f"⭐ Task Routing: MergeVLA Smart Routing (自动推断任务类型)")
+    else:
+        print(f"⚠️ Task Routing: Simple Average (可能导致动作混乱！)")
+        print(f"   建议：使用 --smart-routing 或 --task-type narrower/wider")
     print("="*80 + "\n")
 
     if args.eval:
         print("🚀 Starting real-time evaluation...")
         if args.disable_adapter:
             print("⚠️ MergeVLA adapter is DISABLED")
+        if args.smart_routing:
+            print("⭐ MergeVLA Smart Routing is ENABLED")
         eval(args.ckpt_path, model_type=args.model_type, control_arm=True, control_claw=True, 
              action_chunk_size=args.action_chunk_size, 
              enable_gui=args.enable_gui,
@@ -2282,7 +2386,10 @@ if __name__ == '__main__':
              claw_lock_threshold=args.claw_lock_threshold,
              claw_lock_count_threshold=args.claw_lock_count_threshold,
              claw_locked_value=args.claw_locked_value,
-             disable_adapter=args.disable_adapter)
+             disable_adapter=args.disable_adapter,
+             task_type=args.task_type,
+             use_smart_routing=args.smart_routing,
+        )
     elif args.replay:
         print("Replaying the model")
         lerobot_dataset_path = '/home/lab/kuavo-manip/lerobot_data/vel_wrend_box_613'
