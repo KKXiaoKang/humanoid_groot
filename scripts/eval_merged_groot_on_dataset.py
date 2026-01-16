@@ -394,6 +394,7 @@ def eval_on_dataset(
     use_default_datasets: bool = False,
     visualize: bool = False,
     disable_adapter: bool = False,
+    infer_per_frame: int = 1,
 ):
     """
     在数据集上评估融合模型
@@ -406,7 +407,10 @@ def eval_on_dataset(
         show_progress: 是否显示进度条
         use_default_datasets: 是否使用默认的训练数据集（评估所有数据集）
         visualize: 是否启用 Rerun 可视化
+        disable_adapter: 是否禁用适配层（用于测试）
+        infer_per_frame: 每隔多少帧重新推理一次（>=1，默认1=每帧推理）
     """
+    infer_per_frame = max(1, infer_per_frame)  # 至少每帧推理一次
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
     
     # ------------- 初始化 visualizer (可选) -------------
@@ -427,6 +431,7 @@ def eval_on_dataset(
     print(f"📂 模型路径: {model_path}")
     print(f"🔧 设备: {device}")
     print(f"📊 Action chunk size: {n_actions}")
+    print(f"🔄 推理频率: 每 {infer_per_frame} 帧推理一次 (infer_per_frame={infer_per_frame})")
     
     # 加载融合配置
     merge_config = load_merge_config(model_path)
@@ -592,6 +597,7 @@ def eval_on_dataset(
                         show_progress=show_progress,
                         vizer=vizer,
                         kb=kb,
+                        infer_per_frame=infer_per_frame,
                     )
                     dataset_results.append(result)
                 except Exception as e:
@@ -629,6 +635,7 @@ def eval_on_dataset(
             show_progress=show_progress,
             vizer=vizer,
             kb=kb,
+            infer_per_frame=infer_per_frame,
         )
         
         print_single_result(result)
@@ -654,8 +661,16 @@ def eval_single_episode(
     show_progress: bool = True,
     vizer = None,
     kb = None,
+    infer_per_frame: int = 1,
 ) -> dict:
-    """评估单个 episode"""
+    """评估单个 episode
+    
+    Args:
+        infer_per_frame: 每隔多少帧重新推理一次（>=1，默认1=每帧推理）
+    """
+    infer_per_frame = max(1, infer_per_frame)
+    last_inferred_chunk: np.ndarray | None = None
+    last_inference_step: int = -1
     # 加载数据集
     dataset_name = Path(dataset_path).name
     dataset = LeRobotDataset(repo_id=dataset_name, root=dataset_path, episodes=[episode])
@@ -784,32 +799,84 @@ def eval_single_episode(
         # 获取 ground truth
         gt_action = batch['action'][0].cpu().numpy()
         
+        # 判断是否需要执行推理（根据 infer_per_frame 参数）
+        should_infer = (data_step % infer_per_frame == 0)
+        
         # 模型推理（精确测量推理时间）
-        if device.startswith('cuda'):
-            torch.cuda.synchronize()
-        inference_start = time.perf_counter()
-        
-        processed_observation = preprocessor(observation)
-        with torch.inference_mode():
-            pred_actions = policy.predict_action_chunk(processed_observation)
-        
-        if device.startswith('cuda'):
-            torch.cuda.synchronize()
-        inference_end = time.perf_counter()
-        inference_time = inference_end - inference_start
-        inference_times.append(inference_time)
-        
-        # 使用 postprocessor 进行反归一化
-        _, chunk_size, _ = pred_actions.shape
-        processed_actions = []
-        for i in range(chunk_size):
-            single_action = pred_actions[:, i, :]
-            processed_action = postprocessor(single_action)
-            processed_actions.append(processed_action)
-        
-        pred_actions_unnorm = torch.stack(processed_actions, dim=1)
-        pred_chunk = pred_actions_unnorm[0].cpu().numpy()  # (chunk_size, action_dim)
-        pred_action_single = pred_chunk[0]  # 取第一个 action
+        if should_infer:
+            # 需要推理：执行完整的推理流程
+            if device.startswith('cuda'):
+                torch.cuda.synchronize()
+            inference_start = time.perf_counter()
+            
+            processed_observation = preprocessor(observation)
+            with torch.inference_mode():
+                pred_actions = policy.predict_action_chunk(processed_observation)
+            
+            if device.startswith('cuda'):
+                torch.cuda.synchronize()
+            inference_end = time.perf_counter()
+            inference_time = inference_end - inference_start
+            inference_times.append(inference_time)
+            
+            # 使用 postprocessor 进行反归一化
+            _, chunk_size, _ = pred_actions.shape
+            processed_actions = []
+            for i in range(chunk_size):
+                single_action = pred_actions[:, i, :]
+                processed_action = postprocessor(single_action)
+                processed_actions.append(processed_action)
+            
+            pred_actions_unnorm = torch.stack(processed_actions, dim=1)
+            pred_chunk = pred_actions_unnorm[0].cpu().numpy()  # (chunk_size, action_dim)
+            pred_action_single = pred_chunk[0]  # 取第一个 action
+            
+            # 保存预测结果供后续帧使用
+            last_inferred_chunk = pred_chunk.copy()
+            last_inference_step = data_step
+        else:
+            # 不需要推理：复用上一次的预测结果
+            if last_inferred_chunk is not None:
+                pred_chunk = last_inferred_chunk.copy()
+                # 根据距离上次推理的帧数，选择 chunk 中的对应 action
+                # 例如：如果 infer_per_frame=3，data_step=4，last_inference_step=3
+                # 则 offset = 4 - 3 = 1，取 pred_chunk[1]
+                offset = data_step - last_inference_step
+                if offset < pred_chunk.shape[0]:
+                    pred_action_single = pred_chunk[offset]
+                else:
+                    # 如果超出 chunk 范围，使用最后一个 action
+                    pred_action_single = pred_chunk[-1]
+            else:
+                # 如果这是第一帧且 infer_per_frame > 1，需要先推理一次
+                print(f"⚠️  Warning: No previous prediction at frame {data_step}. Performing inference anyway.")
+                if device.startswith('cuda'):
+                    torch.cuda.synchronize()
+                inference_start = time.perf_counter()
+                
+                processed_observation = preprocessor(observation)
+                with torch.inference_mode():
+                    pred_actions = policy.predict_action_chunk(processed_observation)
+                
+                if device.startswith('cuda'):
+                    torch.cuda.synchronize()
+                inference_end = time.perf_counter()
+                inference_time = inference_end - inference_start
+                inference_times.append(inference_time)
+                
+                _, chunk_size, _ = pred_actions.shape
+                processed_actions = []
+                for i in range(chunk_size):
+                    single_action = pred_actions[:, i, :]
+                    processed_action = postprocessor(single_action)
+                    processed_actions.append(processed_action)
+                
+                pred_actions_unnorm = torch.stack(processed_actions, dim=1)
+                pred_chunk = pred_actions_unnorm[0].cpu().numpy()
+                pred_action_single = pred_chunk[0]
+                
+                last_inferred_chunk = pred_chunk.copy()
+                last_inference_step = data_step
         
         # 计算误差
         for dim in range(action_dim):
@@ -847,22 +914,24 @@ def eval_single_episode(
                     width=3.0,
                 )
                 
-                # 可视化预测的 action chunk
-                vizer.visualize_chunk(
-                    name=f"chunk/action_dim_{dim}/pred_seg_{data_step}",
-                    chunk_data=pred_chunk[:, dim],
-                    step_id=data_step,
-                    width=2
-                )
-                
-                # 删除旧的可视化
-                if last_data_step != data_step and last_data_step > 0:
-                    vizer.del_chunk(
-                        name=f"chunk/action_dim_{dim}/pred_seg_{last_data_step}",
+                # 只在推理时更新预测的 action chunk 可视化
+                if should_infer:
+                    # 可视化预测的 action chunk
+                    vizer.visualize_chunk(
+                        name=f"chunk/action_dim_{dim}/pred_seg_{data_step}",
                         chunk_data=pred_chunk[:, dim],
-                        step_id=last_data_step,
-                        width=0.5
+                        step_id=data_step,
+                        width=2
                     )
+                    
+                    # 删除旧的可视化
+                    if last_data_step != data_step and last_data_step > 0:
+                        vizer.del_chunk(
+                            name=f"chunk/action_dim_{dim}/pred_seg_{last_data_step}",
+                            chunk_data=pred_chunk[:, dim],
+                            step_id=last_data_step,
+                            width=0.5
+                        )
         
         last_data_step = data_step
     
@@ -990,6 +1059,10 @@ if __name__ == "__main__":
                        help='Enable Rerun visualization')
     parser.add_argument('--disable-adapter', action='store_true',
                        help='Disable adapter layer for testing (use raw backbone features)')
+    parser.add_argument('--infer-per-frame', type=int, default=1,
+                       dest='infer_per_frame',
+                       help='Run policy inference every N frames (default: 1 = every frame). '
+                            'Higher values reduce computation but may decrease accuracy.')
     
     args = parser.parse_args()
     
@@ -1004,6 +1077,7 @@ if __name__ == "__main__":
         print(f"Using default training datasets")
     print(f"Action Chunk Size: {args.action_chunk_size}")
     print(f"Visualization: {args.visualize}")
+    print(f"Infer Every N Frames: {args.infer_per_frame}")
     print("="*80)
     
     eval_on_dataset(
@@ -1015,4 +1089,5 @@ if __name__ == "__main__":
         use_default_datasets=args.use_default_datasets,
         visualize=args.visualize,
         disable_adapter=args.disable_adapter,
+        infer_per_frame=args.infer_per_frame,
     )
