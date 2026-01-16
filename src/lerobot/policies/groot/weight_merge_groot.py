@@ -1957,15 +1957,22 @@ class MergeVLAMerger:
             print(f"   Lambda (tolerance): {self.sparse_merge_lambda}")
             
             # 首先计算 τ_merge（加权和）
+            # 注意：权重键可能有 '_groot_model.' 前缀，需要同时检查
             τ_merge = {}
             for k in base_state_dict:
-                if k.startswith('backbone.') or (self.merge_action_head and k.startswith('action_head.')):
+                # 检查是否是 backbone 或 action_head 权重（支持有无 _groot_model. 前缀）
+                is_backbone = 'backbone.' in k
+                is_action_head = 'action_head.' in k
+                
+                if is_backbone or (self.merge_action_head and is_action_head):
                     τ_merge_k = torch.zeros_like(base_state_dict[k])
                     if k in τ_narrower:
                         τ_merge_k = τ_merge_k + self.narrower_weight * τ_narrower[k]
                     if k in τ_wider:
                         τ_merge_k = τ_merge_k + self.wider_weight * τ_wider[k]
                     τ_merge[k] = τ_merge_k
+            
+            print(f"   τ_merge keys count: {len(τ_merge)}")
             
             # 计算 S_narrower 和 S_wider（参数级稀疏掩码）
             S_narrower = {}
@@ -2010,11 +2017,15 @@ class MergeVLAMerger:
             
             print(f"\n📊 Sparse Mask Statistics:")
             print(f"   Total parameters: {total_params:,}")
-            print(f"   Narrower active: {narrower_active_params:,} ({100*narrower_active_params/total_params:.1f}%)")
-            print(f"   Wider active: {wider_active_params:,} ({100*wider_active_params/total_params:.1f}%)")
-            print(f"   Shared (both tasks keep): {shared_params:,} ({100*shared_params/total_params:.1f}%)")
-            print(f"   Selfish (only one task keeps): {selfish_params:,} ({100*selfish_params/total_params:.1f}%)")
-            print(f"   (MergeVLA论文报告约75%参数为'selfish'，表明任务掩码有效)")
+            if total_params > 0:
+                print(f"   Narrower active: {narrower_active_params:,} ({100*narrower_active_params/total_params:.1f}%)")
+                print(f"   Wider active: {wider_active_params:,} ({100*wider_active_params/total_params:.1f}%)")
+                print(f"   Shared (both tasks keep): {shared_params:,} ({100*shared_params/total_params:.1f}%)")
+                print(f"   Selfish (only one task keeps): {selfish_params:,} ({100*selfish_params/total_params:.1f}%)")
+                print(f"   (MergeVLA论文报告约75%参数为'selfish'，表明任务掩码有效)")
+            else:
+                print(f"   ⚠️ Warning: No parameters found for sparse mask calculation!")
+                print(f"   τ_merge keys: {list(τ_merge.keys())[:5]}..." if τ_merge else "   τ_merge is empty")
         
         # 融合权重
         merged_state_dict = {}
@@ -2022,7 +2033,11 @@ class MergeVLAMerger:
         action_head_count = 0
         
         for k in base_state_dict:
-            if k.startswith('backbone.'):
+            # 检查是否是 backbone 或 action_head 权重（支持有无 _groot_model. 前缀）
+            is_backbone = 'backbone.' in k
+            is_action_head = 'action_head.' in k
+            
+            if is_backbone:
                 # 融合 backbone
                 merged = base_state_dict[k].clone()
                 
@@ -2042,7 +2057,7 @@ class MergeVLAMerger:
                 
                 merged_state_dict[k] = merged
                 backbone_count += 1
-            elif k.startswith('action_head.'):
+            elif is_action_head:
                 # Action head 处理
                 if self.merge_action_head:
                     # 融合 action_head（GROOT 使用 cross-attention，可以尝试）
