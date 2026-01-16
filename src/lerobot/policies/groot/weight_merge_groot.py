@@ -2371,6 +2371,9 @@ class MergeVLAMerger:
             "num_tasks": 2,
             "merge_action_head": self.merge_action_head,
             "action_head_source": "merged" if self.merge_action_head else "narrower",
+            # ⭐ MergeVLA Section 4.1: 参数级稀疏掩码融合配置
+            "use_sparse_merge": self.use_sparse_merge,
+            "sparse_merge_lambda": self.sparse_merge_lambda,
         }
         with open(output_path / "merge_config.json", "w") as f:
             json.dump(merge_config, f, indent=2)

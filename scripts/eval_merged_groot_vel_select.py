@@ -888,6 +888,16 @@ def load_model_and_env(ckpt_path, model_type, action_chunk_size=50, enable_gui=F
         print(f"   📋 任务数: {merge_config.get('num_tasks', 2)}")
         print(f"   📋 稀疏度: {merge_config.get('sparsity', 0.5)}")
         
+        # ⭐ MergeVLA Section 4.1: 参数级稀疏掩码融合配置
+        use_sparse_merge = merge_config.get('use_sparse_merge', None)
+        sparse_merge_lambda = merge_config.get('sparse_merge_lambda', None)
+        if use_sparse_merge is not None:
+            print(f"\n   🔥 MergeVLA Section 4.1 参数级稀疏掩码融合:")
+            print(f"      - 稀疏掩码融合: {'✅ 启用' if use_sparse_merge else '❌ 禁用'}")
+            if use_sparse_merge and sparse_merge_lambda is not None:
+                print(f"      - Lambda (容忍度系数): {sparse_merge_lambda}")
+                print(f"      - 公式: S_m = I[|τ_m| > λ|τ_merge - τ_m|]")
+        
         if disable_adapter:
             print("   ⚠️ --disable-adapter 已设置，跳过适配层加载")
         else:

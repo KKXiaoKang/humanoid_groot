@@ -518,6 +518,16 @@ def eval_on_dataset(
                 print(f"     - Action Head: 使用插值（interpolate）: 0.5 * narrower + 0.5 * wider")
         else:
             print(f"     - ✅ 融合所有权重（包括 backbone 和 action_head）")
+        
+        # ⭐ MergeVLA Section 4.1: 参数级稀疏掩码融合配置
+        use_sparse_merge = merge_config.get('use_sparse_merge', None)
+        sparse_merge_lambda = merge_config.get('sparse_merge_lambda', None)
+        if use_sparse_merge is not None:
+            print(f"\n   🔥 MergeVLA Section 4.1 参数级稀疏掩码融合:")
+            print(f"     - 稀疏掩码融合: {'✅ 启用' if use_sparse_merge else '❌ 禁用'}")
+            if use_sparse_merge and sparse_merge_lambda is not None:
+                print(f"     - Lambda (容忍度系数): {sparse_merge_lambda}")
+                print(f"     - 公式: S_m = I[|τ_m| > λ|τ_merge - τ_m|]")
     else:
         print(f"\n⚠️  警告: 未找到 merge_config.json，无法显示融合配置")
     
