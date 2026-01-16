@@ -60,6 +60,8 @@ echo ""
 #   --lora_rank: 增加到 32 以提高适配器容量
 #   --sparsity: 降低到 0.3 以激活更多参数（减少稀疏性）
 #   --merge_action_head: 尝试融合 action_head（GROOT 使用 cross-attention，更安全）
+#   --batch_size: 8 (H100 80GB 可以支持更大的 batch，提高训练稳定性和梯度估计质量)
+#                 注意: batch_size=1 会导致 loss 和 grad_norm 波动非常大，训练不稳定
 #
 # ⭐ Episode-based 采样模式（保持时序连续性）：
 #   --episode-based: 按 episode 组织数据，保持动作轨迹的时序关系
@@ -86,7 +88,7 @@ python scripts/train_weight_merge.py \
     --sparsity 0.6 \
     --adapter_epochs 100 \
     --adapter_lr 1e-3 \
-    --batch_size 1 \
+    --batch_size 64 \
     --device "${DEVICE}" \
     --use_default_datasets \
     --merge_action_head \
