@@ -93,9 +93,23 @@ class MergeVLAConfig:
     disable_adapter: bool = field(default=False, metadata={"help": "禁用适配层（调试用）"})
     
     # 动作队列配置
+    # ⚠️ 关键参数：控制何时触发新推理
+    # 值太大(如90)会导致频繁推理，chunk间不连续导致抖动
+    # 值太小可能导致队列耗尽，动作断档
+    # 推荐：设置为 execution_horizon * 5 左右（如 10 * 5 = 50）
     action_queue_size_to_get_new_actions: int = field(
-        default=90,
-        metadata={"help": "触发新推理的动作队列阈值"}
+        default=50,  # 从90改为50，减少推理频率
+        metadata={"help": "触发新推理的动作队列阈值（推荐: execution_horizon * 5）"}
+    )
+    
+    # 动作平滑参数
+    action_smoothing: bool = field(
+        default=True,
+        metadata={"help": "启用 chunk 间动作平滑（减少抖动）"}
+    )
+    smoothing_alpha: float = field(
+        default=0.3,
+        metadata={"help": "平滑系数 (0-1)，越大越平滑但延迟越高"}
     )
 
 
@@ -243,6 +257,39 @@ def load_mergevla_model(cfg: MergeVLAConfig) -> ModelWrapper:
     )
 
 
+def smooth_chunk_transition(
+    new_chunk: torch.Tensor,
+    prev_last_action: torch.Tensor | None,
+    alpha: float = 0.3,
+    transition_steps: int = 10,
+) -> torch.Tensor:
+    """
+    平滑 chunk 之间的过渡，减少抖动
+    
+    Args:
+        new_chunk: 新的 action chunk (chunk_size, action_dim)
+        prev_last_action: 上一个 chunk 的最后一个 action (action_dim,)
+        alpha: 平滑系数，越大越平滑
+        transition_steps: 过渡的步数
+    
+    Returns:
+        平滑后的 chunk
+    """
+    if prev_last_action is None:
+        return new_chunk
+    
+    smoothed = new_chunk.clone()
+    chunk_size = new_chunk.shape[0]
+    transition_steps = min(transition_steps, chunk_size)
+    
+    for i in range(transition_steps):
+        # 权重从 alpha 逐渐降到 0
+        weight = alpha * (1 - i / transition_steps)
+        smoothed[i] = (1 - weight) * new_chunk[i] + weight * prev_last_action
+    
+    return smoothed
+
+
 def get_actions(
     model: ModelWrapper,
     env: GrabBoxMpcEnv,
@@ -259,6 +306,10 @@ def get_actions(
         
         if not cfg.rtc.enabled:
             get_actions_threshold = 0
+        
+        # 用于 chunk 间平滑的状态
+        prev_chunk_last_action = None
+        inference_count = 0
         
         while not shutdown_event.is_set():
             if action_queue.qsize() <= get_actions_threshold:
@@ -308,10 +359,29 @@ def get_actions(
                 new_delay = math.ceil(new_latency / time_per_chunk)
                 latency_tracker.add(new_latency)
                 
+                # 诊断日志（前几次推理）
+                inference_count += 1
+                if inference_count <= 3:
+                    logger.info(f"[INF #{inference_count}] latency={new_latency*1000:.1f}ms, "
+                               f"delay={new_delay}, queue={action_queue.qsize()}, "
+                               f"threshold={get_actions_threshold}")
+                
                 # 第一次推理平滑处理
                 if episode_state.first_inference:
                     postprocessed_actions = apply_first_chunk_smooth(postprocessed_actions, obs_data, env)
                     episode_state.first_inference = False
+                
+                # ⚠️ 关键：chunk 间平滑（减少 MergeVLA 适配层导致的抖动）
+                if cfg.action_smoothing and prev_chunk_last_action is not None:
+                    postprocessed_actions = smooth_chunk_transition(
+                        postprocessed_actions,
+                        prev_chunk_last_action,
+                        alpha=cfg.smoothing_alpha,
+                        transition_steps=int(cfg.fps),  # 约 1 秒的过渡
+                    )
+                
+                # 保存当前 chunk 的最后一个 action 用于下次平滑
+                prev_chunk_last_action = postprocessed_actions[-1].clone()
                 
                 # 重采样
                 postprocessed_resampled = resample_chunk_with_claw_hold(
@@ -391,13 +461,24 @@ def main(cfg: MergeVLAConfig):
     
     print(f"\n{'='*60}")
     print(f"🤖 MergeVLA 实时推理")
+    print(f"{'='*60}")
     print(f"   模型: {cfg.model_path}")
     print(f"   适配层: {'✅ 已启用' if model.adapter else '❌ 已禁用'}")
     print(f"   任务: {cfg.task}")
-    print(f"   频率: {cfg.fps} Hz")
-    print(f"   周期: {cfg.duration} 秒")
+    print(f"{'='*60}")
+    print(f"   推理频率: {cfg.fps} Hz")
+    print(f"   推理周期: {cfg.duration} 秒")
     print(f"   RTC: {'✅ 启用' if cfg.rtc.enabled else '❌ 禁用'}")
     print(f"   RTC execution_horizon: {cfg.rtc.execution_horizon}")
+    print(f"{'='*60}")
+    print(f"   动作队列阈值: {cfg.action_queue_size_to_get_new_actions}")
+    print(f"   chunk平滑: {'✅ 启用' if cfg.action_smoothing else '❌ 禁用'}")
+    if cfg.action_smoothing:
+        print(f"   平滑系数: {cfg.smoothing_alpha}")
+    print(f"{'='*60}")
+    print(f"💡 如果动作抖动，尝试调整以下参数：")
+    print(f"   --action_queue_size_to_get_new_actions=30  (减小阈值)")
+    print(f"   --smoothing_alpha=0.5                      (增大平滑)")
     print(f"{'='*60}")
     
     while True:
