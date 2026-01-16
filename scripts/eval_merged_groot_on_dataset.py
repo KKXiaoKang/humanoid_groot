@@ -246,16 +246,32 @@ def load_adapter_if_needed(policy: GrootPolicy, model_path: str, merge_config: d
         return None
 
 
-def wrap_policy_with_adapter(policy: GrootPolicy, adapter: DistributionAdapter):
+def wrap_policy_with_adapter(policy: GrootPolicy, adapter: DistributionAdapter, task_type: str = None):
     """
     包装 GrootPolicy，使其在推理时使用适配层
     
     Args:
         policy: GrootPolicy 实例
         adapter: DistributionAdapter 实例
+        task_type: 任务类型 ("narrower", "wider", None)
+                   - "narrower": 使用 task_id=0 的适配器参数
+                   - "wider": 使用 task_id=1 的适配器参数
+                   - None: 使用所有任务的平均（可能导致动作混乱！）
     """
     if adapter is None:
         return
+    
+    # ⚠️ 关键：根据任务类型设置 task_id
+    if task_type == "narrower":
+        fixed_task_id = torch.tensor([0], device=next(adapter.parameters()).device)
+        print(f"   ⚠️ 使用任务路由: task_type=narrower (task_id=0)")
+    elif task_type == "wider":
+        fixed_task_id = torch.tensor([1], device=next(adapter.parameters()).device)
+        print(f"   ⚠️ 使用任务路由: task_type=wider (task_id=1)")
+    else:
+        fixed_task_id = None
+        print(f"   ⚠️ 未指定任务类型，使用所有任务的平均（可能导致动作混乱！）")
+        print(f"      建议：使用 --task-type narrower 或 --task-type wider 指定任务类型")
     
     # 保存原始的 get_action 方法
     original_get_action = policy._groot_model.get_action
@@ -288,9 +304,8 @@ def wrap_policy_with_adapter(policy: GrootPolicy, adapter: DistributionAdapter):
             if torch.isinf(backbone_features).any():
                 print(f"      ⚠️ Warning: Backbone features contain Inf!")
         
-        # 对于 sparse_lora，如果没有 task_id，使用 None（会使用所有任务的平均）
-        task_id = None  # 推理时任务未知，使用平均
-        adapted_features = adapter(backbone_features, task_id=task_id)
+        # ⚠️ 关键修复：使用固定的 task_id 而不是 None
+        adapted_features = adapter(backbone_features, task_id=fixed_task_id)
         
         # ⚠️ 关键诊断：检查适配层是否过度改变了特征分布
         # 如果适配层改变了特征的统计特性（mean/std），可能导致迭代去噪不稳定
@@ -395,6 +410,7 @@ def eval_on_dataset(
     visualize: bool = False,
     disable_adapter: bool = False,
     infer_per_frame: int = 1,
+    task_type: str = None,
 ):
     """
     在数据集上评估融合模型
@@ -409,6 +425,9 @@ def eval_on_dataset(
         visualize: 是否启用 Rerun 可视化
         disable_adapter: 是否禁用适配层（用于测试）
         infer_per_frame: 每隔多少帧重新推理一次（>=1，默认1=每帧推理）
+        task_type: 任务类型 ("narrower", "wider", None)
+                   ⚠️ 关键：对于 sparse_lora 适配器，必须指定任务类型！
+                   否则会使用所有任务的平均，导致动作混乱。
     """
     infer_per_frame = max(1, infer_per_frame)  # 至少每帧推理一次
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
@@ -496,7 +515,7 @@ def eval_on_dataset(
     adapter = load_adapter_if_needed(policy, model_path, merge_config)
     if adapter is not None:
         if not disable_adapter:
-            wrap_policy_with_adapter(policy, adapter)
+            wrap_policy_with_adapter(policy, adapter, task_type=task_type)
         else:
             print(f"\n⚠️  WARNING: Adapter layer is DISABLED for testing!")
             print(f"   Using raw backbone features (without adapter)")
@@ -1063,6 +1082,13 @@ if __name__ == "__main__":
                        dest='infer_per_frame',
                        help='Run policy inference every N frames (default: 1 = every frame). '
                             'Higher values reduce computation but may decrease accuracy.')
+    parser.add_argument('--task-type', type=str, default=None,
+                       choices=['narrower', 'wider'],
+                       dest='task_type',
+                       help='⚠️ CRITICAL for sparse_lora adapter! Specify task type for routing. '
+                            '"narrower" for narrow box task (task_id=0), '
+                            '"wider" for wide box task (task_id=1). '
+                            'If not specified, uses average of all tasks (may cause action confusion!)')
     
     args = parser.parse_args()
     
@@ -1078,6 +1104,10 @@ if __name__ == "__main__":
     print(f"Action Chunk Size: {args.action_chunk_size}")
     print(f"Visualization: {args.visualize}")
     print(f"Infer Every N Frames: {args.infer_per_frame}")
+    if args.task_type:
+        print(f"⚠️ Task Type: {args.task_type} (使用任务特定的适配器路由)")
+    else:
+        print(f"⚠️ Task Type: None (使用所有任务的平均，可能导致动作混乱！)")
     print("="*80)
     
     eval_on_dataset(
@@ -1090,4 +1120,5 @@ if __name__ == "__main__":
         visualize=args.visualize,
         disable_adapter=args.disable_adapter,
         infer_per_frame=args.infer_per_frame,
+        task_type=args.task_type,
     )
