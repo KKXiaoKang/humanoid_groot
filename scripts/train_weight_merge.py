@@ -1081,6 +1081,8 @@ def run_mergevla_merge(args):
         lora_rank=args.lora_rank,
         sparsity=getattr(args, 'sparsity', 0.5),
         merge_action_head=getattr(args, 'merge_action_head', False),
+        use_sparse_merge=getattr(args, 'use_sparse_merge', True),  # ⭐ Section 4.1 稀疏掩码融合
+        sparse_merge_lambda=getattr(args, 'sparse_merge_lambda', 1.0),  # ⭐ 容忍度系数
     )
     
     # 加载并融合
@@ -1292,6 +1294,15 @@ def main():
                        help="Sparsity for sparse_lora adapter (percentage of parameters activated per task, default: 0.5)")
     parser.add_argument("--merge_action_head", action="store_true", default=False,
                        help="Merge action_head weights (GROOT uses cross-attention, can try merging)")
+    
+    # ⭐ MergeVLA Section 4.1: 参数级稀疏掩码融合
+    parser.add_argument("--use_sparse_merge", action="store_true", default=True,
+                       help="Use MergeVLA Section 4.1 sparse mask merging: S_m = I[|τ_m| > λ|τ_merge - τ_m|]")
+    parser.add_argument("--no_sparse_merge", action="store_false", dest="use_sparse_merge",
+                       help="Disable sparse mask merging (use simple linear interpolation)")
+    parser.add_argument("--sparse_merge_lambda", type=float, default=1.0,
+                       help="Tolerance coefficient λ for sparse mask (paper default: 1.0). Higher = more strict = sparser masks")
+    
     parser.add_argument("--adapter_epochs", type=int, default=20,
                        help="Number of epochs to train the distribution adapter")
     parser.add_argument("--adapter_lr", type=float, default=1e-3,

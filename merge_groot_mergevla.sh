@@ -70,6 +70,11 @@ echo ""
 #   1. --episode-based --num-episodes 5：每个数据集采样 5 个完整 episode（推荐！）
 #   2. --use-all-frames：使用所有帧（数据量大，训练慢，但效果最好）
 #   3. 不加这些参数：随机帧采样（可能破坏时序关系）
+#
+# 🔥 MergeVLA Section 4.1: 参数级稀疏掩码融合（默认启用）
+#   --use_sparse_merge: 使用公式 S_m = I[|τ_m| > λ|τ_merge - τ_m|] 计算任务掩码
+#   --sparse_merge_lambda: 容忍度系数 λ（论文默认 1.0，越大越稀疏）
+#   这会过滤掉参数级别的符号冲突，保留对各任务有意义的参数更新
 python scripts/train_weight_merge.py \
     --method mergevla \
     --narrower_path "${NARROWER_PATH}" \
@@ -86,7 +91,9 @@ python scripts/train_weight_merge.py \
     --use_default_datasets \
     --merge_action_head \
     --episode-based \
-    --num-episodes 120
+    --num-episodes 120 \
+    --use_sparse_merge \
+    --sparse_merge_lambda 1.0
 
 echo ""
 echo "=========================================="

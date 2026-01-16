@@ -6,7 +6,9 @@ MergeVLA 是基于论文 [MergeVLA: Cross-Skill Model Merging Toward a Generalis
 
 **核心问题**：如何将两个专家模型（narrower 和 wider）融合成一个通用模型，使其能同时处理两种任务？
 
-**核心创新**：使用 **Sparse LoRA Adapter**（稀疏激活的 LoRA 适配器）来解决融合后的分布漂移问题。
+**核心创新**：
+1. **参数级稀疏掩码融合**（Section 4.1）：通过任务掩码解决参数冲突问题
+2. **Sparse LoRA Adapter**：用于特征层面的分布对齐和动态任务路由
 
 ---
 
@@ -450,6 +452,91 @@ for k in base_state_dict:
 
 **结果**：`backbone = 0.5 × narrower + 0.5 × wider`
 
+### 阶段 3.1: MergeVLA Section 4.1 参数级稀疏掩码融合（可选）
+
+当启用 `--use_sparse_merge` 时，采用论文 Section 4.1 描述的参数级稀疏掩码融合方法：
+
+```python
+# 📌 MergeVLA Section 4.1: 稀疏激活的任务掩码
+# 公式: S_m = I[|τ_m| > λ|τ_merge - τ_m|]
+
+# 1. 计算合并的任务向量
+τ_merge = {}
+for k in backbone_keys:
+    τ_merge[k] = (narrower_weight * τ_narrower[k] + wider_weight * τ_wider[k])
+
+# 2. 计算各任务的二值掩码
+λ = sparse_merge_lambda  # 容忍度系数，默认 1.0
+
+S_narrower = {}
+S_wider = {}
+for k in τ_merge:
+    # 论文公式: S_m = I[|τ_m| > λ|τ_merge - τ_m|]
+    # 只保留那些 "显著" 且 "优于残差差异" 的参数
+    S_narrower[k] = (torch.abs(τ_narrower[k]) > λ * torch.abs(τ_merge[k] - τ_narrower[k])).float()
+    S_wider[k] = (torch.abs(τ_wider[k]) > λ * torch.abs(τ_merge[k] - τ_wider[k])).float()
+
+# 3. 应用稀疏掩码融合
+# 使用两个任务掩码的并集，确保不丢失任何任务的关键参数
+for k in backbone_keys:
+    unified_mask = torch.max(S_narrower[k], S_wider[k])  # 并集掩码
+    merged_state_dict[k] = base_state_dict[k] + unified_mask * τ_merge[k]
+```
+
+**工作原理**：
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│              MergeVLA Section 4.1: 参数级一致性检验                       │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  对于每个参数位置 i，判断该参数是否应该被保留：                            │
+│                                                                         │
+│  S_m[i] = 1  ⟺  |τ_m[i]| > λ|τ_merge[i] - τ_m[i]|                       │
+│                                                                         │
+│  含义：                                                                 │
+│  - 左边 |τ_m[i]|: 任务 m 在该位置的"任务特定贡献"强度                    │
+│  - 右边 |τ_merge - τ_m|: 该参数与合并结果的"残差差异"                    │
+│  - 如果任务贡献 > λ × 残差差异，说明这个参数对该任务"足够重要"            │
+│                                                                         │
+│  效果：                                                                 │
+│  - 过滤掉"噪声参数"（贡献小但波动大）                                    │
+│  - 保留"关键参数"（贡献显著且稳定）                                      │
+│  - 减少跨任务参数干扰，提升多任务性能                                    │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**掩码统计示例**：
+
+```
+📊 Sparse Mask Statistics:
+   Total merged parameters: 1,234,567,890
+   
+   Narrower mask:
+     - Active: 923,456,789 (74.8%)
+     - Masked: 311,111,101 (25.2%)
+   
+   Wider mask:
+     - Active: 912,345,678 (73.9%)
+     - Masked: 322,222,212 (26.1%)
+   
+   Parameter categories:
+     - Shared (both tasks): 701,234,567 (56.8%)  ← 两个任务都需要的参数
+     - Narrower selfish: 222,222,222 (18.0%)    ← 只对 narrower 重要
+     - Wider selfish: 211,111,111 (17.1%)       ← 只对 wider 重要
+     - Neither: 100,000,000 (8.1%)              ← 噪声参数，被过滤
+```
+
+**为什么使用并集掩码**：
+
+原始 MergeVLA 论文使用 `S_m` 为每个任务单独激活参数。但对于推理时任务未知的情况，
+我们使用 `unified_mask = max(S_narrower, S_wider)` 作为并集：
+
+- ✅ 保留了两个任务的所有"关键参数"
+- ✅ 过滤了对两个任务都不重要的"噪声参数"
+- ✅ 简化了推理逻辑，无需动态切换掩码
+
 ### 阶段 4: 保留 Action Head (DiT)
 
 ```python
@@ -621,7 +708,9 @@ outputs/merged_groot_mergevla/pretrained_model/
 │   ├── adapter_type: "sparse_lora"
 │   ├── lora_rank: 16
 │   ├── sparsity: 0.5
-│   └── merge_action_head: false
+│   ├── merge_action_head: false
+│   ├── use_sparse_merge: true      # ⭐ Section 4.1 参数级稀疏掩码
+│   └── sparse_merge_lambda: 1.0    # ⭐ 容忍度系数
 ├── policy_preprocessor.json
 ├── policy_preprocessor_*.safetensors
 ├── policy_postprocessor.json
@@ -632,34 +721,58 @@ outputs/merged_groot_mergevla/pretrained_model/
 
 ## 关键参数说明
 
+### 融合参数
+
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `narrower_weight` | 0.5 | narrower 任务向量的权重 |
 | `wider_weight` | 0.5 | wider 任务向量的权重 |
+| `merge_action_head` | false | 是否融合 action_head |
+
+### MergeVLA Section 4.1: 参数级稀疏掩码
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `use_sparse_merge` | true | 是否启用参数级稀疏掩码融合 |
+| `sparse_merge_lambda` | 1.0 | 容忍度系数 λ，控制掩码的严格程度 |
+
+**关于 `sparse_merge_lambda`**：
+- λ = 0: 所有参数都会被保留（无稀疏效果）
+- λ = 1: 默认值，平衡稀疏度和任务性能
+- λ > 1: 更严格的过滤，更多参数被掩蔽
+- λ < 1: 更宽松的过滤，更多参数被保留
+
+论文建议 λ = 1.0，这时约 75% 的参数是"自私的"（仅被一个任务保留）。
+
+### 适配层参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
 | `adapter_type` | sparse_lora | 适配器类型（MergeVLA 风格） |
 | `lora_rank` | 16 | LoRA 的秩（越大容量越大） |
 | `sparsity` | 0.5 | 每个任务激活的参数比例 |
 | `adapter_epochs` | 20 | 适配层训练轮数 |
 | `adapter_lr` | 1e-3 | 适配层学习率 |
 | `num_samples` | 10 | 每个数据集采样数量 |
-| `merge_action_head` | false | 是否融合 action_head |
 
 ---
 
 ## 与其他方法的对比
 
-| 方法 | Backbone | Action Head | 适配层 | 效果 |
-|------|----------|-------------|--------|------|
-| **MergeVLA** | 融合 | narrower | Sparse LoRA ✅ | 最好 |
-| Two-Stage | 融合 | narrower | 标准 LoRA | 较好 |
-| Interpolation | 融合 | 融合 | 无 | 抖动 |
-| Task Arithmetic | 融合 | 融合 | 无 | 抖动 |
+| 方法 | Backbone 融合 | 参数级稀疏掩码 | Action Head | 适配层 | 效果 |
+|------|--------------|----------------|-------------|--------|------|
+| **MergeVLA** | ✅ Task Vector | ✅ Section 4.1 | narrower | Sparse LoRA ✅ | 最好 |
+| Two-Stage | ✅ Task Vector | ❌ | narrower | 标准 LoRA | 较好 |
+| Interpolation | 线性插值 | ❌ | 融合 | 无 | 抖动 |
+| Task Arithmetic | Task Vector | ❌ | 融合 | 无 | 抖动 |
 
 **MergeVLA 的优势**：
-1. ✅ Sparse LoRA 通过任务掩码减少任务间冲突
-2. ✅ 保留 narrower 的 DiT 避免了动作抖动
-3. ✅ 适配层参数量小（仅 135K），训练快速
-4. ✅ 融合的 backbone 继承了两个任务的视觉理解能力
+1. ✅ **Section 4.1 参数级稀疏掩码**：通过 `S_m = I[|τ_m| > λ|τ_merge - τ_m|]` 在 backbone 融合阶段过滤冲突参数
+2. ✅ **Sparse LoRA Adapter**：通过可学习任务掩码在特征层面进一步减少任务间干扰
+3. ✅ 保留 narrower 的 DiT 避免了动作抖动
+4. ✅ 适配层参数量小（仅 135K），训练快速
+5. ✅ 融合的 backbone 继承了两个任务的视觉理解能力
+6. ✅ **Test-Time Task Routing**：推理时自动识别任务类型，智能选择路由
 
 ---
 

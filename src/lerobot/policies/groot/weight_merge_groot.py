@@ -1884,6 +1884,8 @@ class MergeVLAMerger:
         lora_rank: int = 16,
         sparsity: float = 0.5,  # 稀疏度（仅用于 sparse_lora）
         merge_action_head: bool = False,  # 是否融合 action_head（GROOT 使用 cross-attention，可以尝试）
+        use_sparse_merge: bool = True,  # ⭐ 是否使用 Section 4.1 的参数级稀疏掩码融合
+        sparse_merge_lambda: float = 1.0,  # ⭐ 容忍度系数 λ（论文默认 1.0）
     ):
         self.narrower_path = narrower_path
         self.wider_path = wider_path
@@ -1894,6 +1896,8 @@ class MergeVLAMerger:
         self.lora_rank = lora_rank
         self.sparsity = sparsity
         self.merge_action_head = merge_action_head
+        self.use_sparse_merge = use_sparse_merge
+        self.sparse_merge_lambda = sparse_merge_lambda
         self.device = torch.device(device)
         
         self.merged_model = None
@@ -1944,6 +1948,74 @@ class MergeVLAMerger:
             if k in wider_state_dict:
                 τ_wider[k] = wider_state_dict[k] - base_state_dict[k]
         
+        # ⭐ MergeVLA Section 4.1: 参数级稀疏掩码融合
+        # 公式: S_m = I[|τ_m| > λ|τ_merge - τ_m|]
+        # 融合: Θ^(m)_merge = Θ_0 + S_m ⊙ τ_merge
+        if self.use_sparse_merge:
+            print(f"\n🔥 Applying MergeVLA Section 4.1 Sparse Mask Merging")
+            print(f"   Formula: S_m = I[|τ_m| > λ|τ_merge - τ_m|]")
+            print(f"   Lambda (tolerance): {self.sparse_merge_lambda}")
+            
+            # 首先计算 τ_merge（加权和）
+            τ_merge = {}
+            for k in base_state_dict:
+                if k.startswith('backbone.') or (self.merge_action_head and k.startswith('action_head.')):
+                    τ_merge_k = torch.zeros_like(base_state_dict[k])
+                    if k in τ_narrower:
+                        τ_merge_k = τ_merge_k + self.narrower_weight * τ_narrower[k]
+                    if k in τ_wider:
+                        τ_merge_k = τ_merge_k + self.wider_weight * τ_wider[k]
+                    τ_merge[k] = τ_merge_k
+            
+            # 计算 S_narrower 和 S_wider（参数级稀疏掩码）
+            S_narrower = {}
+            S_wider = {}
+            
+            total_params = 0
+            narrower_active_params = 0
+            wider_active_params = 0
+            shared_params = 0  # 被两个任务共同保留的参数
+            selfish_params = 0  # 只被一个任务保留的参数（论文称为 "selfish"）
+            
+            for k in τ_merge:
+                if k in τ_narrower:
+                    # S_narrower = I[|τ_narrower| > λ|τ_merge - τ_narrower|]
+                    abs_τ_narrower = torch.abs(τ_narrower[k])
+                    abs_diff_narrower = torch.abs(τ_merge[k] - τ_narrower[k])
+                    S_narrower[k] = (abs_τ_narrower > self.sparse_merge_lambda * abs_diff_narrower).float()
+                else:
+                    S_narrower[k] = torch.zeros_like(base_state_dict[k])
+                
+                if k in τ_wider:
+                    # S_wider = I[|τ_wider| > λ|τ_merge - τ_wider|]
+                    abs_τ_wider = torch.abs(τ_wider[k])
+                    abs_diff_wider = torch.abs(τ_merge[k] - τ_wider[k])
+                    S_wider[k] = (abs_τ_wider > self.sparse_merge_lambda * abs_diff_wider).float()
+                else:
+                    S_wider[k] = torch.zeros_like(base_state_dict[k])
+                
+                # 统计参数激活情况
+                param_count = S_narrower[k].numel()
+                total_params += param_count
+                narrower_active = (S_narrower[k] > 0).sum().item()
+                wider_active = (S_wider[k] > 0).sum().item()
+                narrower_active_params += narrower_active
+                wider_active_params += wider_active
+                
+                # 共同保留 vs 自私参数
+                both_active = ((S_narrower[k] > 0) & (S_wider[k] > 0)).sum().item()
+                only_one_active = ((S_narrower[k] > 0) ^ (S_wider[k] > 0)).sum().item()
+                shared_params += both_active
+                selfish_params += only_one_active
+            
+            print(f"\n📊 Sparse Mask Statistics:")
+            print(f"   Total parameters: {total_params:,}")
+            print(f"   Narrower active: {narrower_active_params:,} ({100*narrower_active_params/total_params:.1f}%)")
+            print(f"   Wider active: {wider_active_params:,} ({100*wider_active_params/total_params:.1f}%)")
+            print(f"   Shared (both tasks keep): {shared_params:,} ({100*shared_params/total_params:.1f}%)")
+            print(f"   Selfish (only one task keeps): {selfish_params:,} ({100*selfish_params/total_params:.1f}%)")
+            print(f"   (MergeVLA论文报告约75%参数为'selfish'，表明任务掩码有效)")
+        
         # 融合权重
         merged_state_dict = {}
         backbone_count = 0
@@ -1953,10 +2025,21 @@ class MergeVLAMerger:
             if k.startswith('backbone.'):
                 # 融合 backbone
                 merged = base_state_dict[k].clone()
-                if k in τ_narrower:
-                    merged = merged + self.narrower_weight * τ_narrower[k]
-                if k in τ_wider:
-                    merged = merged + self.wider_weight * τ_wider[k]
+                
+                if self.use_sparse_merge and k in τ_merge:
+                    # ⭐ MergeVLA Section 4.1: 使用稀疏掩码融合
+                    # 为简化，我们使用两个掩码的并集（保留任一任务认为重要的参数）
+                    # 也可以考虑使用加权平均的方式
+                    unified_mask = torch.max(S_narrower.get(k, torch.zeros_like(merged)), 
+                                             S_wider.get(k, torch.zeros_like(merged)))
+                    merged = merged + unified_mask * τ_merge[k]
+                else:
+                    # 简单线性插值（备选方案）
+                    if k in τ_narrower:
+                        merged = merged + self.narrower_weight * τ_narrower[k]
+                    if k in τ_wider:
+                        merged = merged + self.wider_weight * τ_wider[k]
+                
                 merged_state_dict[k] = merged
                 backbone_count += 1
             elif k.startswith('action_head.'):
@@ -1964,10 +2047,18 @@ class MergeVLAMerger:
                 if self.merge_action_head:
                     # 融合 action_head（GROOT 使用 cross-attention，可以尝试）
                     merged = base_state_dict[k].clone()
-                    if k in τ_narrower:
-                        merged = merged + self.narrower_weight * τ_narrower[k]
-                    if k in τ_wider:
-                        merged = merged + self.wider_weight * τ_wider[k]
+                    
+                    if self.use_sparse_merge and k in τ_merge:
+                        # ⭐ MergeVLA Section 4.1: 使用稀疏掩码融合
+                        unified_mask = torch.max(S_narrower.get(k, torch.zeros_like(merged)), 
+                                                 S_wider.get(k, torch.zeros_like(merged)))
+                        merged = merged + unified_mask * τ_merge[k]
+                    else:
+                        if k in τ_narrower:
+                            merged = merged + self.narrower_weight * τ_narrower[k]
+                        if k in τ_wider:
+                            merged = merged + self.wider_weight * τ_wider[k]
+                    
                     merged_state_dict[k] = merged
                 else:
                     # 使用 narrower 的 action_head（更安全）
@@ -1976,7 +2067,8 @@ class MergeVLAMerger:
             else:
                 merged_state_dict[k] = base_state_dict[k]
         
-        print(f"\n📊 Merging completed:")
+        merge_method = "Sparse Mask (Section 4.1)" if self.use_sparse_merge else "Linear Interpolation"
+        print(f"\n📊 Merging completed ({merge_method}):")
         print(f"   Backbone layers: {backbone_count} (merged)")
         print(f"   Action head layers: {action_head_count} ({'merged' if self.merge_action_head else 'using narrower'})")
         
