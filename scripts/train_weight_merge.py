@@ -1134,11 +1134,15 @@ def run_mergevla_merge(args):
         num_episodes=num_episodes,
     )
     
-    # 训练适配层
+    # 训练适配层（使用稳定训练配置）
     merger.train_adapter(
         train_dataloader=dataloader,
         num_epochs=args.adapter_epochs,
         learning_rate=args.adapter_lr,
+        warmup_ratio=getattr(args, 'warmup_ratio', 0.1),
+        use_cosine_schedule=getattr(args, 'use_cosine_schedule', True),
+        gradient_accumulation_steps=getattr(args, 'gradient_accumulation_steps', 1),
+        max_grad_norm=getattr(args, 'max_grad_norm', 1.0),
     )
     
     # 保存
@@ -1336,6 +1340,18 @@ def main():
                        help="Number of epochs to train the distribution adapter")
     parser.add_argument("--adapter_lr", type=float, default=1e-3,
                        help="Learning rate for adapter training (MergeVLA uses larger LR, default: 1e-3)")
+    
+    # ⭐ 稳定训练参数
+    parser.add_argument("--warmup_ratio", type=float, default=0.1,
+                       help="Warmup ratio (percentage of total steps for linear warmup, default: 0.1)")
+    parser.add_argument("--use_cosine_schedule", action="store_true", default=True,
+                       help="Use cosine learning rate schedule with warmup (default: True)")
+    parser.add_argument("--no_cosine_schedule", action="store_false", dest="use_cosine_schedule",
+                       help="Disable cosine learning rate schedule (use constant LR)")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1,
+                       help="Gradient accumulation steps for more stable training (default: 1)")
+    parser.add_argument("--max_grad_norm", type=float, default=1.0,
+                       help="Max gradient norm for clipping (default: 1.0)")
     
     # 设备
     parser.add_argument("--device", type=str, default="cuda:0",

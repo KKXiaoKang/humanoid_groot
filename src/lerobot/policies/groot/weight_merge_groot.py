@@ -2707,17 +2707,39 @@ class MergeVLAMerger:
         train_dataloader,
         num_epochs: int = 20,
         learning_rate: float = 1e-3,  # MergeVLA 使用较大的学习率
+        warmup_ratio: float = 0.1,    # 预热步数占比
+        use_cosine_schedule: bool = True,  # 使用 cosine 学习率衰减
+        gradient_accumulation_steps: int = 1,  # 梯度累积步数
+        max_grad_norm: float = 1.0,   # 梯度裁剪阈值
     ):
         """
         训练稀疏 LoRA 适配器（MergeVLA 风格）
         
         使用 action loss 来优化适配层
+        
+        ⭐ 稳定训练技巧：
+        1. 学习率预热 (warmup): 前 10% 步数线性预热
+        2. Cosine 学习率衰减: 平滑降低学习率
+        3. 梯度裁剪: 防止梯度爆炸
+        4. 梯度累积: 更稳定的梯度估计
         """
+        from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+        
+        # 计算总步数
+        total_steps = num_epochs * len(train_dataloader)
+        warmup_steps = int(total_steps * warmup_ratio)
+        
         print(f"\n{'='*60}")
-        print(f"🏋️ Training MergeVLA Adapter")
+        print(f"🏋️ Training MergeVLA Adapter (稳定训练模式)")
         print(f"   Epochs: {num_epochs}")
         print(f"   Learning rate: {learning_rate}")
         print(f"   Adapter type: {self.adapter_type}")
+        print(f"   ⭐ 稳定训练配置:")
+        print(f"      Total steps: {total_steps}")
+        print(f"      Warmup steps: {warmup_steps} ({warmup_ratio*100:.0f}%)")
+        print(f"      Cosine schedule: {use_cosine_schedule}")
+        print(f"      Gradient accumulation: {gradient_accumulation_steps}")
+        print(f"      Max grad norm: {max_grad_norm}")
         print(f"{'='*60}\n")
         
         optimizer = torch.optim.AdamW(
@@ -2725,18 +2747,50 @@ class MergeVLAMerger:
             lr=learning_rate,
             weight_decay=1e-4,
             betas=(0.9, 0.999),
+            eps=1e-8,
         )
         
-        # MergeVLA 使用固定学习率
-        scheduler = None
+        # ⭐ 学习率调度器：预热 + Cosine 衰减
+        if use_cosine_schedule and warmup_steps > 0:
+            # 线性预热
+            warmup_scheduler = LinearLR(
+                optimizer, 
+                start_factor=0.01,  # 从 1% 开始
+                end_factor=1.0, 
+                total_iters=warmup_steps
+            )
+            # Cosine 衰减
+            cosine_scheduler = CosineAnnealingLR(
+                optimizer, 
+                T_max=total_steps - warmup_steps,
+                eta_min=learning_rate * 0.01,  # 最小学习率 = 初始的 1%
+            )
+            # 组合调度器
+            scheduler = SequentialLR(
+                optimizer, 
+                schedulers=[warmup_scheduler, cosine_scheduler],
+                milestones=[warmup_steps]
+            )
+        elif use_cosine_schedule:
+            scheduler = CosineAnnealingLR(
+                optimizer, 
+                T_max=total_steps,
+                eta_min=learning_rate * 0.01,
+            )
+        else:
+            scheduler = None
         
         self.merged_model.train()
+        global_step = 0
+        accumulated_loss = 0.0
         
         for epoch in range(num_epochs):
             epoch_losses = []
             
             for batch_idx, batch in enumerate(train_dataloader):
-                optimizer.zero_grad()
+                # 梯度累积：只在累积完成后清零
+                if batch_idx % gradient_accumulation_steps == 0:
+                    optimizer.zero_grad()
                 
                 # 准备输入
                 observation = self._prepare_observation(batch)
@@ -2779,6 +2833,10 @@ class MergeVLAMerger:
                     
                     loss = outputs_dict['loss']
                     
+                    # 梯度累积：缩放 loss
+                    if gradient_accumulation_steps > 1:
+                        loss = loss / gradient_accumulation_steps
+                    
                 except Exception as e:
                     if batch_idx == 0:
                         print(f"   ⚠️ Forward failed: {e}")
@@ -2794,20 +2852,33 @@ class MergeVLAMerger:
                 
                 # 反向传播
                 loss.backward()
+                accumulated_loss += loss.item()
                 
-                # 梯度裁剪
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    self.merged_model.adapter.parameters(),
-                    max_norm=1.0,
-                )
-                
-                optimizer.step()
-                epoch_losses.append(loss.item())
-                
-                if batch_idx % 10 == 0:
-                    current_lr = optimizer.param_groups[0]['lr']
-                    print(f"   Epoch {epoch+1}/{num_epochs}, Batch {batch_idx}: "
-                          f"loss = {loss.item():.4f}, grad_norm = {grad_norm:.4f}, lr = {current_lr:.2e}")
+                # 梯度累积：只在累积完成后更新
+                if (batch_idx + 1) % gradient_accumulation_steps == 0:
+                    # 梯度裁剪
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        self.merged_model.adapter.parameters(),
+                        max_norm=max_grad_norm,
+                    )
+                    
+                    optimizer.step()
+                    
+                    # 更新学习率
+                    if scheduler is not None:
+                        scheduler.step()
+                    
+                    global_step += 1
+                    
+                    # 记录实际 loss（还原累积的平均）
+                    actual_loss = accumulated_loss * gradient_accumulation_steps
+                    epoch_losses.append(actual_loss)
+                    accumulated_loss = 0.0
+                    
+                    if global_step % 10 == 0:
+                        current_lr = optimizer.param_groups[0]['lr']
+                        print(f"   Epoch {epoch+1}/{num_epochs}, Step {global_step}: "
+                              f"loss = {actual_loss:.4f}, grad_norm = {grad_norm:.4f}, lr = {current_lr:.2e}")
             
             if epoch_losses:
                 avg_loss = sum(epoch_losses) / len(epoch_losses)

@@ -95,15 +95,19 @@ python scripts/train_weight_merge.py \
     --lora_rank 32 \
     --sparsity 0.6 \
     --adapter_epochs 100 \
-    --adapter_lr 1e-3 \
+    --adapter_lr 5e-5 \
     --batch_size 64 \
     --device "${DEVICE}" \
     --use_default_datasets \
     --use_moe \
     --episode-based \
-    --num-episodes 120 \
+    --num-episodes 32 \
     --use_sparse_merge \
-    --sparse_merge_lambda 1.0
+    --sparse_merge_lambda 1.0 \
+    --warmup_ratio 0.1 \
+    --use_cosine_schedule \
+    --gradient_accumulation_steps 4 \
+    --max_grad_norm 1.0
 
 echo ""
 echo "=========================================="
