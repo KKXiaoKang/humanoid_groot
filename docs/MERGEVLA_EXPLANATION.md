@@ -9,10 +9,11 @@ MergeVLA 是基于论文 [MergeVLA: Cross-Skill Model Merging Toward a Generalis
 **核心创新**：
 1. **参数级稀疏掩码融合**（Section 4.1）：通过任务掩码解决参数冲突问题
 2. **Sparse LoRA Adapter**：用于特征层面的分布对齐和动态任务路由
+3. **🆕 MoE Action Head**：保留每个任务独立的 Action Head (DiT)，通过 Smart Routing 选择专家
 
 ---
 
-## 融合后的模型架构图
+## 融合后的模型架构图（MoE 模式）
 
 ### 完整数据流和模块结构
 
@@ -47,53 +48,38 @@ graph TB
         BackboneOut["backbone_features<br/>B x T x 2048"]
     end
 
-    subgraph SparseLoRA["★ Sparse LoRA Adapter<br/>🆕 新增组件 (训练得到)"]
+    subgraph SparseLoRA["★ Sparse LoRA Adapter + Smart Routing<br/>🆕 新增组件 (训练得到)"]
         subgraph LoRAParams["LoRA 参数"]
-            LoRA_A["lora_A<br/>(2, 2048, 16)<br/>2个任务的下投影"]
-            LoRA_B["lora_B<br/>(2, 16, 2048)<br/>2个任务的上投影"]
-            TaskMasks["task_masks<br/>(2, 2048)<br/>稀疏掩码 sparsity=0.5"]
-            ResScale["residual_scale<br/>≈1.01"]
+            LoRA_A["lora_A<br/>(2, 2048, 32)<br/>2个任务的下投影"]
+            LoRA_B["lora_B<br/>(2, 32, 2048)<br/>2个任务的上投影"]
+            TaskMasks["task_masks<br/>(2, 2048)<br/>稀疏掩码 sparsity=0.6"]
+            ResScale["residual_scale<br/>≤0.1 (限制)"]
         end
         
-        subgraph LoRACompute["推理计算"]
-            LoRAAvg["任务平均:<br/>output = x + scale × Σ(A×mask×B)/2"]
+        subgraph SmartRouting["⭐ Smart Routing (Test-Time)"]
+            RouteCompute["计算路由分数:<br/>score[t] = ||x @ (A[t]×mask[t])||"]
+            RouteSelect["选择最高分任务<br/>或使用固定 task_type"]
         end
         
         AdaptedOut["adapted_features<br/>B x T x 2048<br/>分布已调整"]
     end
 
-    subgraph ActionHead["FlowmatchingActionHead<br/>📦 来自 narrower (未融合)"]
-        subgraph ProcessBackbone["process_backbone_output"]
-            VLLN["vlln: LayerNorm<br/>📦 narrower权重"]
-            VLSA["vl_self_attention<br/>📦 narrower权重<br/>4层 Transformer"]
+    subgraph MoEActionHead["⭐ MoE Action Head<br/>🆕 混合专家架构"]
+        subgraph ExpertRouter["Expert Router (专家路由)"]
+            RouteWeight["routing_weights<br/>来自 Sparse LoRA"]
         end
         
-        subgraph Projectors["投影层 (narrower)"]
-            StateEnc["State Encoder<br/>📦 narrower权重<br/>64 → 1024 → 1536"]
-            ActionEnc["Action Encoder<br/>📦 narrower权重<br/>32 → 1536"]
-            FutureTok["Future Tokens<br/>📦 narrower权重<br/>Embedding(32, 1536)"]
+        subgraph Expert0["Expert 0: Narrower<br/>🟠 独立 Action Head"]
+            DiT0["DiT (narrower)<br/>16层 DiT Blocks<br/>📦 narrower权重"]
+            Dec0["Decoder (narrower)<br/>📦 narrower权重"]
         end
         
-        DiTInput["拼接输入 sa_embs<br/>state + future + action<br/>B x (1+32+T) x 1536"]
-        
-        subgraph DiT["DiT (narrower)"]
-            subgraph DiTBlocks["16层 DiT Blocks<br/>📦 narrower权重"]
-                DiT1["DiT Block 1<br/>Cross-Attn + Self-Attn"]
-                DiT2["DiT Block 2<br/>Self-Attn only"]
-                DiTDots["..."]
-                DiT16["DiT Block 16"]
-            end
-            
-            DiTOut["输出投影<br/>📦 narrower权重<br/>1536 → 1024"]
+        subgraph Expert1["Expert 1: Wider<br/>🟣 独立 Action Head"]
+            DiT1["DiT (wider)<br/>16层 DiT Blocks<br/>📦 wider权重"]
+            Dec1["Decoder (wider)<br/>📦 wider权重"]
         end
         
-        subgraph Decoders["解码器 (narrower)"]
-            SharedLayer["共享底层特征<br/>📦 narrower权重<br/>1024 → 1024"]
-            CrossAttnArm["交叉注意力<br/>📦 narrower权重<br/>左↔右手"]
-            LeftOut["Left Output<br/>📦 narrower权重<br/>1024 → 7"]
-            RightOut["Right Output<br/>📦 narrower权重<br/>1024 → 7"]
-            ClawDec["Claw Decoder<br/>📦 narrower权重<br/>1024 → 2"]
-        end
+        MoEOutput["MoE Output<br/>选择对应专家输出<br/>或加权融合"]
     end
 
     subgraph Output["输出 Output"]
@@ -116,52 +102,51 @@ graph TB
     EagleLinear --> BackboneOut
     
     BackboneOut --> LoRA_A
-    BackboneOut --> LoRAAvg
-    LoRA_A --> LoRAAvg
-    LoRA_B --> LoRAAvg
-    TaskMasks --> LoRAAvg
-    ResScale --> LoRAAvg
-    LoRAAvg --> AdaptedOut
+    BackboneOut --> RouteCompute
+    LoRA_A --> RouteCompute
+    TaskMasks --> RouteCompute
+    RouteCompute --> RouteSelect
+    RouteSelect --> RouteWeight
     
-    AdaptedOut --> VLLN
-    VLLN --> VLSA
+    BackboneOut --> AdaptedOut
+    LoRA_A --> AdaptedOut
+    LoRA_B --> AdaptedOut
+    TaskMasks --> AdaptedOut
+    ResScale --> AdaptedOut
     
-    STATE --> StateEnc
-    ACTION --> ActionEnc
-    StateEnc --> DiTInput
-    FutureTok --> DiTInput
-    ActionEnc --> DiTInput
+    AdaptedOut --> DiT0
+    AdaptedOut --> DiT1
+    STATE --> Expert0
+    STATE --> Expert1
+    ACTION --> Expert0
+    ACTION --> Expert1
     
-    VLSA -->|encoder_hidden_states| DiT
-    DiTInput -->|hidden_states| DiT
-    DiT --> DiT1
-    DiT1 --> DiT2
-    DiT2 --> DiTDots
-    DiTDots --> DiT16
-    DiT16 --> DiTOut
+    RouteWeight --> MoEOutput
+    DiT0 --> Dec0
+    DiT1 --> Dec1
+    Dec0 --> MoEOutput
+    Dec1 --> MoEOutput
     
-    DiTOut --> SharedLayer
-    SharedLayer --> CrossAttnArm
-    CrossAttnArm --> LeftOut
-    CrossAttnArm --> RightOut
-    DiTOut --> ClawDec
-    
-    LeftOut --> LeftArmOut
-    RightOut --> RightArmOut
-    ClawDec --> ClawOut
+    MoEOutput --> LeftArmOut
+    MoEOutput --> RightArmOut
+    MoEOutput --> ClawOut
     LeftArmOut --> ACTIONS
     RightArmOut --> ACTIONS
     ClawOut --> ACTIONS
 
     classDef merged fill:#e8f5e9,stroke:#2e7d32,stroke-width:3px
     classDef narrower fill:#fff3e0,stroke:#e65100,stroke-width:2px
+    classDef wider fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px
     classDef adapter fill:#e1f5fe,stroke:#0277bd,stroke-width:3px
-    classDef input fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px
+    classDef moe fill:#ffebee,stroke:#c62828,stroke-width:3px
+    classDef input fill:#eceff1,stroke:#37474f,stroke-width:2px
     classDef output fill:#fce4ec,stroke:#c2185b,stroke-width:2px
     
     class SigLip,MLP1,VitEmbeds,Tokenizer,TextEmbeds,LLM,SelectLayer,EagleLinear,BackboneOut merged
-    class VLLN,VLSA,StateEnc,ActionEnc,FutureTok,DiT1,DiT2,DiT16,DiTOut,SharedLayer,CrossAttnArm,LeftOut,RightOut,ClawDec narrower
-    class LoRA_A,LoRA_B,TaskMasks,ResScale,LoRAAvg,AdaptedOut adapter
+    class DiT0,Dec0 narrower
+    class DiT1,Dec1 wider
+    class LoRA_A,LoRA_B,TaskMasks,ResScale,RouteCompute,RouteSelect,AdaptedOut adapter
+    class RouteWeight,MoEOutput,ExpertRouter moe
     class IMG,TXT,STATE,ACTION input
     class LeftArmOut,RightArmOut,ClawOut,ACTIONS output
 ```
@@ -170,15 +155,17 @@ graph TB
 
 | 颜色 | 含义 |
 |------|------|
-| 🟢 绿色边框 | **融合权重** (0.5×narrower + 0.5×wider) |
-| 🟠 橙色边框 | **narrower 权重** (未融合，直接使用) |
-| 🔵 蓝色边框 | **Sparse LoRA Adapter** (新增，训练得到) |
-| 🟣 紫色边框 | 输入数据 |
-| 🔴 粉色边框 | 输出数据 |
+| 🟢 绿色边框 | **融合权重** (0.5×narrower + 0.5×wider) - Backbone |
+| 🟠 橙色边框 | **narrower 专家** (Expert 0) - Action Head |
+| 🟣 紫色边框 | **wider 专家** (Expert 1) - Action Head |
+| 🔵 蓝色边框 | **Sparse LoRA Adapter + Smart Routing** (新增，训练得到) |
+| 🔴 红色边框 | **MoE 路由层** (选择/融合专家输出) |
+| ⬜ 灰色边框 | 输入数据 |
+| 🌸 粉色边框 | 输出数据 |
 
 ---
 
-### Sparse LoRA Adapter 详细结构
+### Sparse LoRA Adapter + Smart Routing 详细结构
 
 ```mermaid
 graph LR
@@ -188,30 +175,40 @@ graph LR
     
     subgraph SparseLoRA["Sparse LoRA Adapter"]
         subgraph Task0["任务0 (narrower)"]
-            A0["lora_A[0]<br/>2048 x 16"]
-            M0["task_masks[0]<br/>2048<br/>~50%激活"]
-            B0["lora_B[0]<br/>16 x 2048"]
+            A0["lora_A[0]<br/>2048 x 32"]
+            M0["task_masks[0]<br/>2048<br/>~60%激活"]
+            B0["lora_B[0]<br/>32 x 2048"]
             Compute0["x @ (A×mask) @ B"]
         end
         
         subgraph Task1["任务1 (wider)"]
-            A1["lora_A[1]<br/>2048 x 16"]
-            M1["task_masks[1]<br/>2048<br/>~50%激活"]
-            B1["lora_B[1]<br/>16 x 2048"]
+            A1["lora_A[1]<br/>2048 x 32"]
+            M1["task_masks[1]<br/>2048<br/>~60%激活"]
+            B1["lora_B[1]<br/>32 x 2048"]
             Compute1["x @ (A×mask) @ B"]
         end
         
-        Avg["平均: (out0 + out1) / 2"]
-        Scale["× (alpha/rank) × residual_scale"]
+        subgraph SmartRoute["⭐ Smart Routing"]
+            Score0["score0 = ||x @ A0_norm||"]
+            Score1["score1 = ||x @ A1_norm||"]
+            Softmax["softmax(scores/τ)"]
+            TaskID["task_id = argmax"]
+        end
+        
+        Select["根据 task_id 选择<br/>或使用固定路由"]
+        Scale["× (alpha/rank) × residual_scale<br/>⚠️ residual_scale ≤ 0.1"]
         Residual["残差: x + scaled_output"]
     end
     
     subgraph Output["输出"]
         Y["adapted_features<br/>B x T x 2048"]
+        TID["task_id<br/>用于 MoE 路由"]
     end
     
     X --> A0
     X --> A1
+    X --> Score0
+    X --> Score1
     X --> Residual
     
     A0 --> M0
@@ -222,77 +219,216 @@ graph LR
     M1 --> Compute1
     B1 --> Compute1
     
-    Compute0 --> Avg
-    Compute1 --> Avg
-    Avg --> Scale
+    A0 --> Score0
+    A1 --> Score1
+    M0 --> Score0
+    M1 --> Score1
+    Score0 --> Softmax
+    Score1 --> Softmax
+    Softmax --> TaskID
+    
+    TaskID --> Select
+    Compute0 --> Select
+    Compute1 --> Select
+    Select --> Scale
     Scale --> Residual
     Residual --> Y
+    TaskID --> TID
     
     classDef task0 fill:#e3f2fd,stroke:#1565c0
     classDef task1 fill:#fce4ec,stroke:#c2185b
+    classDef routing fill:#e8f5e9,stroke:#2e7d32
     classDef common fill:#f5f5f5,stroke:#616161
     
     class A0,M0,B0,Compute0 task0
     class A1,M1,B1,Compute1 task1
-    class Avg,Scale,Residual common
+    class Score0,Score1,Softmax,TaskID,SmartRoute routing
+    class Select,Scale,Residual common
 ```
 
 ---
 
-### 权重来源对照表
+### ⭐ MoE Action Head 详细结构
+
+```mermaid
+graph TB
+    subgraph Input["输入"]
+        AdaptedFeat["adapted_features<br/>B x T x 2048"]
+        TaskID["task_id<br/>来自 Smart Routing"]
+        StateIn["robot_state<br/>B x 64"]
+        ActionIn["noisy_action<br/>B x T x 16"]
+    end
+    
+    subgraph MoEHead["MoE Action Head"]
+        subgraph Expert0["Expert 0: Narrower"]
+            subgraph AH0Proc["process_backbone"]
+                VLLN0["vlln<br/>📦 narrower"]
+                VLSA0["vl_self_attention<br/>📦 narrower"]
+            end
+            subgraph AH0Proj["projectors"]
+                StateEnc0["state_encoder<br/>📦 narrower"]
+                ActionEnc0["action_encoder<br/>📦 narrower"]
+                FutureTok0["future_tokens<br/>📦 narrower"]
+            end
+            subgraph AH0DiT["DiT"]
+                DiTBlocks0["16层 DiT Blocks<br/>📦 narrower权重"]
+            end
+            subgraph AH0Dec["decoders"]
+                ArmDec0["arm_decoder<br/>📦 narrower"]
+                ClawDec0["claw_decoder<br/>📦 narrower"]
+            end
+            Out0["action_pred_0<br/>B x T x 16"]
+        end
+        
+        subgraph Expert1["Expert 1: Wider"]
+            subgraph AH1Proc["process_backbone"]
+                VLLN1["vlln<br/>📦 wider"]
+                VLSA1["vl_self_attention<br/>📦 wider"]
+            end
+            subgraph AH1Proj["projectors"]
+                StateEnc1["state_encoder<br/>📦 wider"]
+                ActionEnc1["action_encoder<br/>📦 wider"]
+                FutureTok1["future_tokens<br/>📦 wider"]
+            end
+            subgraph AH1DiT["DiT"]
+                DiTBlocks1["16层 DiT Blocks<br/>📦 wider权重"]
+            end
+            subgraph AH1Dec["decoders"]
+                ArmDec1["arm_decoder<br/>📦 wider"]
+                ClawDec1["claw_decoder<br/>📦 wider"]
+            end
+            Out1["action_pred_1<br/>B x T x 16"]
+        end
+        
+        subgraph Router["Expert Router"]
+            RouteLogic["if task_id == 0:<br/>  output = Out0<br/>elif task_id == 1:<br/>  output = Out1<br/>else (soft routing):<br/>  output = w0×Out0 + w1×Out1"]
+        end
+    end
+    
+    subgraph Output["输出"]
+        FinalAction["final_action_pred<br/>B x T x 16"]
+    end
+    
+    AdaptedFeat --> VLLN0
+    AdaptedFeat --> VLLN1
+    VLLN0 --> VLSA0
+    VLLN1 --> VLSA1
+    
+    StateIn --> StateEnc0
+    StateIn --> StateEnc1
+    ActionIn --> ActionEnc0
+    ActionIn --> ActionEnc1
+    
+    VLSA0 --> DiTBlocks0
+    StateEnc0 --> DiTBlocks0
+    ActionEnc0 --> DiTBlocks0
+    FutureTok0 --> DiTBlocks0
+    
+    VLSA1 --> DiTBlocks1
+    StateEnc1 --> DiTBlocks1
+    ActionEnc1 --> DiTBlocks1
+    FutureTok1 --> DiTBlocks1
+    
+    DiTBlocks0 --> ArmDec0
+    DiTBlocks0 --> ClawDec0
+    ArmDec0 --> Out0
+    ClawDec0 --> Out0
+    
+    DiTBlocks1 --> ArmDec1
+    DiTBlocks1 --> ClawDec1
+    ArmDec1 --> Out1
+    ClawDec1 --> Out1
+    
+    TaskID --> RouteLogic
+    Out0 --> RouteLogic
+    Out1 --> RouteLogic
+    RouteLogic --> FinalAction
+    
+    classDef expert0 fill:#fff3e0,stroke:#e65100
+    classDef expert1 fill:#f3e5f5,stroke:#7b1fa2
+    classDef router fill:#ffebee,stroke:#c62828
+    classDef input fill:#e3f2fd,stroke:#1565c0
+    classDef output fill:#e8f5e9,stroke:#2e7d32
+    
+    class VLLN0,VLSA0,StateEnc0,ActionEnc0,FutureTok0,DiTBlocks0,ArmDec0,ClawDec0,Out0 expert0
+    class VLLN1,VLSA1,StateEnc1,ActionEnc1,FutureTok1,DiTBlocks1,ArmDec1,ClawDec1,Out1 expert1
+    class RouteLogic,Router router
+    class AdaptedFeat,TaskID,StateIn,ActionIn input
+    class FinalAction output
+```
+
+---
+
+### 权重来源对照表（MoE 模式）
 
 ```mermaid
 graph TB
     subgraph Legend["权重来源"]
-        L1["🔀 融合 = 0.5×narrower + 0.5×wider"]
-        L2["📦 narrower = 直接使用 narrower 权重"]
-        L3["🆕 新增 = 训练得到的适配层"]
+        L1["🔀 融合 = 0.5×narrower + 0.5×wider (Backbone)"]
+        L2["📦 narrower = Expert 0 的 Action Head 权重"]
+        L3["📦 wider = Expert 1 的 Action Head 权重"]
+        L4["🆕 新增 = 训练得到的适配层"]
     end
     
-    subgraph Backbone["EagleBackbone"]
+    subgraph Backbone["EagleBackbone (融合)"]
         B1["vision_model 🔀"]
         B2["mlp1 🔀"]
         B3["language_model 🔀"]
         B4["eagle_linear 🔀"]
     end
     
-    subgraph Adapter["Sparse LoRA Adapter"]
-        AD1["lora_A 🆕"]
-        AD2["lora_B 🆕"]
-        AD3["task_masks 🆕"]
-        AD4["residual_scale 🆕"]
+    subgraph Adapter["Sparse LoRA Adapter + Smart Routing"]
+        AD1["lora_A (2, 2048, 32) 🆕"]
+        AD2["lora_B (2, 32, 2048) 🆕"]
+        AD3["task_masks (2, 2048) 🆕"]
+        AD4["residual_scale (≤0.1) 🆕"]
     end
     
-    subgraph ActionHead["FlowmatchingActionHead"]
-        AH1["vlln 📦"]
-        AH2["vl_self_attention 📦"]
-        AH3["state_encoder 📦"]
-        AH4["action_encoder 📦"]
-        AH5["future_tokens 📦"]
-        AH6["DiT (16层) 📦"]
-        AH7["arm_decoder 📦"]
-        AH8["claw_decoder 📦"]
+    subgraph MoE["⭐ MoE Action Head"]
+        subgraph Expert0["Expert 0 (narrower)"]
+            E0_1["vlln 📦 narrower"]
+            E0_2["vl_self_attention 📦 narrower"]
+            E0_3["state_encoder 📦 narrower"]
+            E0_4["action_encoder 📦 narrower"]
+            E0_5["future_tokens 📦 narrower"]
+            E0_6["DiT (16层) 📦 narrower"]
+            E0_7["arm_decoder 📦 narrower"]
+            E0_8["claw_decoder 📦 narrower"]
+        end
+        
+        subgraph Expert1["Expert 1 (wider)"]
+            E1_1["vlln 📦 wider"]
+            E1_2["vl_self_attention 📦 wider"]
+            E1_3["state_encoder 📦 wider"]
+            E1_4["action_encoder 📦 wider"]
+            E1_5["future_tokens 📦 wider"]
+            E1_6["DiT (16层) 📦 wider"]
+            E1_7["arm_decoder 📦 wider"]
+            E1_8["claw_decoder 📦 wider"]
+        end
     end
     
     classDef merged fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
     classDef narrower fill:#fff3e0,stroke:#e65100,stroke-width:2px
+    classDef wider fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px
     classDef adapter fill:#e1f5fe,stroke:#0277bd,stroke-width:2px
     
     class B1,B2,B3,B4 merged
     class AD1,AD2,AD3,AD4 adapter
-    class AH1,AH2,AH3,AH4,AH5,AH6,AH7,AH8 narrower
+    class E0_1,E0_2,E0_3,E0_4,E0_5,E0_6,E0_7,E0_8 narrower
+    class E1_1,E1_2,E1_3,E1_4,E1_5,E1_6,E1_7,E1_8 wider
 ```
 
 ---
 
-### 推理时的数据流
+### 推理时的数据流（MoE 模式）
 
 ```mermaid
 sequenceDiagram
     participant IMG as 图像
     participant BB as Backbone<br/>(融合)
-    participant SLA as Sparse LoRA<br/>Adapter
-    participant AH as Action Head<br/>(narrower)
+    participant SLA as Sparse LoRA<br/>+ Smart Routing
+    participant MoE as MoE Action Head<br/>(2个专家)
     participant OUT as 动作输出
 
     IMG->>BB: 1. 输入图像+文本+状态
@@ -301,23 +437,29 @@ sequenceDiagram
     BB->>BB: 3. LLM 编码 (12层)
     BB->>SLA: 4. backbone_features (2048维)
     
-    Note over SLA: ★ 关键步骤
-    SLA->>SLA: 5a. 计算 narrower LoRA: x@A0@B0
-    SLA->>SLA: 5b. 计算 wider LoRA: x@A1@B1
-    SLA->>SLA: 5c. 平均: (out0+out1)/2
-    SLA->>SLA: 5d. 残差: x + scale×avg
-    SLA->>AH: 6. adapted_features (2048维)
+    Note over SLA: ★ 关键步骤: Adapter + Routing
+    SLA->>SLA: 5a. Smart Routing: 计算路由分数
+    SLA->>SLA: 5b. 选择 task_id (或使用固定路由)
+    SLA->>SLA: 5c. 应用对应任务的 LoRA
+    SLA->>SLA: 5d. 残差: x + scale×lora_out
+    SLA->>MoE: 6. adapted_features + task_id
     
-    Note over AH: 使用 narrower 权重<br/>但输入已被适配层"翻译"
-    AH->>AH: 7. vl_self_attention
-    AH->>AH: 8. DiT 生成动作
-    AH->>AH: 9. Decoder 解码
-    AH->>OUT: 10. 动作预测 (16维)
+    Note over MoE: ⭐ MoE 专家选择
+    alt task_id == 0 (narrower)
+        MoE->>MoE: 7a. Expert 0 (narrower) 处理
+    else task_id == 1 (wider)
+        MoE->>MoE: 7b. Expert 1 (wider) 处理
+    else soft routing
+        MoE->>MoE: 7c. 两个专家加权融合
+    end
+    MoE->>MoE: 8. DiT 生成动作
+    MoE->>MoE: 9. Decoder 解码
+    MoE->>OUT: 10. 动作预测 (16维)
 ```
 
 ---
 
-### 关键维度变化表
+### 关键维度变化表（MoE 模式）
 
 | 位置 | 模块 | 输入维度 | 输出维度 | 权重来源 |
 |------|------|---------|---------|----------|
@@ -326,77 +468,130 @@ sequenceDiagram
 | mlp1 | Linear | VIT_dim | 2048 | 🔀 融合 |
 | LLM | Qwen3-1.5B | B×T×vocab | B×T×2048 | 🔀 融合 |
 | eagle_linear | Linear/Identity | 2048 | 2048 | 🔀 融合 |
-| **Sparse LoRA Adapter (新增)** |
-| lora_A | Parameter | (2, 2048, 16) | - | 🆕 训练 |
-| lora_B | Parameter | (2, 16, 2048) | - | 🆕 训练 |
+| **Sparse LoRA Adapter + Smart Routing (新增)** |
+| lora_A | Parameter | (2, 2048, 32) | - | 🆕 训练 |
+| lora_B | Parameter | (2, 32, 2048) | - | 🆕 训练 |
 | task_masks | Parameter | (2, 2048) | - | 🆕 训练 |
+| residual_scale | Parameter | (1,) ≤ 0.1 | - | 🆕 训练 |
+| Smart Routing | 计算路由分数 | B×T×2048 | task_id | 🆕 |
 | 整体变换 | x + LoRA(x) | B×T×2048 | B×T×2048 | 🆕 训练 |
-| **FlowmatchingActionHead (narrower)** |
+| **⭐ MoE Action Head (2个专家)** |
+| **Expert 0 (narrower)** |
 | vlln | LayerNorm | B×T×2048 | B×T×2048 | 📦 narrower |
 | vl_self_attention | SelfAttn×4 | B×T×2048 | B×T×2048 | 📦 narrower |
 | State Encoder | CategoryMLP | B×64 | B×1×1536 | 📦 narrower |
 | Action Encoder | MultiEmbMLP | B×T×32 | B×T×1536 | 📦 narrower |
-| Future Tokens | Embedding | - | B×32×1536 | 📦 narrower |
+| Future Tokens | Embedding | - | B×64×1536 | 📦 narrower |
 | DiT (16层) | Transformer | B×S×1536 | B×S×1024 | 📦 narrower |
 | Arm Decoder | SharedBottom | B×T×1024 | B×T×14 | 📦 narrower |
 | Claw Decoder | CategoryMLP | B×T×1024 | B×T×2 | 📦 narrower |
+| **Expert 1 (wider)** |
+| vlln | LayerNorm | B×T×2048 | B×T×2048 | 📦 wider |
+| vl_self_attention | SelfAttn×4 | B×T×2048 | B×T×2048 | 📦 wider |
+| State Encoder | CategoryMLP | B×64 | B×1×1536 | 📦 wider |
+| Action Encoder | MultiEmbMLP | B×T×32 | B×T×1536 | 📦 wider |
+| Future Tokens | Embedding | - | B×64×1536 | 📦 wider |
+| DiT (16层) | Transformer | B×S×1536 | B×S×1024 | 📦 wider |
+| Arm Decoder | SharedBottom | B×T×1024 | B×T×14 | 📦 wider |
+| Claw Decoder | CategoryMLP | B×T×1024 | B×T×2 | 📦 wider |
 
-### 参数量统计
+### 参数量统计（MoE 模式）
 
 | 组件 | 参数量 | 来源 |
 |------|--------|------|
 | EagleBackbone (融合) | ~3B | 🔀 0.5×narrower + 0.5×wider |
-| Sparse LoRA Adapter | **135,170** | 🆕 训练得到 |
-| └─ lora_A | 65,536 (2×2048×16) | |
-| └─ lora_B | 65,536 (2×16×2048) | |
+| Sparse LoRA Adapter | **~266K** | 🆕 训练得到 |
+| └─ lora_A | 131,072 (2×2048×32) | |
+| └─ lora_B | 131,072 (2×32×2048) | |
 | └─ task_masks | 4,096 (2×2048) | |
-| └─ residual_scale | 2 | |
-| FlowmatchingActionHead | ~750M | 📦 narrower |
-| **总计** | ~3.75B + 135K | |
+| └─ residual_scale | 1 | |
+| **⭐ MoE Action Head** | **~1.5B** | 📦 2个专家 |
+| └─ Expert 0 (narrower) | ~750M | 📦 narrower |
+| └─ Expert 1 (wider) | ~750M | 📦 wider |
+| **总计** | **~4.5B + 266K** | |
 
-**适配层仅占总参数量的 0.0036%**，但它是连接融合 backbone 和 narrower action head 的关键！
+**MoE 模式 vs 单专家模式**：
+- 单专家模式：~3.75B 参数（只有 narrower action head）
+- MoE 模式：**~4.5B 参数**（两个完整的 action head）
+- 增加 ~750M 参数，但**保留了两个任务的完整动作生成能力**！
+
+**适配层仅占总参数量的 0.006%**，但它负责 Smart Routing 和特征分布对齐！
 
 ---
 
-## 为什么 DiT 使用 narrower 权重却能处理 wider 任务？
+## ⭐ MoE 模式：为什么每个任务都有独立的专家？
 
-这是因为 **适配层学会了如何调整 backbone 输出的分布**，使其适配 narrower 的 DiT：
+在之前的单专家模式中，只保留 narrower 的 DiT，依赖适配层"翻译"wider 特征。但实验发现 **wider 任务的动作能力被严重削弱**。
+
+### MoE 模式的解决方案
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                        推理时的数据流                                    │
+│                   ⭐ MoE 模式推理数据流                                   │
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                         │
-│  Wider 任务的图像输入                                                    │
+│  任务图像输入 (可能是 narrower 或 wider 箱子)                            │
 │         ↓                                                               │
 │  ┌─────────────────────────────────────────────────────────────────┐   │
 │  │  融合的 Backbone (0.5×narrower + 0.5×wider)                     │   │
-│  │  ✅ 已经学会了 wider 任务的视觉表示！                              │   │
+│  │  ✅ 已经学会了两种任务的视觉表示！                                 │   │
 │  └─────────────────────────────────────────────────────────────────┘   │
-│         ↓ backbone_features (包含 wider 任务的信息)                     │
+│         ↓ backbone_features (包含任务信息)                              │
 │  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │  ★ Sparse LoRA Adapter                                          │   │
-│  │  ✅ 学会了将 wider 风格的特征 → 转换为 narrower DiT 能理解的格式    │   │
+│  │  ★ Sparse LoRA Adapter + Smart Routing                          │   │
 │  │                                                                  │   │
-│  │  关键：训练时使用了两种任务的数据！                                 │   │
-│  │  - narrower 数据 → task_id=0 → 激活 task_mask[0]                  │   │
-│  │  - wider 数据 → task_id=1 → 激活 task_mask[1]                     │   │
+│  │  1️⃣ Smart Routing: 根据特征自动识别任务类型                       │   │
+│  │     score[0] = ||x @ A[0]_norm||  (narrower 相关性)              │   │
+│  │     score[1] = ||x @ A[1]_norm||  (wider 相关性)                 │   │
+│  │     task_id = argmax(softmax(scores / τ))                       │   │
+│  │                                                                  │   │
+│  │  2️⃣ 特征适配: 应用对应任务的 LoRA 变换                            │   │
+│  │     adapted = x + scale × (x @ A[task_id] × mask[task_id] @ B)  │   │
 │  └─────────────────────────────────────────────────────────────────┘   │
-│         ↓ adapted_features (分布已调整，适配 narrower DiT)              │
+│         ↓ adapted_features + task_id                                    │
 │  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │  DiT Action Head (narrower 权重)                                 │   │
-│  │  ✅ 虽然是 narrower 权重，但接收的特征已经被适配层"翻译"过了       │   │
+│  │  ⭐ MoE Action Head                                              │   │
+│  │                                                                  │   │
+│  │  ┌─────────────────┐      ┌─────────────────┐                   │   │
+│  │  │  Expert 0       │      │  Expert 1       │                   │   │
+│  │  │  (narrower)     │      │  (wider)        │                   │   │
+│  │  │  📦 完整的      │      │  📦 完整的      │                   │   │
+│  │  │  action_head    │      │  action_head    │                   │   │
+│  │  └────────┬────────┘      └────────┬────────┘                   │   │
+│  │           │                        │                            │   │
+│  │           └────────┬───────────────┘                            │   │
+│  │                    ↓                                            │   │
+│  │           ┌────────────────┐                                    │   │
+│  │           │ Expert Router  │                                    │   │
+│  │           │ if task_id==0: │                                    │   │
+│  │           │   use Expert 0 │                                    │   │
+│  │           │ else:          │                                    │   │
+│  │           │   use Expert 1 │                                    │   │
+│  │           └────────────────┘                                    │   │
 │  └─────────────────────────────────────────────────────────────────┘   │
 │         ↓                                                               │
-│  正确的 wider 任务动作输出                                               │
+│  正确的动作输出 (由对应专家生成)                                          │
 │                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
+### MoE 模式 vs 单专家模式
+
+| 特性 | 单专家模式 | MoE 模式 |
+|------|-----------|----------|
+| Action Head | 只有 narrower | narrower + wider 两个专家 |
+| 参数量 | ~3.75B | ~4.5B (+750M) |
+| narrower 任务 | ✅ 正常 | ✅ Expert 0 处理 |
+| wider 任务 | ⚠️ 依赖适配层翻译，效果受限 | ✅ Expert 1 处理 |
+| 路由方式 | 无需路由 | Smart Routing 或固定路由 |
+| 核心优势 | 参数少 | **保留完整的任务能力** |
+
 **简单类比**：
 - Backbone = 眼睛（融合后能同时"看懂"两种任务）
-- Sparse LoRA Adapter = 翻译器（把不同任务的视觉信息"翻译"成统一格式）
-- DiT = 手（只需要理解一种格式的命令就能执行动作）
+- Sparse LoRA Adapter = 翻译器 + 任务识别器（识别任务类型并调整特征）
+- MoE Action Head = **两只专业的手**（每只手专门处理一种任务）
+  - Expert 0 = 专门抓 narrower 箱子的手
+  - Expert 1 = 专门抓 wider 箱子的手
 
 ---
 
@@ -537,69 +732,159 @@ for k in backbone_keys:
 - ✅ 过滤了对两个任务都不重要的"噪声参数"
 - ✅ 简化了推理逻辑，无需动态切换掩码
 
-### 阶段 4: 保留 Action Head (DiT)
+### 阶段 4: ⭐ MoE 模式 - 保留两个独立的 Action Head
 
 ```python
-    elif k.startswith('action_head.'):
-        if self.merge_action_head:
-            # 也融合 action_head（可选，默认不启用）
-            merged = ...
-        else:
-            # 直接使用 narrower 的 action_head（默认）
-            merged_state_dict[k] = narrower_state_dict[k]
+# MoE 模式：不融合 action_head，而是保留两个独立的专家
+if self.use_moe:
+    # 保存每个任务的 action_head 作为独立专家
+    self.expert_state_dicts = {
+        'narrower': {k: v for k, v in narrower_state_dict.items() 
+                     if k.startswith('action_head.')},
+        'wider': {k: v for k, v in wider_state_dict.items() 
+                  if k.startswith('action_head.')}
+    }
+    # backbone 使用融合权重
+    for k in base_state_dict:
+        if k.startswith('backbone.'):
+            merged_state_dict[k] = merged_backbone[k]
 ```
 
-**原因**：DiT 对权重变化非常敏感，直接融合会导致动作抖动
+**原因**：
+- DiT 对权重变化非常敏感，直接融合会导致动作抖动
+- 更重要的是，**保留 wider 专家的 action_head 可以保留 wider 任务的完整动作能力**
 
-### 阶段 5: 创建 Sparse LoRA Adapter
+### 阶段 5: 创建 MoE 模型 (MergedModelWithMoE)
 
 ```python
-# 创建稀疏激活的 LoRA 适配层
-self.merged_model = MergedModelWithAdapter(
+# 创建 MoE 风格的融合模型
+self.merged_model = MergedModelWithMoE(
     merged_backbone_state_dict=merged_state_dict,
-    narrower_action_head_state_dict=narrower_state_dict,
+    expert_action_head_state_dicts=[
+        narrower_action_head_state_dict,  # Expert 0
+        wider_action_head_state_dict,      # Expert 1
+    ],
+    expert_names=['narrower', 'wider'],
     base_model=base_model,
-    adapter_type="sparse_lora",  # MergeVLA 风格
+    adapter_type="sparse_lora",
     hidden_size=2048,
-    lora_rank=16,
-    num_tasks=2,      # 两个任务：narrower, wider
-    sparsity=0.5,     # 每个任务激活 50% 的参数
+    lora_rank=32,         # 增大 LoRA rank 提升容量
+    num_tasks=2,
+    sparsity=0.6,         # 每个任务激活 60% 的参数
+    use_soft_routing=False,  # 硬路由：选择一个专家
 )
 ```
 
-**Sparse LoRA Adapter 结构**：
+**MoE Action Head 结构**：
+
+```python
+class MoEActionHead(nn.Module):
+    """混合专家动作头 - 每个任务一个独立的 action_head"""
+    
+    def __init__(
+        self,
+        expert_heads: nn.ModuleList,  # 多个 FlowmatchingActionHead
+        expert_names: list[str] = None,
+        routing_temperature: float = 0.1,
+        use_soft_routing: bool = False,
+    ):
+        super().__init__()
+        self.expert_heads = expert_heads
+        self.num_experts = len(expert_heads)
+        self.expert_names = expert_names or [f"expert_{i}" for i in range(self.num_experts)]
+        self.routing_temperature = routing_temperature
+        self.use_soft_routing = use_soft_routing
+        
+        # 路由统计
+        self._routing_stats = {name: 0 for name in self.expert_names}
+        self._routing_call_count = 0
+    
+    def get_action(
+        self,
+        backbone_outputs,
+        action_inputs,
+        task_id: torch.Tensor = None,
+        routing_weights: torch.Tensor = None,
+        **kwargs,
+    ):
+        if task_id is not None:
+            # 固定路由：使用指定专家
+            expert_idx = task_id[0].item()
+            self._routing_stats[self.expert_names[expert_idx]] += 1
+            return self.expert_heads[expert_idx].get_action(
+                backbone_outputs, action_inputs, **kwargs
+            )
+        
+        elif self.use_soft_routing and routing_weights is not None:
+            # 软路由：加权融合多个专家的输出
+            outputs = []
+            for i, expert in enumerate(self.expert_heads):
+                out = expert.get_action(backbone_outputs, action_inputs, **kwargs)
+                outputs.append(out['action_pred'] * routing_weights[:, i:i+1, None])
+            return {'action_pred': sum(outputs)}
+        
+        else:
+            # 硬路由：根据 routing_weights 选择最高分专家
+            expert_idx = routing_weights.argmax(dim=-1)[0].item()
+            self._routing_stats[self.expert_names[expert_idx]] += 1
+            return self.expert_heads[expert_idx].get_action(
+                backbone_outputs, action_inputs, **kwargs
+            )
+```
+
+**Sparse LoRA Adapter + Smart Routing**：
 
 ```python
 class SparseLoRAAdapter(nn.Module):
-    def __init__(self, hidden_size=2048, rank=16, num_tasks=2, sparsity=0.5):
+    def __init__(self, hidden_size=2048, rank=32, num_tasks=2, sparsity=0.6):
         # LoRA 参数（每个任务独立）
         self.lora_A = nn.Parameter(torch.randn(num_tasks, hidden_size, rank) * 0.02)
         self.lora_B = nn.Parameter(torch.zeros(num_tasks, rank, hidden_size))
         
         # 任务掩码（稀疏激活）
-        # mask[t, i] = 1 表示任务 t 激活维度 i
         self.task_masks = nn.Parameter(init_sparse_mask(num_tasks, hidden_size, sparsity))
         
-        self.residual_scale = nn.Parameter(torch.ones(1))
+        # ⚠️ 重要：residual_scale 初始化为 0.1，防止 Flow Matching 崩溃
+        self.residual_scale = nn.Parameter(torch.full((1,), 0.1))
     
-    def forward(self, x, task_id=None):
-        # x: (B, T, 2048) - backbone 输出
+    def compute_task_routing_scores(self, x: torch.Tensor) -> torch.Tensor:
+        """⭐ Smart Routing: 根据输入特征计算任务路由分数"""
+        # x: (B, T, hidden_size)
+        scores = []
+        for t in range(self.num_tasks):
+            # 计算与每个任务 LoRA 的相关性
+            A_t = self.lora_A[t] * torch.sigmoid(self.task_masks[t]).unsqueeze(-1)
+            # ⚠️ 关键：归一化防止范数差异导致路由偏差
+            A_t = A_t / (A_t.norm() + 1e-8)
+            score = (x @ A_t).norm(dim=-1).mean()
+            scores.append(score)
+        
+        scores = torch.stack(scores)
+        return torch.softmax(scores / self.routing_temperature, dim=0)
+    
+    def forward(self, x, task_id=None, use_smart_routing=False):
+        if use_smart_routing and task_id is None:
+            # Smart Routing：自动选择任务
+            routing_weights = self.compute_task_routing_scores(x)
+            task_id = routing_weights.argmax().unsqueeze(0)
         
         if task_id is not None:
-            # 使用指定任务的 LoRA 参数和掩码
-            A = self.lora_A[task_id] * sigmoid(self.task_masks[task_id])
-            B = self.lora_B[task_id]
+            # 使用指定任务的 LoRA
+            t = task_id[0].item()
+            A_t = self.lora_A[t] * torch.sigmoid(self.task_masks[t]).unsqueeze(-1)
+            B_t = self.lora_B[t]
+            lora_output = x @ A_t @ B_t
         else:
-            # 推理时任务未知：使用所有任务的平均
+            # 平均所有任务的 LoRA（不推荐）
             outputs = []
-            for t in range(num_tasks):
-                A_t = self.lora_A[t] * sigmoid(self.task_masks[t])
+            for t in range(self.num_tasks):
+                A_t = self.lora_A[t] * torch.sigmoid(self.task_masks[t]).unsqueeze(-1)
                 B_t = self.lora_B[t]
                 outputs.append(x @ A_t @ B_t)
             lora_output = torch.stack(outputs).mean(dim=0)
         
-        # 残差连接
-        return x + residual_scale * (alpha / rank) * lora_output
+        # 残差连接（scale 限制在 0.1 以内）
+        return x + self.residual_scale.clamp(max=0.15) * (self.alpha / self.rank) * lora_output
 ```
 
 ### 阶段 6: 训练适配层
@@ -634,14 +919,28 @@ for epoch in range(20):
 - 每个样本都有 `task_source` 标签（0=narrower, 1=wider）
 - 适配层学会根据任务类型激活不同的参数子集
 
-### 阶段 7: 保存融合模型
+### 阶段 7: 保存融合模型（MoE 模式）
 
 ```python
-# 保存的权重包含：
+# MoE 模式保存的权重包含：
 state_dict = {
-    "_groot_model.backbone.*": ...,           # 融合后的 backbone
-    "_groot_model.action_head.*": ...,        # narrower 的 action_head
-    "_groot_model.distribution_adapter.*": ..., # 训练好的适配层
+    "_groot_model.backbone.*": ...,              # 融合后的 backbone
+    "_groot_model.action_head.*": ...,           # 默认 action_head (narrower，兼容性)
+    "_groot_model.expert_heads.0.*": ...,        # Expert 0 (narrower) 完整权重
+    "_groot_model.expert_heads.1.*": ...,        # Expert 1 (wider) 完整权重
+    "_groot_model.distribution_adapter.*": ...,  # 训练好的适配层 + Smart Routing
+}
+
+# merge_config.json 中的 MoE 配置
+merge_config = {
+    "merge_method": "mergevla",
+    "use_moe": True,                    # ⭐ 启用 MoE 模式
+    "expert_names": ["narrower", "wider"],
+    "use_soft_routing": False,          # 硬路由
+    "adapter_type": "sparse_lora",
+    "lora_rank": 32,
+    "sparsity": 0.6,
+    ...
 }
 
 save_file(state_dict, "model.safetensors")
@@ -649,68 +948,107 @@ save_file(state_dict, "model.safetensors")
 
 ---
 
-## 推理时的工作流程
+## 推理时的工作流程（MoE 模式）
 
 ```python
-def get_action_with_adapter(inputs, **kwargs):
+def get_action_with_moe(inputs, task_type=None, use_smart_routing=True, **kwargs):
     # 1. 通过融合的 backbone
     backbone_outputs = policy._groot_model.backbone(backbone_inputs)
     backbone_features = backbone_outputs["backbone_features"]  # (B, T, 2048)
     
-    # 2. 通过 Sparse LoRA Adapter
-    # 推理时 task_id=None，使用所有任务的平均
-    task_id = None
-    adapted_features = adapter(backbone_features, task_id=task_id)
+    # 2. 确定 task_id（三种方式）
+    if task_type == "narrower":
+        task_id = torch.tensor([0])  # 固定使用 Expert 0
+    elif task_type == "wider":
+        task_id = torch.tensor([1])  # 固定使用 Expert 1
+    elif use_smart_routing:
+        # ⭐ Smart Routing：自动识别任务类型
+        routing_weights = adapter.compute_task_routing_scores(backbone_features)
+        task_id = routing_weights.argmax().unsqueeze(0)
+    else:
+        task_id = torch.tensor([0])  # 默认 Expert 0
     
-    # 3. 通过 narrower 的 DiT action_head
-    action_head_outputs = policy._groot_model.action_head.get_action(
-        adapted_features, 
-        action_inputs
+    # 3. 通过 Sparse LoRA Adapter
+    adapted_features = adapter(backbone_features, task_id=task_id)
+    backbone_outputs["backbone_features"] = adapted_features
+    
+    # 4. ⭐ 通过 MoE Action Head（选择对应专家）
+    action_outputs = moe_head.get_action(
+        backbone_outputs,
+        action_inputs,
+        task_id=task_id,
+        **kwargs
     )
     
-    return action_head_outputs["action_pred"]
+    return action_outputs["action_pred"]
 ```
 
-**为什么这能工作**：
+**MoE 模式为什么能工作**：
 
 1. **Backbone 融合**：包含了两种任务的视觉理解能力
    - 看到窄箱子 → 提取窄箱子相关特征
    - 看到宽箱子 → 提取宽箱子相关特征
 
-2. **Adapter 平均**：推理时使用两个任务的适配参数平均
-   - `adapted = x + 0.5 * (narrower_transform(x) + wider_transform(x))`
-   - 这相当于一个"通用翻译器"
+2. **Smart Routing**：自动识别当前输入属于哪个任务
+   - 基于 backbone 特征与每个任务 LoRA 的相关性计算路由分数
+   - 选择得分最高的任务作为路由目标
 
-3. **DiT 执行**：虽然是 narrower 权重，但：
-   - 它从未见过"原始的 wider 特征"
-   - 它只看到经过适配层处理后的"标准化特征"
-   - 适配层已经学会把 wider 风格的特征转换成 narrower DiT 能理解的格式
+3. **MoE Action Head**：**每个任务都有完整的专家**
+   - Expert 0 (narrower)：使用 narrower 模型的完整 action_head
+   - Expert 1 (wider)：使用 wider 模型的完整 action_head
+   - 根据路由结果选择对应专家生成动作
+   - **不再依赖适配层"翻译"，而是直接使用对应任务的专家！**
 
 ---
 
-## 融合后的模型文件结构
+## 融合后的模型文件结构（MoE 模式）
 
 ```
 outputs/merged_groot_mergevla/pretrained_model/
-├── model.safetensors           # 融合后的权重（包含适配层）
+├── model.safetensors           # 融合后的权重（包含 MoE 和适配层）
 │   ├── _groot_model.backbone.*           # 融合: 0.5×narrower + 0.5×wider
-│   ├── _groot_model.action_head.*        # 来自 narrower（未融合）
-│   └── _groot_model.distribution_adapter.* # 训练得到的适配层
-│       ├── adapter.lora_A     (2, 2048, 16)
-│       ├── adapter.lora_B     (2, 16, 2048)
+│   ├── _groot_model.action_head.*        # 默认 action_head (兼容性)
+│   │
+│   │   ⭐ MoE Expert Heads
+│   ├── _groot_model.expert_heads.0.*     # Expert 0 (narrower) 完整 action_head
+│   │   ├── vlln.*
+│   │   ├── vl_self_attention.*
+│   │   ├── state_encoder.*
+│   │   ├── action_encoder.*
+│   │   ├── future_tokens.*
+│   │   ├── model.* (DiT 16层)
+│   │   ├── shared_arm_decoder.*
+│   │   └── action_claw_decoder.*
+│   ├── _groot_model.expert_heads.1.*     # Expert 1 (wider) 完整 action_head
+│   │   └── (同上结构)
+│   │
+│   │   ⭐ Sparse LoRA Adapter
+│   └── _groot_model.distribution_adapter.*
+│       ├── adapter.lora_A     (2, 2048, 32)
+│       ├── adapter.lora_B     (2, 32, 2048)
 │       ├── adapter.task_masks (2, 2048)
-│       └── adapter.residual_scale (1,)
+│       └── adapter.residual_scale (1,) ≤ 0.1
+│
 ├── config.json                 # 模型配置
 ├── merge_config.json           # 融合配置
 │   ├── merge_method: "mergevla"
 │   ├── narrower_weight: 0.5
 │   ├── wider_weight: 0.5
+│   │
+│   │   ⭐ MoE 配置
+│   ├── use_moe: true                 # 启用 MoE 模式
+│   ├── expert_names: ["narrower", "wider"]
+│   ├── use_soft_routing: false       # 硬路由
+│   │
+│   │   ⭐ 适配层配置
 │   ├── adapter_type: "sparse_lora"
-│   ├── lora_rank: 16
-│   ├── sparsity: 0.5
-│   ├── merge_action_head: false
-│   ├── use_sparse_merge: true      # ⭐ Section 4.1 参数级稀疏掩码
-│   └── sparse_merge_lambda: 1.0    # ⭐ 容忍度系数
+│   ├── lora_rank: 32
+│   ├── sparsity: 0.6
+│   │
+│   │   ⭐ Section 4.1 参数级稀疏掩码
+│   ├── use_sparse_merge: true
+│   └── sparse_merge_lambda: 1.0
+│
 ├── policy_preprocessor.json
 ├── policy_preprocessor_*.safetensors
 ├── policy_postprocessor.json
@@ -759,20 +1097,25 @@ outputs/merged_groot_mergevla/pretrained_model/
 
 ## 与其他方法的对比
 
-| 方法 | Backbone 融合 | 参数级稀疏掩码 | Action Head | 适配层 | 效果 |
-|------|--------------|----------------|-------------|--------|------|
-| **MergeVLA** | ✅ Task Vector | ✅ Section 4.1 | narrower | Sparse LoRA ✅ | 最好 |
-| Two-Stage | ✅ Task Vector | ❌ | narrower | 标准 LoRA | 较好 |
-| Interpolation | 线性插值 | ❌ | 融合 | 无 | 抖动 |
-| Task Arithmetic | Task Vector | ❌ | 融合 | 无 | 抖动 |
+| 方法 | Backbone 融合 | 参数级稀疏掩码 | Action Head | 适配层 | Smart Routing | 效果 |
+|------|--------------|----------------|-------------|--------|---------------|------|
+| **⭐ MergeVLA + MoE** | ✅ Task Vector | ✅ Section 4.1 | **MoE (2专家)** | Sparse LoRA ✅ | ✅ | **最好** |
+| MergeVLA (单专家) | ✅ Task Vector | ✅ Section 4.1 | narrower only | Sparse LoRA ✅ | ✅ | 较好 |
+| Two-Stage | ✅ Task Vector | ❌ | narrower only | 标准 LoRA | ❌ | 一般 |
+| Interpolation | 线性插值 | ❌ | 融合 | 无 | ❌ | 抖动 |
+| Task Arithmetic | Task Vector | ❌ | 融合 | 无 | ❌ | 抖动 |
 
-**MergeVLA 的优势**：
+**⭐ MergeVLA + MoE 的优势**：
 1. ✅ **Section 4.1 参数级稀疏掩码**：通过 `S_m = I[|τ_m| > λ|τ_merge - τ_m|]` 在 backbone 融合阶段过滤冲突参数
 2. ✅ **Sparse LoRA Adapter**：通过可学习任务掩码在特征层面进一步减少任务间干扰
-3. ✅ 保留 narrower 的 DiT 避免了动作抖动
-4. ✅ 适配层参数量小（仅 135K），训练快速
+3. ⭐ **MoE Action Head**：**保留每个任务独立的完整 action_head**
+   - 不再依赖适配层"翻译"wider 特征
+   - Expert 0 处理 narrower 任务，Expert 1 处理 wider 任务
+   - 每个专家都有完整的 DiT + Decoder
+4. ✅ **Smart Routing**：推理时自动识别任务类型，选择对应专家
 5. ✅ 融合的 backbone 继承了两个任务的视觉理解能力
-6. ✅ **Test-Time Task Routing**：推理时自动识别任务类型，智能选择路由
+6. ✅ 适配层参数量小（仅 266K），主要参数在 MoE 专家中
+7. ✅ **residual_scale 限制**：防止 Flow Matching 崩溃导致 "flat chunk"
 
 ---
 
