@@ -1685,6 +1685,427 @@ class DistributionAdapter(nn.Module):
             self.adapter.reset_routing_stats()
 
 
+# ============================================================
+# MoE 风格的多专家动作头 (Multi-Expert Action Head)
+# ============================================================
+# 
+# 基于 MergeVLA 论文 Section 3.2 的 "Expert Head" 概念：
+# - 深层 Action Blocks 保留每个任务自己的，不融合
+# - 使用 Test-Time Task Router 选择使用哪个 Expert Head
+# 
+# 架构：
+# backbone_merged → Sparse LoRA Adapter → [Router] → Expert Head 0 (narrower) → action
+#                                                  ↘ Expert Head 1 (wider) → action
+
+class MoEActionHead(nn.Module):
+    """
+    MoE 风格的多专家动作头 ⭐
+    
+    基于 MergeVLA 论文 Section 3.2：
+    "the deeper blocks of the action expert, referred to as the expert head, 
+    remain unmergeable due to their strong task specialization. 
+    Consequently, each task keeps its own expert head"
+    
+    每个任务保留自己独立的 action_head (DiT)，
+    通过 Smart Routing 或固定路由选择使用哪个专家。
+    """
+    
+    def __init__(
+        self,
+        expert_heads: nn.ModuleList,  # 多个 action_head
+        expert_names: list[str] = None,  # 专家名称（用于调试）
+        routing_temperature: float = 0.1,  # 路由温度（越小越倾向于硬路由）
+        use_soft_routing: bool = False,  # 是否使用软路由（加权平均）
+    ):
+        super().__init__()
+        self.expert_heads = expert_heads
+        self.num_experts = len(expert_heads)
+        self.expert_names = expert_names or [f"expert_{i}" for i in range(self.num_experts)]
+        self.routing_temperature = routing_temperature
+        self.use_soft_routing = use_soft_routing
+        
+        # 路由统计
+        self._routing_stats = {name: 0 for name in self.expert_names}
+        self._routing_call_count = 0
+        
+        print(f"   🎯 MoE Action Head initialized:")
+        print(f"      Experts: {self.expert_names}")
+        print(f"      Soft routing: {use_soft_routing}")
+        print(f"      Temperature: {routing_temperature}")
+    
+    def forward(
+        self, 
+        backbone_outputs: dict, 
+        action_inputs, 
+        task_id: torch.Tensor = None,
+        routing_weights: torch.Tensor = None,
+    ) -> dict:
+        """
+        MoE 前向传播（训练模式，计算 loss）
+        
+        Args:
+            backbone_outputs: backbone 输出（包含 adapted_features）
+            action_inputs: action_head 需要的输入
+            task_id: (B,) - 如果提供，使用固定路由
+            routing_weights: (B, num_experts) - 如果提供，使用软路由权重
+        
+        Returns:
+            dict with 'loss' and other outputs
+        """
+        B = backbone_outputs[BACKBONE_FEATURE_KEY].shape[0]
+        device = backbone_outputs[BACKBONE_FEATURE_KEY].device
+        
+        if task_id is not None:
+            # 固定路由：每个样本使用指定的专家
+            # 对于每个专家，选择属于该专家的样本
+            all_outputs = []
+            all_losses = []
+            
+            for expert_idx in range(self.num_experts):
+                # 找到属于这个专家的样本
+                mask = (task_id == expert_idx)
+                if not mask.any():
+                    continue
+                
+                # 提取这些样本的输入
+                expert_backbone_outputs = {
+                    k: v[mask] if isinstance(v, torch.Tensor) and v.shape[0] == B else v
+                    for k, v in backbone_outputs.items()
+                }
+                
+                # 通过专家头
+                expert_output = self.expert_heads[expert_idx](
+                    expert_backbone_outputs, 
+                    action_inputs
+                )
+                
+                if hasattr(expert_output, 'data'):
+                    expert_output = expert_output.data
+                
+                if 'loss' in expert_output:
+                    all_losses.append(expert_output['loss'] * mask.sum())
+                    self._routing_stats[self.expert_names[expert_idx]] += mask.sum().item()
+            
+            self._routing_call_count += 1
+            
+            # 计算平均 loss
+            if all_losses:
+                total_loss = sum(all_losses) / B
+                return {'loss': total_loss}
+            else:
+                # Fallback：使用第一个专家
+                return self.expert_heads[0](backbone_outputs, action_inputs)
+        
+        elif routing_weights is not None and self.use_soft_routing:
+            # 软路由：加权平均各专家的 loss
+            all_losses = []
+            
+            for expert_idx in range(self.num_experts):
+                expert_output = self.expert_heads[expert_idx](backbone_outputs, action_inputs)
+                if hasattr(expert_output, 'data'):
+                    expert_output = expert_output.data
+                
+                if 'loss' in expert_output:
+                    # 加权 loss
+                    weight = routing_weights[:, expert_idx].mean()
+                    all_losses.append(expert_output['loss'] * weight)
+            
+            if all_losses:
+                total_loss = sum(all_losses)
+                return {'loss': total_loss}
+            else:
+                return self.expert_heads[0](backbone_outputs, action_inputs)
+        
+        else:
+            # 默认：使用第一个专家
+            return self.expert_heads[0](backbone_outputs, action_inputs)
+    
+    def get_action(
+        self, 
+        backbone_outputs: dict, 
+        action_inputs, 
+        task_id: torch.Tensor = None,
+        routing_weights: torch.Tensor = None,
+        **kwargs
+    ) -> dict:
+        """
+        MoE 推理（获取动作）
+        
+        Args:
+            backbone_outputs: backbone 输出（包含 adapted_features）
+            action_inputs: action_head 需要的输入
+            task_id: (B,) - 如果提供，使用固定路由
+            routing_weights: (B, num_experts) - 如果提供，使用软路由权重
+        
+        Returns:
+            dict with 'action_pred' and other outputs
+        """
+        if task_id is not None:
+            # 固定路由：选择指定专家
+            expert_idx = task_id[0].item() if isinstance(task_id, torch.Tensor) else task_id
+            expert_idx = min(expert_idx, self.num_experts - 1)
+            
+            self._routing_stats[self.expert_names[expert_idx]] += 1
+            self._routing_call_count += 1
+            
+            return self.expert_heads[expert_idx].get_action(
+                backbone_outputs, action_inputs, **kwargs
+            )
+        
+        elif routing_weights is not None:
+            # 根据路由权重选择专家
+            # 使用硬路由：选择权重最大的专家
+            expert_idx = routing_weights[0].argmax().item()
+            
+            self._routing_stats[self.expert_names[expert_idx]] += 1
+            self._routing_call_count += 1
+            
+            return self.expert_heads[expert_idx].get_action(
+                backbone_outputs, action_inputs, **kwargs
+            )
+        
+        else:
+            # 默认：使用第一个专家
+            self._routing_stats[self.expert_names[0]] += 1
+            self._routing_call_count += 1
+            return self.expert_heads[0].get_action(backbone_outputs, action_inputs, **kwargs)
+    
+    def get_routing_stats(self) -> dict:
+        """获取路由统计"""
+        total = sum(self._routing_stats.values())
+        if total == 0:
+            return self._routing_stats
+        
+        result = {'total_calls': total}
+        for name, count in self._routing_stats.items():
+            result[name] = count
+            result[f'{name}_ratio'] = count / total
+        return result
+    
+    def reset_routing_stats(self):
+        """重置路由统计"""
+        self._routing_stats = {name: 0 for name in self.expert_names}
+        self._routing_call_count = 0
+
+
+class MergedModelWithMoE(nn.Module):
+    """
+    带 MoE 动作专家的融合模型 ⭐
+    
+    基于 MergeVLA 论文的完整实现：
+    - backbone: 融合后的 backbone（冻结）
+    - adapter: Sparse LoRA 适配层（可训练）
+    - moe_head: MoE 动作专家（多个独立的 action_head）
+    
+    架构：
+    backbone_merged → Sparse LoRA Adapter → [Router] → Expert Head 0 (narrower)
+                                                     ↘ Expert Head 1 (wider)
+    """
+    
+    def __init__(
+        self,
+        merged_backbone_state_dict: dict,
+        expert_action_head_state_dicts: list[dict],  # 多个专家的 action_head 权重
+        expert_names: list[str],  # 专家名称
+        base_model: GR00TN15,
+        adapter_type: str = "sparse_lora",
+        hidden_size: int = 2048,
+        lora_rank: int = 32,
+        sparsity: float = 0.5,
+        use_soft_routing: bool = False,
+    ):
+        super().__init__()
+        
+        num_experts = len(expert_action_head_state_dicts)
+        self.expert_names = expert_names
+        self.num_experts = num_experts
+        
+        print(f"\n{'='*60}")
+        print(f"🎯 MergedModelWithMoE: MoE 风格多专家架构")
+        print(f"{'='*60}")
+        print(f"   专家数量: {num_experts}")
+        print(f"   专家名称: {expert_names}")
+        print(f"   适配器类型: {adapter_type}")
+        print(f"   LoRA rank: {lora_rank}")
+        
+        # 1. 创建基础模型结构（用于 backbone）
+        self.base_model = copy.deepcopy(base_model)
+        
+        # 2. 加载融合后的 backbone 权重
+        backbone_keys = [k for k in merged_backbone_state_dict.keys() if 'backbone.' in k]
+        backbone_state = {}
+        for k in backbone_keys:
+            # 移除可能的前缀
+            new_k = k
+            if k.startswith('_groot_model.'):
+                new_k = k[len('_groot_model.'):]
+            backbone_state[new_k] = merged_backbone_state_dict[k]
+        
+        self.base_model.load_state_dict(backbone_state, strict=False)
+        print(f"   ✅ 加载融合 backbone: {len(backbone_state)} layers")
+        
+        # 3. 冻结 backbone
+        for name, param in self.base_model.backbone.named_parameters():
+            param.requires_grad = False
+        
+        # 4. 创建多个专家 action_head
+        self.expert_heads = nn.ModuleList()
+        for i, expert_state_dict in enumerate(expert_action_head_state_dicts):
+            # 创建一个新的 action_head（复制基础模型的结构）
+            expert_head = copy.deepcopy(base_model.action_head)
+            
+            # 加载专家权重
+            action_head_keys = [k for k in expert_state_dict.keys() if 'action_head.' in k]
+            action_head_state = {}
+            for k in action_head_keys:
+                new_k = k
+                if k.startswith('_groot_model.'):
+                    new_k = k[len('_groot_model.'):]
+                if new_k.startswith('action_head.'):
+                    new_k = new_k[len('action_head.'):]
+                action_head_state[new_k] = expert_state_dict[k]
+            
+            expert_head.load_state_dict(action_head_state, strict=False)
+            
+            # 冻结专家 action_head
+            for param in expert_head.parameters():
+                param.requires_grad = False
+            
+            self.expert_heads.append(expert_head)
+            print(f"   ✅ 加载专家 {expert_names[i]} action_head: {len(action_head_state)} layers")
+        
+        # 5. 创建 MoE 动作头
+        self.moe_head = MoEActionHead(
+            expert_heads=self.expert_heads,
+            expert_names=expert_names,
+            use_soft_routing=use_soft_routing,
+        )
+        
+        # 6. 创建 Sparse LoRA 适配层（可训练）
+        self.adapter = DistributionAdapter(
+            hidden_size=hidden_size,
+            adapter_type=adapter_type,
+            lora_rank=lora_rank,
+            num_tasks=num_experts,
+            sparsity=sparsity,
+        )
+        
+        print(f"   ✅ 创建适配层: {sum(p.numel() for p in self.adapter.parameters()):,} params")
+        print(f"{'='*60}\n")
+    
+    def forward(
+        self, 
+        inputs: dict, 
+        task_id: torch.Tensor = None,
+        use_smart_routing: bool = True,
+    ) -> dict:
+        """
+        前向传播（训练模式）
+        
+        Args:
+            inputs: 模型输入
+            task_id: (B,) - 任务ID，如果提供则使用固定路由
+            use_smart_routing: 如果 task_id=None，是否使用智能路由
+        """
+        device = next(self.base_model.parameters()).device
+        use_bf16 = getattr(self.base_model, "compute_dtype", None) == "bfloat16"
+        
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16):
+            # 1. 准备输入
+            backbone_inputs, action_inputs = self.base_model.prepare_input(inputs)
+            
+            # 2. 通过 backbone
+            backbone_outputs = self.base_model.backbone(backbone_inputs)
+            
+            # 3. 通过适配层
+            backbone_features = backbone_outputs[BACKBONE_FEATURE_KEY]
+            
+            # 计算路由权重（如果需要）
+            routing_weights = None
+            if task_id is None and use_smart_routing:
+                routing_weights = self.adapter.adapter.compute_task_routing_scores(backbone_features)
+            
+            # 应用适配
+            adapted_features = self.adapter(
+                backbone_features, 
+                task_id=task_id,
+                use_smart_routing=use_smart_routing
+            )
+            backbone_outputs[BACKBONE_FEATURE_KEY] = adapted_features
+            
+            # 4. 通过 MoE 动作头
+            action_outputs = self.moe_head(
+                backbone_outputs, 
+                action_inputs,
+                task_id=task_id,
+                routing_weights=routing_weights,
+            )
+        
+        return action_outputs
+    
+    def get_action(
+        self, 
+        inputs: dict, 
+        task_id: torch.Tensor = None,
+        use_smart_routing: bool = True,
+        **kwargs
+    ) -> dict:
+        """
+        推理时获取动作
+        
+        Args:
+            inputs: 模型输入
+            task_id: (B,) - 任务ID，如果提供则使用固定路由
+            use_smart_routing: 如果 task_id=None，是否使用智能路由
+        """
+        # 1. 通过 backbone
+        backbone_inputs, action_inputs = self.base_model.prepare_input(inputs)
+        backbone_outputs = self.base_model.backbone(backbone_inputs)
+        
+        # 2. 通过适配层
+        backbone_features = backbone_outputs[BACKBONE_FEATURE_KEY]
+        
+        # 计算路由权重
+        routing_weights = None
+        if task_id is None and use_smart_routing:
+            routing_weights = self.adapter.adapter.compute_task_routing_scores(backbone_features)
+        
+        # 应用适配
+        adapted_features = self.adapter(
+            backbone_features, 
+            task_id=task_id,
+            use_smart_routing=use_smart_routing
+        )
+        backbone_outputs[BACKBONE_FEATURE_KEY] = adapted_features
+        
+        # 3. 通过 MoE 动作头
+        rtc_enabled = kwargs.pop('rtc_enabled', False)
+        action_outputs = self.moe_head.get_action(
+            backbone_outputs, 
+            action_inputs,
+            task_id=task_id,
+            routing_weights=routing_weights,
+            rtc_enabled=rtc_enabled,
+            **kwargs
+        )
+        
+        return action_outputs
+    
+    def get_routing_stats(self) -> dict:
+        """获取综合路由统计"""
+        adapter_stats = self.adapter.get_routing_stats() or {}
+        moe_stats = self.moe_head.get_routing_stats()
+        return {
+            'adapter': adapter_stats,
+            'moe_head': moe_stats,
+        }
+    
+    def reset_routing_stats(self):
+        """重置路由统计"""
+        self.adapter.reset_routing_stats()
+        self.moe_head.reset_routing_stats()
+
+
 class MergedModelWithAdapter(nn.Module):
     """
     带适配层的融合模型
@@ -1902,6 +2323,12 @@ class MergeVLAMerger:
     - 如果 base_model_path == narrower_path，则 τ_narrower = 0，τ_wider = wider - narrower
     - 融合公式：θ_merged = θ_base + α_narrower * τ_narrower + α_wider * τ_wider
     - 使用稀疏 LoRA 适配器处理分布漂移
+    
+    ⭐ MoE 模式 (use_moe=True)：
+    基于论文 Section 3.2 "Expert Head" 概念：
+    - Backbone: 融合
+    - Action Head (DiT): 保留每个任务独立的 Expert Head，不融合
+    - 推理时使用 Smart Routing 选择使用哪个 Expert Head
     """
     
     def __init__(
@@ -1918,6 +2345,8 @@ class MergeVLAMerger:
         merge_action_head: bool = False,  # 是否融合 action_head（GROOT 使用 cross-attention，可以尝试）
         use_sparse_merge: bool = True,  # ⭐ 是否使用 Section 4.1 的参数级稀疏掩码融合
         sparse_merge_lambda: float = 1.0,  # ⭐ 容忍度系数 λ（论文默认 1.0）
+        use_moe: bool = False,  # ⭐ 是否使用 MoE 模式（保留多个独立的 action_head）
+        use_soft_routing: bool = False,  # ⭐ 是否使用软路由（加权平均）
     ):
         self.narrower_path = narrower_path
         self.wider_path = wider_path
@@ -1930,11 +2359,17 @@ class MergeVLAMerger:
         self.merge_action_head = merge_action_head
         self.use_sparse_merge = use_sparse_merge
         self.sparse_merge_lambda = sparse_merge_lambda
+        self.use_moe = use_moe  # ⭐ MoE 模式
+        self.use_soft_routing = use_soft_routing
         self.device = torch.device(device)
         
         self.merged_model = None
         self.preprocessor = None
         self.postprocessor = None
+        
+        # ⭐ MoE 模式下存储各专家的权重
+        self.expert_state_dicts = []
+        self.expert_names = ["narrower", "wider"]
     
     def load_and_merge(self):
         """
@@ -2147,22 +2582,51 @@ class MergeVLAMerger:
         
         print(f"   📐 Detected backbone hidden_size: {hidden_size}")
         
-        # 创建带适配层的模型
-        self.merged_model = MergedModelWithAdapter(
-            merged_backbone_state_dict=merged_state_dict,
-            narrower_action_head_state_dict=narrower_state_dict,
-            base_model=base_model,
-            adapter_type=self.adapter_type,
-            hidden_size=hidden_size,
-            lora_rank=self.lora_rank,
-            num_tasks=2,  # narrower, wider
-            sparsity=self.sparsity,
-        ).to(self.device)
+        # ⭐ 根据模式选择不同的模型架构
+        if self.use_moe:
+            # ============================================================
+            # MoE 模式：保留多个独立的 Expert Head (action_head)
+            # ============================================================
+            # 基于 MergeVLA 论文 Section 3.2：
+            # "the deeper blocks of the action expert, referred to as the expert head,
+            # remain unmergeable due to their strong task specialization.
+            # Consequently, each task keeps its own expert head"
+            print(f"\n🎯 使用 MoE 模式：保留多个独立的 Expert Head")
+            print(f"   每个任务保留自己的 action_head (DiT)，通过 Smart Routing 选择")
+            
+            # 存储各专家的 state_dict
+            self.expert_state_dicts = [narrower_state_dict, wider_state_dict]
+            
+            # 创建 MoE 模型
+            self.merged_model = MergedModelWithMoE(
+                merged_backbone_state_dict=merged_state_dict,
+                expert_action_head_state_dicts=self.expert_state_dicts,
+                expert_names=self.expert_names,
+                base_model=base_model,
+                adapter_type=self.adapter_type,
+                hidden_size=hidden_size,
+                lora_rank=self.lora_rank,
+                sparsity=self.sparsity,
+                use_soft_routing=self.use_soft_routing,
+            ).to(self.device)
+        else:
+            # 原有模式：只使用一个 action_head
+            self.merged_model = MergedModelWithAdapter(
+                merged_backbone_state_dict=merged_state_dict,
+                narrower_action_head_state_dict=narrower_state_dict,
+                base_model=base_model,
+                adapter_type=self.adapter_type,
+                hidden_size=hidden_size,
+                lora_rank=self.lora_rank,
+                num_tasks=2,  # narrower, wider
+                sparsity=self.sparsity,
+            ).to(self.device)
         
         # 加载预处理器
         self._load_processors(self.narrower_path)
         
-        print(f"\n✅ MergeVLA merging completed, ready for adapter training")
+        mode_str = "MoE (多专家)" if self.use_moe else "单 action_head"
+        print(f"\n✅ MergeVLA merging completed ({mode_str}), ready for adapter training")
     
     def _load_processors(self, model_path: str):
         """加载预处理器和后处理器"""
@@ -2343,49 +2807,90 @@ class MergeVLAMerger:
         ⚠️ 关键修复：
         1. 权重键名必须添加 `_groot_model.` 前缀（GrootPolicy.from_pretrained 期望的格式）
         2. config.json 中的 `base_model_path` 必须指向本地路径，而不是 HuggingFace
+        
+        ⭐ MoE 模式：
+        - 保存多个 expert heads 的权重
+        - 使用 expert_head_0.safetensors, expert_head_1.safetensors 等
         """
         output_path = Path(output_path)
         output_path.mkdir(parents=True, exist_ok=True)
         
-        # 获取完整的 state_dict
-        model_state_dict = self.merged_model.model.state_dict()
-        
-        # ⚠️ 关键修复：添加 `_groot_model.` 前缀
-        # GrootPolicy.from_pretrained 期望的键名格式是 `_groot_model.xxx`
-        # 而 GR00TN15.state_dict() 返回的是 `backbone.xxx` 和 `action_head.xxx`
-        state_dict = {}
-        for k, v in model_state_dict.items():
-            # 添加 _groot_model. 前缀
-            new_key = f"_groot_model.{k}"
-            state_dict[new_key] = v
-        
-        # 添加适配层权重（也需要前缀）
-        adapter_state = self.merged_model.adapter.state_dict()
-        for k, v in adapter_state.items():
-            state_dict[f"_groot_model.distribution_adapter.{k}"] = v
-        
-        # 克隆以处理共享内存
-        state_dict_cloned = {k: v.clone().contiguous() for k, v in state_dict.items()}
-        
-        print(f"\n📊 保存的权重统计:")
-        print(f"   总键数: {len(state_dict_cloned)}")
-        print(f"   前5个键: {list(state_dict_cloned.keys())[:5]}")
-        
-        save_file(state_dict_cloned, str(output_path / "model.safetensors"))
-        
-        # ⚠️ 关键修复：修改 config.json 中的 base_model_path
-        # 让它指向 narrower 模型的本地路径，而不是 HuggingFace
         import shutil
         narrower_path = Path(self.narrower_path)
         
-        # 复制并修改 config.json
+        if self.use_moe:
+            # ============================================================
+            # MoE 模式：保存 backbone + adapter + 多个 expert heads
+            # ============================================================
+            print(f"\n🎯 保存 MoE 模型...")
+            
+            state_dict = {}
+            
+            # 1. 保存 backbone
+            backbone_state = self.merged_model.base_model.backbone.state_dict()
+            for k, v in backbone_state.items():
+                state_dict[f"_groot_model.backbone.{k}"] = v
+            print(f"   ✅ Backbone: {len(backbone_state)} layers")
+            
+            # 2. 保存适配层
+            adapter_state = self.merged_model.adapter.state_dict()
+            for k, v in adapter_state.items():
+                state_dict[f"_groot_model.distribution_adapter.{k}"] = v
+            print(f"   ✅ Adapter: {len(adapter_state)} layers")
+            
+            # 3. 保存各专家 action_head
+            for i, (expert_head, expert_name) in enumerate(
+                zip(self.merged_model.expert_heads, self.expert_names)
+            ):
+                expert_state = expert_head.state_dict()
+                for k, v in expert_state.items():
+                    state_dict[f"_groot_model.expert_heads.{i}.{k}"] = v
+                print(f"   ✅ Expert {expert_name}: {len(expert_state)} layers")
+            
+            # 4. 同时保存默认的 action_head（兼容性：使用第一个专家）
+            # 这样不支持 MoE 的推理脚本也能加载（虽然只会使用 narrower）
+            first_expert_state = self.merged_model.expert_heads[0].state_dict()
+            for k, v in first_expert_state.items():
+                state_dict[f"_groot_model.action_head.{k}"] = v
+            
+            # 克隆以处理共享内存
+            state_dict_cloned = {k: v.clone().contiguous() for k, v in state_dict.items()}
+            
+            print(f"\n📊 保存的权重统计 (MoE):")
+            print(f"   总键数: {len(state_dict_cloned)}")
+            
+            save_file(state_dict_cloned, str(output_path / "model.safetensors"))
+        else:
+            # 原有模式：单个 action_head
+            # 获取完整的 state_dict
+            model_state_dict = self.merged_model.model.state_dict()
+            
+            # ⚠️ 关键修复：添加 `_groot_model.` 前缀
+            state_dict = {}
+            for k, v in model_state_dict.items():
+                new_key = f"_groot_model.{k}"
+                state_dict[new_key] = v
+            
+            # 添加适配层权重
+            adapter_state = self.merged_model.adapter.state_dict()
+            for k, v in adapter_state.items():
+                state_dict[f"_groot_model.distribution_adapter.{k}"] = v
+            
+            # 克隆以处理共享内存
+            state_dict_cloned = {k: v.clone().contiguous() for k, v in state_dict.items()}
+            
+            print(f"\n📊 保存的权重统计:")
+            print(f"   总键数: {len(state_dict_cloned)}")
+            print(f"   前5个键: {list(state_dict_cloned.keys())[:5]}")
+            
+            save_file(state_dict_cloned, str(output_path / "model.safetensors"))
+        
+        # ⚠️ 关键修复：修改 config.json 中的 base_model_path
         config_src = narrower_path / "config.json"
         if config_src.exists():
             with open(config_src, 'r') as f:
                 config = json.load(f)
             
-            # ⚠️ 关键：修改 base_model_path 指向本地 narrower 路径
-            # 这样加载时会使用 narrower 的模型结构（包括正确的 num_target_vision_tokens）
             config['base_model_path'] = str(narrower_path.resolve())
             
             print(f"\n⚠️ 修改 config.json:")
@@ -2406,7 +2911,7 @@ class MergeVLAMerger:
         
         # 保存融合配置
         merge_config = {
-            "merge_method": "mergevla",
+            "merge_method": "mergevla_moe" if self.use_moe else "mergevla",
             "narrower_path": str(self.narrower_path),
             "wider_path": str(self.wider_path),
             "base_model_path": str(self.base_model_path),
@@ -2417,7 +2922,11 @@ class MergeVLAMerger:
             "sparsity": self.sparsity,
             "num_tasks": 2,
             "merge_action_head": self.merge_action_head,
-            "action_head_source": "merged" if self.merge_action_head else "narrower",
+            "action_head_source": "moe" if self.use_moe else ("merged" if self.merge_action_head else "narrower"),
+            # ⭐ MoE 配置
+            "use_moe": self.use_moe,
+            "expert_names": self.expert_names if self.use_moe else None,
+            "use_soft_routing": self.use_soft_routing,
             # ⭐ MergeVLA Section 4.1: 参数级稀疏掩码融合配置
             "use_sparse_merge": self.use_sparse_merge,
             "sparse_merge_lambda": self.sparse_merge_lambda,

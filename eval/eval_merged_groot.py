@@ -34,6 +34,7 @@ from threading import Event, Thread
 from typing import Optional
 
 import torch
+import torch.nn as nn
 import numpy as np
 import rospy
 
@@ -283,6 +284,138 @@ def wrap_policy_with_adapter(
     logger.info(f"   ✅ Policy 已包装适配层 (路由模式: {routing_mode})")
 
 
+def load_moe_expert_heads(policy, model_path: str, merge_config: dict, device: str = "cuda:0"):
+    """
+    ⭐ 加载 MoE 模式的多个 Expert Heads (action_head)
+    
+    基于 MergeVLA 论文 Section 3.2 "Expert Head" 概念
+    """
+    import copy
+    from safetensors.torch import load_file
+    from lerobot.policies.groot.weight_merge_groot import MoEActionHead
+    
+    expert_names = merge_config.get('expert_names', ['narrower', 'wider'])
+    num_experts = len(expert_names)
+    
+    logger.info(f"   🎯 加载 MoE Expert Heads: {expert_names}")
+    
+    # 加载模型权重
+    model_path = Path(model_path)
+    safetensors_files = glob.glob(str(model_path / "model*.safetensors"))
+    
+    state_dict = {}
+    for f in sorted(safetensors_files):
+        state_dict.update(load_file(f))
+    
+    # 创建并加载每个专家的 action_head
+    expert_heads = nn.ModuleList()
+    groot_model = policy._groot_model
+    
+    for i, expert_name in enumerate(expert_names):
+        # 复制 action_head 结构
+        expert_head = copy.deepcopy(groot_model.action_head)
+        
+        # 提取该专家的权重
+        prefix = f'_groot_model.expert_heads.{i}.'
+        expert_state_dict = {}
+        for key, value in state_dict.items():
+            if key.startswith(prefix):
+                new_key = key[len(prefix):]
+                expert_state_dict[new_key] = value
+        
+        if expert_state_dict:
+            expert_head.load_state_dict(expert_state_dict, strict=False)
+            logger.info(f"   ✅ Expert {expert_name}: 加载 {len(expert_state_dict)} 层权重")
+        else:
+            logger.warning(f"   ⚠️ Expert {expert_name}: 未找到专用权重，使用默认 action_head")
+        
+        expert_head.eval()
+        expert_heads.append(expert_head)
+    
+    # 创建 MoE 动作头
+    moe_head = MoEActionHead(
+        expert_heads=expert_heads,
+        expert_names=expert_names,
+        use_soft_routing=merge_config.get('use_soft_routing', False),
+    )
+    moe_head.to(device)
+    moe_head.eval()
+    
+    logger.info(f"   ✅ MoE Action Head 创建成功，{num_experts} 个专家")
+    return moe_head
+
+
+def wrap_policy_with_moe(
+    policy, 
+    adapter,
+    moe_head,
+    task_type: str = None,
+    use_smart_routing: bool = False,
+    swap_task_mapping: bool = False,
+):
+    """
+    ⭐ 包装 GrootPolicy，使其使用 MoE 动作头
+    
+    Args:
+        policy: GrootPolicy 实例
+        adapter: DistributionAdapter 实例
+        moe_head: MoEActionHead 实例
+        task_type: 任务类型 ("narrower", "wider", None)
+        use_smart_routing: 是否使用智能任务路由
+        swap_task_mapping: 是否交换任务映射
+    """
+    # 设置 task_id
+    if task_type == "narrower":
+        actual_task_id = 1 if swap_task_mapping else 0
+        fixed_task_id = torch.tensor([actual_task_id], device=next(adapter.parameters()).device)
+        logger.info(f"   ⚠️ MoE 路由: task_type=narrower → task_id={actual_task_id}")
+    elif task_type == "wider":
+        actual_task_id = 0 if swap_task_mapping else 1
+        fixed_task_id = torch.tensor([actual_task_id], device=next(adapter.parameters()).device)
+        logger.info(f"   ⚠️ MoE 路由: task_type=wider → task_id={actual_task_id}")
+    else:
+        fixed_task_id = None
+        if use_smart_routing:
+            logger.info(f"   ⭐ MoE 智能任务路由 (根据输入选择专家)")
+        else:
+            logger.warning(f"   ⚠️ MoE: 未指定任务类型，使用默认专家 (narrower)")
+            fixed_task_id = torch.tensor([0], device=next(adapter.parameters()).device)
+    
+    def get_action_with_moe(inputs: dict, **kwargs):
+        backbone_inputs, action_inputs = policy._groot_model.prepare_input(inputs)
+        backbone_outputs = policy._groot_model.backbone(backbone_inputs)
+        
+        # 通过适配层
+        backbone_features = backbone_outputs[BACKBONE_FEATURE_KEY]
+        
+        # 计算路由权重（如果使用智能路由）
+        routing_weights = None
+        if fixed_task_id is None and use_smart_routing:
+            routing_weights = adapter.adapter.compute_task_routing_scores(backbone_features)
+        
+        # 应用适配
+        adapted_features = adapter(
+            backbone_features, 
+            task_id=fixed_task_id,
+            use_smart_routing=use_smart_routing
+        )
+        backbone_outputs[BACKBONE_FEATURE_KEY] = adapted_features
+        
+        # 通过 MoE 动作头
+        rtc_enabled = kwargs.pop('rtc_enabled', policy._groot_model._rtc_enabled())
+        return moe_head.get_action(
+            backbone_outputs, 
+            action_inputs, 
+            task_id=fixed_task_id,
+            routing_weights=routing_weights,
+            rtc_enabled=rtc_enabled,
+            **kwargs
+        )
+    
+    policy._groot_model.get_action = get_action_with_moe
+    logger.info(f"   ✅ Policy 已包装 MoE 动作头")
+
+
 def load_mergevla_model(cfg: MergeVLAConfig) -> ModelWrapper:
     """加载 MergeVLA 融合模型"""
     
@@ -293,8 +426,13 @@ def load_mergevla_model(cfg: MergeVLAConfig) -> ModelWrapper:
     if merge_config is None:
         raise RuntimeError(f"未找到 merge_config.json: {cfg.model_path}")
     
-    if merge_config.get('merge_method') != 'mergevla':
-        raise RuntimeError(f"不是 MergeVLA 模型: {merge_config.get('merge_method')}")
+    merge_method = merge_config.get('merge_method', 'mergevla')
+    if merge_method not in ('mergevla', 'mergevla_moe'):
+        raise RuntimeError(f"不是 MergeVLA 模型: {merge_method}")
+    
+    use_moe = merge_config.get('use_moe', False)
+    if use_moe:
+        logger.info(f"🎯 检测到 MoE 模式（多专家动作头）")
     
     # 加载 policy
     config = PreTrainedConfig.from_pretrained(cfg.model_path)
@@ -305,18 +443,35 @@ def load_mergevla_model(cfg: MergeVLAConfig) -> ModelWrapper:
     policy = policy.to(cfg.device)
     policy.eval()
     
-    # 加载适配层
+    # 加载适配层和专家头
     adapter = None
+    moe_head = None
+    
     if not cfg.disable_adapter:
         logger.info(f"🔧 加载 MergeVLA 适配层...")
         adapter = load_adapter(policy, cfg.model_path, merge_config, cfg.device)
-        wrap_policy_with_adapter(
-            policy, 
-            adapter,
-            task_type=cfg.task_type,
-            use_smart_routing=cfg.smart_routing,
-            swap_task_mapping=cfg.swap_task_mapping,
-        )
+        
+        if use_moe:
+            # MoE 模式：加载多个专家头
+            logger.info(f"🔧 加载 MoE Expert Heads...")
+            moe_head = load_moe_expert_heads(policy, cfg.model_path, merge_config, cfg.device)
+            wrap_policy_with_moe(
+                policy, 
+                adapter,
+                moe_head,
+                task_type=cfg.task_type,
+                use_smart_routing=cfg.smart_routing,
+                swap_task_mapping=cfg.swap_task_mapping,
+            )
+        else:
+            # 原有模式：单个 action_head
+            wrap_policy_with_adapter(
+                policy, 
+                adapter,
+                task_type=cfg.task_type,
+                use_smart_routing=cfg.smart_routing,
+                swap_task_mapping=cfg.swap_task_mapping,
+            )
     else:
         logger.warning("⚠️ 适配层已禁用")
     

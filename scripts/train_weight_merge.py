@@ -1055,8 +1055,17 @@ def run_mergevla_merge(args):
     1. 计算 Task Vectors: τ = θ_expert - θ_base
     2. 使用稀疏激活的 LoRA 适配器对齐 backbone 分布
     3. Action head 使用 cross-attention（GROOT 已满足）
+    
+    ⭐ MoE 模式 (--use_moe)：
+    基于论文 Section 3.2 "Expert Head" 概念：
+    - Backbone: 融合
+    - Action Head (DiT): 保留每个任务独立的 Expert Head，不融合
+    - 推理时使用 Smart Routing 选择使用哪个 Expert Head
     """
     from lerobot.policies.groot.weight_merge_groot import MergeVLAMerger
+    
+    use_moe = getattr(args, 'use_moe', False)
+    use_soft_routing = getattr(args, 'use_soft_routing', False)
     
     print(f"\n{'='*60}")
     print(f"⭐ MergeVLA-Style Merging")
@@ -1066,7 +1075,17 @@ def run_mergevla_merge(args):
     print(f"   1. 计算 Task Vectors: τ = θ_expert - θ_base")
     print(f"   2. 融合权重: θ_merged = θ_base + α_narrower * τ_narrower + α_wider * τ_wider")
     print(f"   3. 使用稀疏激活的 LoRA 适配器对齐分布（MergeVLA 核心）")
-    print(f"   4. Action head 使用 cross-attention（GROOT 已满足）")
+    
+    if use_moe:
+        print(f"\n🎯 MoE 模式已启用（基于论文 Section 3.2 Expert Head）")
+        print(f"   - Backbone: 融合")
+        print(f"   - Action Head (DiT): 保留每个任务独立的 Expert Head，不融合")
+        print(f"   - 推理时使用 Smart Routing 选择使用哪个 Expert Head")
+        print(f"   - 软路由: {'是' if use_soft_routing else '否（硬路由）'}")
+    else:
+        print(f"   4. Action head: 只使用 narrower 的（wider 的 DiT 被丢弃！）")
+        print(f"   ⚠️ 警告：这会导致 wider 任务能力丢失！")
+        print(f"   💡 推荐使用 --use_moe 启用 MoE 模式")
     print(f"\n")
     
     # 创建 MergeVLA 融合器
@@ -1083,6 +1102,8 @@ def run_mergevla_merge(args):
         merge_action_head=getattr(args, 'merge_action_head', False),
         use_sparse_merge=getattr(args, 'use_sparse_merge', True),  # ⭐ Section 4.1 稀疏掩码融合
         sparse_merge_lambda=getattr(args, 'sparse_merge_lambda', 1.0),  # ⭐ 容忍度系数
+        use_moe=use_moe,  # ⭐ MoE 模式
+        use_soft_routing=use_soft_routing,  # ⭐ 软路由
     )
     
     # 加载并融合
@@ -1302,6 +1323,14 @@ def main():
                        help="Disable sparse mask merging (use simple linear interpolation)")
     parser.add_argument("--sparse_merge_lambda", type=float, default=1.0,
                        help="Tolerance coefficient λ for sparse mask (paper default: 1.0). Higher = more strict = sparser masks")
+    
+    # ⭐ MoE 模式（多专家动作头）- 基于 MergeVLA Section 3.2 "Expert Head" 概念
+    parser.add_argument("--use_moe", action="store_true", default=False,
+                       help="⭐ Use MoE mode: keep separate action_heads (Expert Heads) for each task. "
+                            "Based on MergeVLA Section 3.2: 'each task keeps its own expert head'. "
+                            "This is the RECOMMENDED way to preserve task-specific action generation capabilities!")
+    parser.add_argument("--use_soft_routing", action="store_true", default=False,
+                       help="Use soft routing (weighted average of experts) instead of hard routing (select one expert)")
     
     parser.add_argument("--adapter_epochs", type=int, default=20,
                        help="Number of epochs to train the distribution adapter")
