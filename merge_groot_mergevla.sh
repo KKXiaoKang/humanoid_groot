@@ -77,6 +77,14 @@ echo ""
 #   --use_sparse_merge: 使用公式 S_m = I[|τ_m| > λ|τ_merge - τ_m|] 计算任务掩码
 #   --sparse_merge_lambda: 容忍度系数 λ（论文默认 1.0，越大越稀疏）
 #   这会过滤掉参数级别的符号冲突，保留对各任务有意义的参数更新
+#
+# ⭐ MoE 模式（推荐！基于论文 Section 3.2 "Expert Head" 概念）：
+#   --use_moe: 保留每个任务独立的 action_head (DiT)，不融合
+#              因为 DiT 对参数变化极其敏感，无法直接线性融合
+#              推理时通过 Smart Routing 或固定路由选择使用哪个专家
+#   
+#   ❌ 错误方式：--merge_action_head（线性融合 DiT，会导致性能崩溃）
+#   ✅ 正确方式：--use_moe（保留两个独立的 DiT，通过路由选择）
 python scripts/train_weight_merge.py \
     --method mergevla \
     --narrower_path "${NARROWER_PATH}" \
@@ -91,7 +99,7 @@ python scripts/train_weight_merge.py \
     --batch_size 64 \
     --device "${DEVICE}" \
     --use_default_datasets \
-    --merge_action_head \
+    --use_moe \
     --episode-based \
     --num-episodes 120 \
     --use_sparse_merge \
@@ -99,13 +107,39 @@ python scripts/train_weight_merge.py \
 
 echo ""
 echo "=========================================="
-echo "✅ MergeVLA merging completed!"
+echo "✅ MergeVLA (MoE 模式) merging completed!"
 echo "=========================================="
 echo ""
-echo "💡 To evaluate the merged model:"
+echo "💡 推理命令（MoE 模式支持选择不同专家）："
+echo ""
+echo "   # 使用 narrower 专家（抓窄箱子）"
+echo "   python eval/eval_merged_groot.py \\"
+echo "       --model_path ${OUTPUT_PATH} \\"
+echo "       --rtc.enabled=true \\"
+echo "       --rtc.execution_horizon=10 \\"
+echo "       --task=\"Depalletize the box\" \\"
+echo "       --task_type=narrower"
+echo ""
+echo "   # 使用 wider 专家（抓宽箱子）"
+echo "   python eval/eval_merged_groot.py \\"
+echo "       --model_path ${OUTPUT_PATH} \\"
+echo "       --rtc.enabled=true \\"
+echo "       --rtc.execution_horizon=10 \\"
+echo "       --task=\"Depalletize the box\" \\"
+echo "       --task_type=wider"
+echo ""
+echo "   # 使用智能路由（根据输入自动选择专家）"
+echo "   python eval/eval_merged_groot.py \\"
+echo "       --model_path ${OUTPUT_PATH} \\"
+echo "       --rtc.enabled=true \\"
+echo "       --rtc.execution_horizon=10 \\"
+echo "       --task=\"Depalletize the box\" \\"
+echo "       --smart_routing=true"
+echo ""
+echo "💡 数据集离线评估："
 echo "   python scripts/eval_merged_groot_on_dataset.py \\"
 echo "       --model-path ${OUTPUT_PATH} \\"
 echo "       --dataset-root /path/to/dataset \\"
 echo "       --episode 0 \\"
-echo "       --action-chunk-size 32 \\"
+echo "       --task-type narrower \\"
 echo "       --visualize"
