@@ -621,6 +621,29 @@ def main(cfg: MergeVLAConfig):
         get_actions_thread.join()
         actor_thread.join()
         
+        # ⭐ 打印智能任务路由统计（如果使用了 smart_routing）
+        if cfg.smart_routing and model.adapter is not None:
+            try:
+                routing_stats = model.adapter.get_routing_stats()
+                if routing_stats:
+                    print(f"\n{'='*60}")
+                    print(f"⭐ MergeVLA Smart Routing 统计")
+                    print(f"{'='*60}")
+                    print(f"   总调用次数: {routing_stats.get('total_calls', 0)}")
+                    print(f"   倾向 Task 0 (narrower): {routing_stats.get('task_0', 0)} 次 "
+                          f"({routing_stats.get('task_0_ratio', 0)*100:.1f}%)")
+                    print(f"   倾向 Task 1 (wider): {routing_stats.get('task_1', 0)} 次 "
+                          f"({routing_stats.get('task_1_ratio', 0)*100:.1f}%)")
+                    print(f"   混合路由: {routing_stats.get('mixed', 0)} 次 "
+                          f"({routing_stats.get('mixed_ratio', 0)*100:.1f}%)")
+                    print(f"{'='*60}")
+                    
+                    # 重置路由统计（为下一次推理准备）
+                    model.adapter.reset_routing_stats()
+            except AttributeError:
+                # 适配层可能没有路由统计方法
+                pass
+        
         logger.info("✅ 本轮推理完成")
 
 
