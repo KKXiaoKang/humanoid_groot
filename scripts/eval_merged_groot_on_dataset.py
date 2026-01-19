@@ -265,6 +265,7 @@ def wrap_policy_with_adapter(
     adapter: DistributionAdapter, 
     task_type: str = None,
     use_smart_routing: bool = False,  # ⭐ 是否使用 MergeVLA 风格的智能任务路由
+    swap_task_mapping: bool = False,  # ⚠️ 是否交换任务映射
 ):
     """
     包装 GrootPolicy，使其在推理时使用适配层
@@ -273,23 +274,35 @@ def wrap_policy_with_adapter(
         policy: GrootPolicy 实例
         adapter: DistributionAdapter 实例
         task_type: 任务类型 ("narrower", "wider", None)
-                   - "narrower": 使用 task_id=0 的适配器参数
-                   - "wider": 使用 task_id=1 的适配器参数
+                   - "narrower": 使用 task_id=0 的适配器参数（或 task_id=1 如果 swap）
+                   - "wider": 使用 task_id=1 的适配器参数（或 task_id=0 如果 swap）
                    - None: 如果 use_smart_routing=True，使用智能任务路由；
                           否则使用所有任务的平均
         use_smart_routing: ⭐ 是否使用 MergeVLA 风格的智能任务路由
                           当 task_type=None 时，根据输入特征自动推断任务类型
+        swap_task_mapping: ⚠️ 是否交换任务映射（narrower↔wider）
+                          如果 Smart Routing 结果相反，使用此选项
     """
     if adapter is None:
         return
     
     # ⚠️ 关键：根据任务类型设置 task_id
     if task_type == "narrower":
-        fixed_task_id = torch.tensor([0], device=next(adapter.parameters()).device)
-        print(f"   ⚠️ 使用任务路由: task_type=narrower (task_id=0)")
+        # 如果 swap，narrower 使用 task_id=1
+        actual_task_id = 1 if swap_task_mapping else 0
+        fixed_task_id = torch.tensor([actual_task_id], device=next(adapter.parameters()).device)
+        if swap_task_mapping:
+            print(f"   ⚠️ 使用任务路由: task_type=narrower → task_id=1 (已交换映射)")
+        else:
+            print(f"   ⚠️ 使用任务路由: task_type=narrower (task_id=0)")
     elif task_type == "wider":
-        fixed_task_id = torch.tensor([1], device=next(adapter.parameters()).device)
-        print(f"   ⚠️ 使用任务路由: task_type=wider (task_id=1)")
+        # 如果 swap，wider 使用 task_id=0
+        actual_task_id = 0 if swap_task_mapping else 1
+        fixed_task_id = torch.tensor([actual_task_id], device=next(adapter.parameters()).device)
+        if swap_task_mapping:
+            print(f"   ⚠️ 使用任务路由: task_type=wider → task_id=0 (已交换映射)")
+        else:
+            print(f"   ⚠️ 使用任务路由: task_type=wider (task_id=1)")
     else:
         fixed_task_id = None
         if use_smart_routing:
@@ -447,6 +460,7 @@ def eval_on_dataset(
     infer_per_frame: int = 1,
     task_type: str = None,
     use_smart_routing: bool = False,  # ⭐ 是否使用 MergeVLA 智能任务路由
+    swap_task_mapping: bool = False,  # ⚠️ 是否交换任务映射
 ):
     """
     在数据集上评估融合模型
@@ -466,6 +480,7 @@ def eval_on_dataset(
                    必须指定任务类型！否则会使用所有任务的平均。
         use_smart_routing: ⭐ 是否使用 MergeVLA 风格的智能任务路由
                           当任务身份未知时，根据模型内部参数子空间
+        swap_task_mapping: ⚠️ 是否交换任务映射（如果 Smart Routing 结果相反）
                           自动推断任务相关性（参考 MergeVLA 论文 Section 3.3）
     """
     infer_per_frame = max(1, infer_per_frame)  # 至少每帧推理一次
@@ -569,6 +584,7 @@ def eval_on_dataset(
                 adapter, 
                 task_type=task_type,
                 use_smart_routing=use_smart_routing,  # ⭐ MergeVLA 智能任务路由
+                swap_task_mapping=swap_task_mapping,  # ⚠️ 交换任务映射
             )
         else:
             print(f"\n⚠️  WARNING: Adapter layer is DISABLED for testing!")
@@ -1182,6 +1198,12 @@ if __name__ == "__main__":
                             'based on model internal parameter subspaces (value projection). '
                             'This is the recommended mode for mixed-task evaluation! '
                             '(Reference: MergeVLA paper Section 3.3)')
+    parser.add_argument('--swap-task-mapping', action='store_true',
+                       dest='swap_task_mapping',
+                       help='⚠️ Swap task mapping: narrower↔wider. '
+                            'Use this if Smart Routing gives opposite results. '
+                            'When enabled: --task-type narrower uses task_id=1, '
+                            '--task-type wider uses task_id=0.')
     
     args = parser.parse_args()
     
@@ -1220,4 +1242,5 @@ if __name__ == "__main__":
         infer_per_frame=args.infer_per_frame,
         task_type=args.task_type,
         use_smart_routing=args.smart_routing,  # ⭐ MergeVLA 智能任务路由
+        swap_task_mapping=args.swap_task_mapping,  # ⚠️ 交换任务映射
     )

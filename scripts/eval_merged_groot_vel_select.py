@@ -720,6 +720,20 @@ def load_adapter(policy, model_path: str, merge_config: dict, device: str = "cud
     adapter.eval()
     adapter.to(device)
     
+    # ⚠️ 关键修复：限制 residual_scale 以避免 chunk 变平
+    # 实验发现：当 residual_scale > 0.10 时，Flow Matching 迭代去噪会崩溃
+    # 导致所有时间步收敛到相似的值（chunk 变平）
+    MAX_SAFE_RESIDUAL_SCALE = 0.10
+    with torch.no_grad():
+        if hasattr(adapter, 'adapter') and hasattr(adapter.adapter, 'residual_scale'):
+            original_scale = adapter.adapter.residual_scale.item()
+            if original_scale > MAX_SAFE_RESIDUAL_SCALE:
+                adapter.adapter.residual_scale.fill_(MAX_SAFE_RESIDUAL_SCALE)
+                mergevla_logger.warning(f"   ⚠️ 修复 residual_scale: {original_scale:.4f} → {MAX_SAFE_RESIDUAL_SCALE:.4f}")
+                mergevla_logger.warning(f"      原因：residual_scale > 0.10 会导致 Flow Matching 崩溃，chunk 变平")
+            else:
+                mergevla_logger.info(f"   ✅ residual_scale={original_scale:.4f} 在安全范围内")
+    
     mergevla_logger.info(f"   ✅ 适配层加载成功，参数量: {sum(p.numel() for p in adapter.parameters()):,}")
     return adapter
 
@@ -729,6 +743,7 @@ def wrap_policy_with_adapter(
     adapter,
     task_type: str = None,
     use_smart_routing: bool = False,
+    swap_task_mapping: bool = False,  # ⚠️ 是否交换任务映射
 ):
     """
     包装 GrootPolicy，使其在推理时使用适配层
@@ -737,22 +752,34 @@ def wrap_policy_with_adapter(
         policy: GrootPolicy 实例
         adapter: DistributionAdapter 实例
         task_type: 任务类型 ("narrower", "wider", None)
-                   - "narrower": 使用 task_id=0 的适配器参数
-                   - "wider": 使用 task_id=1 的适配器参数
+                   - "narrower": 使用 task_id=0 的适配器参数（或 task_id=1 如果 swap）
+                   - "wider": 使用 task_id=1 的适配器参数（或 task_id=0 如果 swap）
                    - None: 如果 use_smart_routing=True，使用智能任务路由；
                           否则使用所有任务的平均
         use_smart_routing: ⭐ 是否使用 MergeVLA 风格的智能任务路由
                           当 task_type=None 时，根据输入特征自动推断任务类型
+        swap_task_mapping: ⚠️ 是否交换任务映射（narrower↔wider）
+                          如果 Smart Routing 结果相反，使用此选项
     """
     import torch
     
     # ⚠️ 关键：根据任务类型设置 task_id
     if task_type == "narrower":
-        fixed_task_id = torch.tensor([0], device=next(adapter.parameters()).device)
-        mergevla_logger.info(f"   ⚠️ 使用任务路由: task_type=narrower (task_id=0)")
+        # 如果 swap，narrower 使用 task_id=1
+        actual_task_id = 1 if swap_task_mapping else 0
+        fixed_task_id = torch.tensor([actual_task_id], device=next(adapter.parameters()).device)
+        if swap_task_mapping:
+            mergevla_logger.info(f"   ⚠️ 使用任务路由: task_type=narrower → task_id=1 (已交换映射)")
+        else:
+            mergevla_logger.info(f"   ⚠️ 使用任务路由: task_type=narrower (task_id=0)")
     elif task_type == "wider":
-        fixed_task_id = torch.tensor([1], device=next(adapter.parameters()).device)
-        mergevla_logger.info(f"   ⚠️ 使用任务路由: task_type=wider (task_id=1)")
+        # 如果 swap，wider 使用 task_id=0
+        actual_task_id = 0 if swap_task_mapping else 1
+        fixed_task_id = torch.tensor([actual_task_id], device=next(adapter.parameters()).device)
+        if swap_task_mapping:
+            mergevla_logger.info(f"   ⚠️ 使用任务路由: task_type=wider → task_id=0 (已交换映射)")
+        else:
+            mergevla_logger.info(f"   ⚠️ 使用任务路由: task_type=wider (task_id=1)")
     else:
         fixed_task_id = None
         if use_smart_routing:
@@ -787,7 +814,7 @@ def wrap_policy_with_adapter(
     mergevla_logger.info(f"   ✅ Policy 已包装适配层 (路由模式: {routing_mode})")
 
 
-def load_model_and_env(ckpt_path, model_type, action_chunk_size=50, enable_gui=False, rotate_head_camera=False, state_zero=False, task_description=None, claw_lock_threshold=50.0, claw_lock_count_threshold=5, claw_locked_value=90.0, disable_adapter=False, task_type=None, use_smart_routing=False):
+def load_model_and_env(ckpt_path, model_type, action_chunk_size=50, enable_gui=False, rotate_head_camera=False, state_zero=False, task_description=None, claw_lock_threshold=50.0, claw_lock_count_threshold=5, claw_locked_value=90.0, disable_adapter=False, task_type=None, use_smart_routing=False, swap_task_mapping=False):
     """
     加载模型和环境（只执行一次，避免重复加载）
     
@@ -908,6 +935,7 @@ def load_model_and_env(ckpt_path, model_type, action_chunk_size=50, enable_gui=F
                     adapter,
                     task_type=task_type,
                     use_smart_routing=use_smart_routing,
+                    swap_task_mapping=swap_task_mapping,  # ⚠️ 交换任务映射
                 )
                 print("=" * 60)
             except Exception as e:
@@ -2048,7 +2076,7 @@ def final_reset_arm(json_path, env, control_arm=True, control_claw=True):
     rospy.loginfo("Arm reset completed!")
 
 
-def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chunk_size=50, enable_gui=False, rotate_head_camera=False, state_zero=False, task_description=None, chunk_start=None, chunk_end=None, model_action_dt=None, sync_mode=False, max_joint_velocity=None, constant_velocity=False, action_stride=1, claw_lock_threshold=50.0, claw_lock_count_threshold=5, claw_locked_value=90.0, disable_adapter=False, task_type=None, use_smart_routing=False):
+def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chunk_size=50, enable_gui=False, rotate_head_camera=False, state_zero=False, task_description=None, chunk_start=None, chunk_end=None, model_action_dt=None, sync_mode=False, max_joint_velocity=None, constant_velocity=False, action_stride=1, claw_lock_threshold=50.0, claw_lock_count_threshold=5, claw_locked_value=90.0, disable_adapter=False, task_type=None, use_smart_routing=False, swap_task_mapping=False):
     """
     在这里和实机/仿真交互，做网络推理（depalletize任务）
     支持多次推理：按'q'退出当前推理，可以快速重新开始下一次推理而无需重新加载模型
@@ -2099,6 +2127,7 @@ def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chun
         disable_adapter=disable_adapter,
         task_type=task_type,
         use_smart_routing=use_smart_routing,
+        swap_task_mapping=swap_task_mapping,  # ⚠️ 交换任务映射
     )
     
     # 主循环：支持多次推理
@@ -2293,6 +2322,12 @@ if __name__ == '__main__':
                              'based on model internal parameter subspaces (value projection). '
                              'This is the recommended mode for mixed-task evaluation! '
                              '(Reference: MergeVLA paper Section 3.3)')
+    parser.add_argument('--swap-task-mapping', action='store_true',
+                        dest='swap_task_mapping',
+                        help='⚠️ Swap task mapping: narrower↔wider. '
+                             'Use this if Smart Routing gives opposite results. '
+                             'When enabled: --task-type narrower uses task_id=1, '
+                             '--task-type wider uses task_id=0.')
     
     args = parser.parse_args()
     
@@ -2399,6 +2434,7 @@ if __name__ == '__main__':
              disable_adapter=args.disable_adapter,
              task_type=args.task_type,
              use_smart_routing=args.smart_routing,
+             swap_task_mapping=args.swap_task_mapping,  # ⚠️ 交换任务映射
         )
     elif args.replay:
         print("Replaying the model")

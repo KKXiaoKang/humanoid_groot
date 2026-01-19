@@ -92,13 +92,27 @@ class MergeVLAConfig:
     # 适配层控制
     disable_adapter: bool = field(default=False, metadata={"help": "禁用适配层（调试用）"})
     
+    # ⭐ 任务路由控制
+    task_type: Optional[str] = field(
+        default=None, 
+        metadata={"help": "任务类型: narrower 或 wider。不指定则使用 smart_routing 或平均"}
+    )
+    smart_routing: bool = field(
+        default=False, 
+        metadata={"help": "启用 MergeVLA 智能任务路由（根据输入特征自动推断任务类型）"}
+    )
+    swap_task_mapping: bool = field(
+        default=False, 
+        metadata={"help": "交换任务映射 (narrower↔wider)，当 Smart Routing 结果相反时使用"}
+    )
+    
     # 动作队列配置
     # ⚠️ 关键参数：控制何时触发新推理
     # 值太大(如90)会导致频繁推理，chunk间不连续导致抖动
     # 值太小可能导致队列耗尽，动作断档
     # 推荐：设置为 execution_horizon * 5 左右（如 10 * 5 = 50）
     action_queue_size_to_get_new_actions: int = field(
-        default=50,  # 从90改为50，减少推理频率
+        default=90,  # 从90改为50，减少推理频率
         metadata={"help": "触发新推理的动作队列阈值（推荐: execution_horizon * 5）"}
     )
     
@@ -184,20 +198,78 @@ def load_adapter(policy, model_path: str, merge_config: dict, device: str = "cud
     adapter.eval()
     adapter.to(device)
     
+    # ⚠️ 关键修复：限制 residual_scale 以避免 chunk 变平
+    # 实验发现：当 residual_scale > 0.10 时，Flow Matching 迭代去噪会崩溃
+    # 导致所有时间步收敛到相似的值（chunk 变平）
+    MAX_SAFE_RESIDUAL_SCALE = 0.10
+    with torch.no_grad():
+        if hasattr(adapter, 'adapter') and hasattr(adapter.adapter, 'residual_scale'):
+            original_scale = adapter.adapter.residual_scale.item()
+            if original_scale > MAX_SAFE_RESIDUAL_SCALE:
+                adapter.adapter.residual_scale.fill_(MAX_SAFE_RESIDUAL_SCALE)
+                logger.warning(f"   ⚠️ 修复 residual_scale: {original_scale:.4f} → {MAX_SAFE_RESIDUAL_SCALE:.4f}")
+                logger.warning(f"      原因：residual_scale > 0.10 会导致 Flow Matching 崩溃，chunk 变平")
+            else:
+                logger.info(f"   ✅ residual_scale={original_scale:.4f} 在安全范围内")
+    
     logger.info(f"   ✅ 适配层加载成功，参数量: {sum(p.numel() for p in adapter.parameters()):,}")
     return adapter
 
 
-def wrap_policy_with_adapter(policy, adapter):
-    """包装 GrootPolicy，使其在推理时使用适配层"""
+def wrap_policy_with_adapter(
+    policy, 
+    adapter,
+    task_type: str = None,
+    use_smart_routing: bool = False,
+    swap_task_mapping: bool = False,
+):
+    """
+    包装 GrootPolicy，使其在推理时使用适配层
+    
+    Args:
+        policy: GrootPolicy 实例
+        adapter: DistributionAdapter 实例
+        task_type: 任务类型 ("narrower", "wider", None)
+                   - "narrower": 使用 task_id=0 的适配器参数（或 task_id=1 如果 swap）
+                   - "wider": 使用 task_id=1 的适配器参数（或 task_id=0 如果 swap）
+                   - None: 如果 use_smart_routing=True，使用智能任务路由；
+                          否则使用所有任务的平均
+        use_smart_routing: ⭐ 是否使用 MergeVLA 风格的智能任务路由
+        swap_task_mapping: ⚠️ 是否交换任务映射（narrower↔wider）
+    """
+    # ⚠️ 关键：根据任务类型设置 task_id
+    if task_type == "narrower":
+        actual_task_id = 1 if swap_task_mapping else 0
+        fixed_task_id = torch.tensor([actual_task_id], device=next(adapter.parameters()).device)
+        if swap_task_mapping:
+            logger.info(f"   ⚠️ 使用任务路由: task_type=narrower → task_id=1 (已交换映射)")
+        else:
+            logger.info(f"   ⚠️ 使用任务路由: task_type=narrower (task_id=0)")
+    elif task_type == "wider":
+        actual_task_id = 0 if swap_task_mapping else 1
+        fixed_task_id = torch.tensor([actual_task_id], device=next(adapter.parameters()).device)
+        if swap_task_mapping:
+            logger.info(f"   ⚠️ 使用任务路由: task_type=wider → task_id=0 (已交换映射)")
+        else:
+            logger.info(f"   ⚠️ 使用任务路由: task_type=wider (task_id=1)")
+    else:
+        fixed_task_id = None
+        if use_smart_routing:
+            logger.info(f"   ⭐ 使用 MergeVLA 智能任务路由 (Test-Time Task Routing)")
+        else:
+            logger.warning(f"   ⚠️ 未指定任务类型，使用所有任务的平均")
     
     def get_action_with_adapter(inputs: dict, **kwargs):
         backbone_inputs, action_inputs = policy._groot_model.prepare_input(inputs)
         backbone_outputs = policy._groot_model.backbone(backbone_inputs)
         
-        # 通过适配层
+        # 通过适配层（支持智能任务路由）
         backbone_features = backbone_outputs[BACKBONE_FEATURE_KEY]
-        adapted_features = adapter(backbone_features, task_id=None)
+        adapted_features = adapter(
+            backbone_features, 
+            task_id=fixed_task_id,
+            use_smart_routing=use_smart_routing
+        )
         backbone_outputs[BACKBONE_FEATURE_KEY] = adapted_features
         
         # 通过 action_head
@@ -207,7 +279,8 @@ def wrap_policy_with_adapter(policy, adapter):
         )
     
     policy._groot_model.get_action = get_action_with_adapter
-    logger.info(f"   ✅ Policy 已包装适配层")
+    routing_mode = "智能任务路由" if use_smart_routing else ("固定任务" if fixed_task_id is not None else "简单平均")
+    logger.info(f"   ✅ Policy 已包装适配层 (路由模式: {routing_mode})")
 
 
 def load_mergevla_model(cfg: MergeVLAConfig) -> ModelWrapper:
@@ -237,7 +310,13 @@ def load_mergevla_model(cfg: MergeVLAConfig) -> ModelWrapper:
     if not cfg.disable_adapter:
         logger.info(f"🔧 加载 MergeVLA 适配层...")
         adapter = load_adapter(policy, cfg.model_path, merge_config, cfg.device)
-        wrap_policy_with_adapter(policy, adapter)
+        wrap_policy_with_adapter(
+            policy, 
+            adapter,
+            task_type=cfg.task_type,
+            use_smart_routing=cfg.smart_routing,
+            swap_task_mapping=cfg.swap_task_mapping,
+        )
     else:
         logger.warning("⚠️ 适配层已禁用")
     
@@ -464,7 +543,16 @@ def main(cfg: MergeVLAConfig):
     print(f"{'='*60}")
     print(f"   模型: {cfg.model_path}")
     print(f"   适配层: {'✅ 已启用' if model.adapter else '❌ 已禁用'}")
-    print(f"   任务: {cfg.task}")
+    print(f"   任务描述: {cfg.task}")
+    print(f"{'='*60}")
+    # ⭐ 任务路由配置
+    if cfg.task_type:
+        swap_info = " (映射已交换)" if cfg.swap_task_mapping else ""
+        print(f"   🎯 任务路由: 固定 task_type={cfg.task_type}{swap_info}")
+    elif cfg.smart_routing:
+        print(f"   ⭐ 任务路由: MergeVLA 智能路由")
+    else:
+        print(f"   ⚠️ 任务路由: 简单平均（可能导致动作混乱！）")
     print(f"{'='*60}")
     print(f"   推理频率: {cfg.fps} Hz")
     print(f"   推理周期: {cfg.duration} 秒")
