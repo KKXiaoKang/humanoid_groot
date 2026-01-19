@@ -95,8 +95,8 @@ python scripts/train_weight_merge.py \
     --lora_rank 32 \
     --sparsity 0.6 \
     --adapter_epochs 100 \
-    --adapter_lr 5e-5 \
-    --batch_size 64 \
+    --adapter_lr 1e-4 \
+    --batch_size 80 \
     --device "${DEVICE}" \
     --use_default_datasets \
     --use_moe \
