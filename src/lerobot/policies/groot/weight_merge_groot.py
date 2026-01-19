@@ -1278,7 +1278,15 @@ class SparseLoRAAdapter(nn.Module):
         self.task_masks = nn.Parameter(mask_init)
         
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
-        self.residual_scale = nn.Parameter(torch.ones(1))
+        # ⚠️ 关键修复：使用更小的初始值，避免特征分布变化过大
+        # 原来是 torch.ones(1)=1.0，导致适配器输出权重太大
+        # 改为 0.1，让适配器以更温和的方式修改特征
+        self.residual_scale = nn.Parameter(torch.full((1,), 0.1))
+        
+        # ⚠️ 关键：输出分布归一化（防止 chunk 变"平"）
+        # 如果适配器改变特征分布过大，Flow Matching 的迭代去噪会崩溃
+        # 导致所有时间步收敛到相同的值（平的 chunk）
+        self.normalize_output = True
         
         # ⭐ 用于测试时任务路由的诊断计数器
         self._routing_call_count = 0
@@ -1325,13 +1333,17 @@ class SparseLoRAAdapter(nn.Module):
             # 应用任务掩码
             A_t = lora_A[t] * task_masks[t].unsqueeze(-1)  # (hidden_size, rank)
             
+            # ⚠️ 关键修复：归一化 A 矩阵，消除范数差异的影响
+            # 否则范数更大的任务会永远被选中，无论输入是什么
+            A_t_normalized = A_t / (A_t.norm() + 1e-8)
+            
             # 将输入投影到任务子空间
-            # x: (B, T, hidden_size), A_t: (hidden_size, rank)
+            # x: (B, T, hidden_size), A_t_normalized: (hidden_size, rank)
             # projection: (B, T, rank)
-            projection = x @ A_t
+            projection = x @ A_t_normalized
             
             # 计算投影的范数作为相似度分数
-            # 范数越大，表示输入在该任务子空间的投影越强，即越相关
+            # 归一化后，分数只取决于输入特征与任务表示的"方向相似性"
             # 使用 L2 范数，对时间维度取平均
             score = projection.norm(dim=-1).mean(dim=-1)  # (B,)
             scores.append(score)
@@ -1446,7 +1458,27 @@ class SparseLoRAAdapter(nn.Module):
             lora_output = torch.stack(outputs, dim=0).mean(dim=0)  # (B, T, H)
         
         # 缩放并添加到输入
-        return x + residual_scale * (self.alpha / self.rank) * lora_output
+        output = x + residual_scale * (self.alpha / self.rank) * lora_output
+        
+        # ⚠️ 关键修复：确保输出分布与输入分布一致（可通过 normalize_output 控制）
+        # 这对于 Flow Matching 的迭代去噪非常重要
+        # 如果分布变化过大，action_head 的时序预测会崩溃（输出变成"平"的）
+        if getattr(self, 'normalize_output', True):  # 默认启用
+            # 计算输入和输出的统计量
+            x_mean = x.mean()
+            x_std = x.std() + 1e-8
+            out_mean = output.mean()
+            out_std = output.std() + 1e-8
+            
+            # 如果分布变化超过阈值，进行归一化
+            mean_diff_ratio = abs(out_mean - x_mean) / (abs(x_mean) + 1e-8)
+            std_diff_ratio = abs(out_std - x_std) / (abs(x_std) + 1e-8)
+            
+            if mean_diff_ratio > 0.15 or std_diff_ratio > 0.15:
+                # 归一化输出以匹配输入分布
+                output = (output - out_mean) / out_std * x_std + x_mean
+        
+        return output
     
     def get_routing_stats(self) -> dict:
         """获取任务路由统计信息"""

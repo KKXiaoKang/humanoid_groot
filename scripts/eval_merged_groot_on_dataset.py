@@ -211,6 +211,20 @@ def load_adapter_if_needed(policy: GrootPolicy, model_path: str, merge_config: d
         adapter.eval()  # 设置为评估模式
         adapter.to(next(policy.parameters()).device)
         
+        # ⚠️ 关键修复：限制 residual_scale 以避免 chunk 变平
+        # 实验发现：当 residual_scale > 0.10 时，Flow Matching 迭代去噪会崩溃
+        # 导致所有时间步收敛到相似的值（chunk 变平）
+        MAX_SAFE_RESIDUAL_SCALE = 0.10
+        with torch.no_grad():
+            if hasattr(adapter, 'adapter') and hasattr(adapter.adapter, 'residual_scale'):
+                original_scale = adapter.adapter.residual_scale.item()
+                if original_scale > MAX_SAFE_RESIDUAL_SCALE:
+                    adapter.adapter.residual_scale.fill_(MAX_SAFE_RESIDUAL_SCALE)
+                    print(f"   ⚠️ 修复 residual_scale: {original_scale:.4f} → {MAX_SAFE_RESIDUAL_SCALE:.4f}")
+                    print(f"      原因：residual_scale > 0.10 会导致 Flow Matching 崩溃，chunk 变平")
+                else:
+                    print(f"   ✅ residual_scale={original_scale:.4f} 在安全范围内")
+        
         print(f"   ✅ 适配层权重加载成功")
         print(f"   📊 适配层参数数量: {sum(p.numel() for p in adapter.parameters()):,}")
         
