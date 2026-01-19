@@ -1697,6 +1697,44 @@ class DistributionAdapter(nn.Module):
 # backbone_merged → Sparse LoRA Adapter → [Router] → Expert Head 0 (narrower) → action
 #                                                  ↘ Expert Head 1 (wider) → action
 
+class DictWithAttrAccess:
+    """
+    将 dict 包装成可以通过属性访问的对象
+    
+    解决 FlowmatchingActionHead.forward 期望 backbone_output.backbone_features 的问题
+    """
+    def __init__(self, d: dict):
+        self._data = d
+    
+    def __getattr__(self, name):
+        if name.startswith('_'):
+            return object.__getattribute__(self, name)
+        if name in self._data:
+            return self._data[name]
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+    
+    def __getitem__(self, key):
+        return self._data[key]
+    
+    def __setitem__(self, key, value):
+        self._data[key] = value
+    
+    def __contains__(self, key):
+        return key in self._data
+    
+    def keys(self):
+        return self._data.keys()
+    
+    def values(self):
+        return self._data.values()
+    
+    def items(self):
+        return self._data.items()
+    
+    def get(self, key, default=None):
+        return self._data.get(key, default)
+
+
 class MoEActionHead(nn.Module):
     """
     MoE 风格的多专家动作头 ⭐
@@ -1733,6 +1771,16 @@ class MoEActionHead(nn.Module):
         print(f"      Soft routing: {use_soft_routing}")
         print(f"      Temperature: {routing_temperature}")
     
+    def _wrap_backbone_outputs(self, backbone_outputs):
+        """
+        将 backbone_outputs 包装成可以属性访问的对象
+        
+        FlowmatchingActionHead.forward 期望 backbone_output.backbone_features
+        """
+        if isinstance(backbone_outputs, dict) and not hasattr(backbone_outputs, 'backbone_features'):
+            return DictWithAttrAccess(backbone_outputs)
+        return backbone_outputs
+    
     def forward(
         self, 
         backbone_outputs: dict, 
@@ -1768,10 +1816,12 @@ class MoEActionHead(nn.Module):
                     continue
                 
                 # 提取这些样本的输入
-                expert_backbone_outputs = {
+                expert_backbone_outputs_dict = {
                     k: v[mask] if isinstance(v, torch.Tensor) and v.shape[0] == B else v
                     for k, v in backbone_outputs.items()
                 }
+                # ⚠️ 关键修复：包装成可属性访问的对象
+                expert_backbone_outputs = self._wrap_backbone_outputs(expert_backbone_outputs_dict)
                 
                 # 通过专家头
                 expert_output = self.expert_heads[expert_idx](
@@ -1794,14 +1844,16 @@ class MoEActionHead(nn.Module):
                 return {'loss': total_loss}
             else:
                 # Fallback：使用第一个专家
-                return self.expert_heads[0](backbone_outputs, action_inputs)
+                wrapped_outputs = self._wrap_backbone_outputs(backbone_outputs)
+                return self.expert_heads[0](wrapped_outputs, action_inputs)
         
         elif routing_weights is not None and self.use_soft_routing:
             # 软路由：加权平均各专家的 loss
             all_losses = []
+            wrapped_outputs = self._wrap_backbone_outputs(backbone_outputs)
             
             for expert_idx in range(self.num_experts):
-                expert_output = self.expert_heads[expert_idx](backbone_outputs, action_inputs)
+                expert_output = self.expert_heads[expert_idx](wrapped_outputs, action_inputs)
                 if hasattr(expert_output, 'data'):
                     expert_output = expert_output.data
                 
@@ -1814,11 +1866,12 @@ class MoEActionHead(nn.Module):
                 total_loss = sum(all_losses)
                 return {'loss': total_loss}
             else:
-                return self.expert_heads[0](backbone_outputs, action_inputs)
+                return self.expert_heads[0](wrapped_outputs, action_inputs)
         
         else:
             # 默认：使用第一个专家
-            return self.expert_heads[0](backbone_outputs, action_inputs)
+            wrapped_outputs = self._wrap_backbone_outputs(backbone_outputs)
+            return self.expert_heads[0](wrapped_outputs, action_inputs)
     
     def get_action(
         self, 
@@ -1840,6 +1893,9 @@ class MoEActionHead(nn.Module):
         Returns:
             dict with 'action_pred' and other outputs
         """
+        # ⚠️ 关键修复：包装成可属性访问的对象
+        wrapped_outputs = self._wrap_backbone_outputs(backbone_outputs)
+        
         if task_id is not None:
             # 固定路由：选择指定专家
             expert_idx = task_id[0].item() if isinstance(task_id, torch.Tensor) else task_id
@@ -1849,7 +1905,7 @@ class MoEActionHead(nn.Module):
             self._routing_call_count += 1
             
             return self.expert_heads[expert_idx].get_action(
-                backbone_outputs, action_inputs, **kwargs
+                wrapped_outputs, action_inputs, **kwargs
             )
         
         elif routing_weights is not None:
@@ -1861,14 +1917,14 @@ class MoEActionHead(nn.Module):
             self._routing_call_count += 1
             
             return self.expert_heads[expert_idx].get_action(
-                backbone_outputs, action_inputs, **kwargs
+                wrapped_outputs, action_inputs, **kwargs
             )
         
         else:
             # 默认：使用第一个专家
             self._routing_stats[self.expert_names[0]] += 1
             self._routing_call_count += 1
-            return self.expert_heads[0].get_action(backbone_outputs, action_inputs, **kwargs)
+            return self.expert_heads[0].get_action(wrapped_outputs, action_inputs, **kwargs)
     
     def get_routing_stats(self) -> dict:
         """获取路由统计"""
