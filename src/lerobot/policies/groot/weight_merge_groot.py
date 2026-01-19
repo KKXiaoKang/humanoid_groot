@@ -2707,7 +2707,7 @@ class MergeVLAMerger:
         train_dataloader,
         num_epochs: int = 20,
         learning_rate: float = 1e-3,  # MergeVLA 使用较大的学习率
-        warmup_ratio: float = 0.1,    # 预热步数占比
+        warmup_ratio: float = 0.05,   # 预热步数占比（更短的 warmup）
         use_cosine_schedule: bool = True,  # 使用 cosine 学习率衰减
         gradient_accumulation_steps: int = 1,  # 梯度累积步数
         max_grad_norm: float = 1.0,   # 梯度裁剪阈值
@@ -2717,26 +2717,30 @@ class MergeVLAMerger:
         
         使用 action loss 来优化适配层
         
-        ⭐ 稳定训练技巧：
-        1. 学习率预热 (warmup): 前 10% 步数线性预热
-        2. Cosine 学习率衰减: 平滑降低学习率
-        3. 梯度裁剪: 防止梯度爆炸
-        4. 梯度累积: 更稳定的梯度估计
+        ⭐ 学习率调度（类似 LeRobot）：
+        1. 快速预热: 前 5% 步数（或最多 100 步）快速达到峰值学习率
+        2. Cosine 退火: 平滑衰减到最小学习率
         """
-        from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+        from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, LambdaLR
+        import math
         
         # 计算总步数
-        total_steps = num_epochs * len(train_dataloader)
-        warmup_steps = int(total_steps * warmup_ratio)
+        steps_per_epoch = len(train_dataloader) // gradient_accumulation_steps
+        total_steps = num_epochs * steps_per_epoch
+        
+        # 快速 warmup: 使用固定步数或比例，取较小者
+        warmup_steps = min(int(total_steps * warmup_ratio), 100)  # 最多 100 步 warmup
+        warmup_steps = max(warmup_steps, 10)  # 至少 10 步
         
         print(f"\n{'='*60}")
-        print(f"🏋️ Training MergeVLA Adapter (稳定训练模式)")
+        print(f"🏋️ Training MergeVLA Adapter (LeRobot 风格调度)")
         print(f"   Epochs: {num_epochs}")
         print(f"   Learning rate: {learning_rate}")
         print(f"   Adapter type: {self.adapter_type}")
-        print(f"   ⭐ 稳定训练配置:")
+        print(f"   ⭐ 学习率调度配置 (类似 LeRobot):")
+        print(f"      Steps per epoch: {steps_per_epoch}")
         print(f"      Total steps: {total_steps}")
-        print(f"      Warmup steps: {warmup_steps} ({warmup_ratio*100:.0f}%)")
+        print(f"      Warmup steps: {warmup_steps} (快速预热)")
         print(f"      Cosine schedule: {use_cosine_schedule}")
         print(f"      Gradient accumulation: {gradient_accumulation_steps}")
         print(f"      Max grad norm: {max_grad_norm}")
@@ -2750,33 +2754,23 @@ class MergeVLAMerger:
             eps=1e-8,
         )
         
-        # ⭐ 学习率调度器：预热 + Cosine 衰减
-        if use_cosine_schedule and warmup_steps > 0:
-            # 线性预热
-            warmup_scheduler = LinearLR(
-                optimizer, 
-                start_factor=0.01,  # 从 1% 开始
-                end_factor=1.0, 
-                total_iters=warmup_steps
-            )
-            # Cosine 衰减
-            cosine_scheduler = CosineAnnealingLR(
-                optimizer, 
-                T_max=total_steps - warmup_steps,
-                eta_min=learning_rate * 0.01,  # 最小学习率 = 初始的 1%
-            )
-            # 组合调度器
-            scheduler = SequentialLR(
-                optimizer, 
-                schedulers=[warmup_scheduler, cosine_scheduler],
-                milestones=[warmup_steps]
-            )
-        elif use_cosine_schedule:
-            scheduler = CosineAnnealingLR(
-                optimizer, 
-                T_max=total_steps,
-                eta_min=learning_rate * 0.01,
-            )
+        # ⭐ LeRobot 风格的学习率调度: 快速 warmup + cosine 退火
+        if use_cosine_schedule:
+            def lr_lambda(current_step: int) -> float:
+                """
+                LeRobot 风格的学习率调度:
+                - Warmup: 线性从 0 增长到 1
+                - Cosine: 从 1 衰减到 0.01
+                """
+                if current_step < warmup_steps:
+                    # 快速线性预热
+                    return float(current_step) / float(max(1, warmup_steps))
+                else:
+                    # Cosine 退火
+                    progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+                    return max(0.01, 0.5 * (1.0 + math.cos(math.pi * progress)))
+            
+            scheduler = LambdaLR(optimizer, lr_lambda)
         else:
             scheduler = None
         

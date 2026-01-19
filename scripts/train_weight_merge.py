@@ -1341,9 +1341,9 @@ def main():
     parser.add_argument("--adapter_lr", type=float, default=1e-3,
                        help="Learning rate for adapter training (MergeVLA uses larger LR, default: 1e-3)")
     
-    # ⭐ 稳定训练参数
-    parser.add_argument("--warmup_ratio", type=float, default=0.1,
-                       help="Warmup ratio (percentage of total steps for linear warmup, default: 0.1)")
+    # ⭐ 稳定训练参数 (LeRobot 风格)
+    parser.add_argument("--warmup_ratio", type=float, default=0.05,
+                       help="Warmup ratio (default: 0.05, 最多 100 步快速预热，类似 LeRobot)")
     parser.add_argument("--use_cosine_schedule", action="store_true", default=True,
                        help="Use cosine learning rate schedule with warmup (default: True)")
     parser.add_argument("--no_cosine_schedule", action="store_false", dest="use_cosine_schedule",
