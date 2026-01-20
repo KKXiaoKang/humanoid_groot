@@ -188,8 +188,9 @@ TRAIN_ARGS=(
     --adapter_type sparse_lora
     --lora_rank 16
     --sparsity 0.5
-    --adapter_epochs 15
+    --adapter_epochs 0
     --adapter_lr 1e-4
+    --bypass_adapter
     --batch_size 32
     --device "${DEVICE}"
     --use_default_datasets

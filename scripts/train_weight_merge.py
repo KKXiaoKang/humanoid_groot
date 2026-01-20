@@ -1325,25 +1325,43 @@ def run_mergevla_merge(args):
             print(f"   缩放因子: {scale_factor:.3f} (num_gpus^0.3)")
             print(f"   缩放后学习率: {learning_rate:.2e}")
     
-    # 训练适配层（固定学习率，更稳定）
-    merger.train_adapter(
-        train_dataloader=dataloader,
-        num_epochs=args.adapter_epochs,
-        learning_rate=learning_rate,
-        decay_lr_ratio=getattr(args, 'decay_lr_ratio', 0.1),
-        warmup_ratio=getattr(args, 'warmup_ratio', 0.0),  # 不使用 warmup
-        use_cosine_schedule=getattr(args, 'use_cosine_schedule', False),  # 固定学习率
-        gradient_accumulation_steps=getattr(args, 'gradient_accumulation_steps', 1),
-        max_grad_norm=getattr(args, 'max_grad_norm', 1.0),
-        weight_decay=getattr(args, 'weight_decay', 1e-4),
-        use_ema=getattr(args, 'use_ema', True),
-        ema_decay=getattr(args, 'ema_decay', 0.999),
-        loss_scale=getattr(args, 'loss_scale', 1.0),
-        accelerator=accelerator,
-        wandb_run=wandb_run if use_wandb else None,
-        log_interval=getattr(args, 'log_interval', 10),
-        bypass_adapter=getattr(args, 'bypass_adapter', False),  # ⭐ 诊断模式
-    )
+    # ⭐ 如果 bypass_adapter=True 或 adapter_epochs=0，跳过 adapter 训练
+    skip_adapter_training = getattr(args, 'bypass_adapter', False) or args.adapter_epochs == 0
+    
+    if skip_adapter_training:
+        if is_main_process():
+            print(f"\n{'='*60}")
+            print(f"⏭️ SKIPPING Adapter Training")
+            if getattr(args, 'bypass_adapter', False):
+                print(f"   Reason: --bypass_adapter flag is set")
+            if args.adapter_epochs == 0:
+                print(f"   Reason: --adapter_epochs is 0")
+            print(f"   📦 Using MoE model with original backbone + expert heads")
+            print(f"   🎯 Smart Routing will select experts at inference time")
+            print(f"{'='*60}\n")
+        
+        # ⭐ 仍然需要将模型移到设备上
+        merger.merged_model = merger.merged_model.to(merger.device)
+    else:
+        # 训练适配层（固定学习率，更稳定）
+        merger.train_adapter(
+            train_dataloader=dataloader,
+            num_epochs=args.adapter_epochs,
+            learning_rate=learning_rate,
+            decay_lr_ratio=getattr(args, 'decay_lr_ratio', 0.1),
+            warmup_ratio=getattr(args, 'warmup_ratio', 0.0),  # 不使用 warmup
+            use_cosine_schedule=getattr(args, 'use_cosine_schedule', False),  # 固定学习率
+            gradient_accumulation_steps=getattr(args, 'gradient_accumulation_steps', 1),
+            max_grad_norm=getattr(args, 'max_grad_norm', 1.0),
+            weight_decay=getattr(args, 'weight_decay', 1e-4),
+            use_ema=getattr(args, 'use_ema', True),
+            ema_decay=getattr(args, 'ema_decay', 0.999),
+            loss_scale=getattr(args, 'loss_scale', 1.0),
+            accelerator=accelerator,
+            wandb_run=wandb_run if use_wandb else None,
+            log_interval=getattr(args, 'log_interval', 10),
+            bypass_adapter=getattr(args, 'bypass_adapter', False),
+        )
     
     # 保存（只在主进程保存）
     if accelerator is None or accelerator.is_main_process:
