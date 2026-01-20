@@ -183,14 +183,30 @@ if [ "$USE_MULTI_GPU" = true ]; then
     echo ""
     echo "🚀 使用 accelerate 启动多卡训练..."
     echo "   GPU 数量: $NUM_GPUS"
-    echo ""
     
-    accelerate launch \
-        --multi_gpu \
-        --num_processes=${NUM_GPUS} \
-        --mixed_precision=bf16 \
-        scripts/train_weight_merge.py \
-        "${TRAIN_ARGS[@]}"
+    # ⚠️ 重要：使用 --gpu_ids 而不是依赖 CUDA_VISIBLE_DEVICES
+    # accelerate 会自己管理 GPU 分配
+    if [ -n "$GPU_IDS" ]; then
+        echo "   GPU IDs: $GPU_IDS"
+        echo ""
+        # 使用 accelerate 的 --gpu_ids 参数明确指定使用哪些 GPU
+        accelerate launch \
+            --multi_gpu \
+            --num_processes=${NUM_GPUS} \
+            --gpu_ids="${GPU_IDS}" \
+            --mixed_precision=bf16 \
+            scripts/train_weight_merge.py \
+            "${TRAIN_ARGS[@]}"
+    else
+        echo ""
+        # 不指定 GPU IDs，让 accelerate 自动选择
+        accelerate launch \
+            --multi_gpu \
+            --num_processes=${NUM_GPUS} \
+            --mixed_precision=bf16 \
+            scripts/train_weight_merge.py \
+            "${TRAIN_ARGS[@]}"
+    fi
 else
     # 单卡训练：直接使用 python
     python scripts/train_weight_merge.py \

@@ -2974,9 +2974,13 @@ class MergeVLAMerger:
         print(f"   Action head layers: {action_head_count} ({'merged' if self.merge_action_head else 'using narrower'})")
         
         # 加载 base 模型结构
+        # ⚠️ 重要：模型会在 CPU 上初始化，稍后移动到指定设备
+        # 这避免了在 accelerate 设备分配之前占用错误的 GPU
         from lerobot.policies.groot.modeling_groot import GrootPolicy
+        print(f"\n📦 Loading base model structure (on CPU first)...")
         policy = GrootPolicy.from_pretrained(Path(self.narrower_path), strict=False)
         base_model = policy._groot_model
+        print(f"   ✅ Base model loaded, will move to {self.device}")
         
         # 获取 hidden_size
         hidden_size = None
@@ -3017,6 +3021,8 @@ class MergeVLAMerger:
             self.expert_state_dicts = [narrower_state_dict, wider_state_dict]
             
             # 创建 MoE 模型
+            # ⚠️ 注意：在多卡训练时，设备分配由 train_adapter 中的 accelerator 管理
+            # 这里先将模型创建在指定设备上，后续可能被 accelerator 重新分配
             self.merged_model = MergedModelWithMoE(
                 merged_backbone_state_dict=merged_state_dict,
                 expert_action_head_state_dicts=self.expert_state_dicts,
@@ -3027,7 +3033,13 @@ class MergeVLAMerger:
                 lora_rank=self.lora_rank,
                 sparsity=self.sparsity,
                 use_soft_routing=self.use_soft_routing,
-            ).to(self.device)
+            )
+            # 只在单卡模式下立即移动到设备，多卡模式由 accelerator 处理
+            if not str(self.device).startswith("cuda:") or int(str(self.device).split(":")[-1]) == 0:
+                self.merged_model = self.merged_model.to(self.device)
+                print(f"   📱 Model moved to {self.device}")
+            else:
+                print(f"   📱 Model will be moved to device by accelerator")
         else:
             # 原有模式：只使用一个 action_head
             self.merged_model = MergedModelWithAdapter(
@@ -3039,7 +3051,12 @@ class MergeVLAMerger:
                 lora_rank=self.lora_rank,
                 num_tasks=2,  # narrower, wider
                 sparsity=self.sparsity,
-            ).to(self.device)
+            )
+            if not str(self.device).startswith("cuda:") or int(str(self.device).split(":")[-1]) == 0:
+                self.merged_model = self.merged_model.to(self.device)
+                print(f"   📱 Model moved to {self.device}")
+            else:
+                print(f"   📱 Model will be moved to device by accelerator")
         
         # 加载预处理器
         self._load_processors(self.narrower_path)
@@ -3150,9 +3167,17 @@ class MergeVLAMerger:
         
         # ⭐ 使用 accelerate 包装模型、优化器、数据加载器
         if use_accelerate:
+            # ⚠️ 重要：首先将整个模型移动到正确的设备
+            # accelerator.device 会返回当前进程应该使用的设备
+            device = accelerator.device
+            if is_main:
+                print(f"   📱 Moving model to {device}...")
+            self.merged_model = self.merged_model.to(device)
+            
             # 准备模型和优化器
-            self.merged_model.adapter, optimizer = accelerator.prepare(
-                self.merged_model.adapter, optimizer
+            # 注意：用整个模型而不只是 adapter
+            self.merged_model, optimizer = accelerator.prepare(
+                self.merged_model, optimizer
             )
             # 准备数据加载器
             train_dataloader = accelerator.prepare(train_dataloader)

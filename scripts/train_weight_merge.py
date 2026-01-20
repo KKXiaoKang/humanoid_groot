@@ -1113,20 +1113,28 @@ def run_mergevla_merge(args):
     use_soft_routing = getattr(args, 'use_soft_routing', False)
     
     # ⭐ 检查是否使用 accelerate 多卡训练
+    # 注意：必须在任何 CUDA 操作之前初始化 accelerator
     accelerator = None
     world_size = get_world_size()
     is_distributed = world_size > 1
     
     if is_distributed and HAS_ACCELERATE:
-        # 创建 accelerator（DDP 配置）
+        # ⚠️ 重要：尽早创建 accelerator，在任何模型加载之前
+        # 这确保 accelerate 正确设置 CUDA 设备
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
         accelerator = Accelerator(
             mixed_precision="bf16",
             kwargs_handlers=[ddp_kwargs],
         )
+        # ⚠️ 关键：确保在正确的设备上进行后续操作
+        # accelerate 会设置每个进程的 CUDA_VISIBLE_DEVICES
+        import torch
+        torch.cuda.set_device(accelerator.local_process_index)
+        
         if accelerator.is_main_process:
             print(f"\n🚀 多卡训练模式启用！")
             print(f"   使用 {accelerator.num_processes} 张 GPU")
+            print(f"   当前进程: {accelerator.local_process_index}")
             print(f"   混合精度: bf16")
     
     if is_main_process():
