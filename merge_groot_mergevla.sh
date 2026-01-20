@@ -186,11 +186,16 @@ TRAIN_ARGS=(
     --base_model_path "${BASE_MODEL_PATH}"
     --output_path "${OUTPUT_PATH}"
     --adapter_type sparse_lora
-    --lora_rank 16
+    --lora_rank 32
     --sparsity 0.5
-    --adapter_epochs 0
-    --adapter_lr 1e-4
-    --bypass_adapter
+    # ⭐ 关键修改：启用 adapter 训练来修正特征分布偏移！
+    # 由于融合后的 backbone 是 50/50 混合，对 wider DiT 来说是"陌生"的分布
+    # adapter 会学习：
+    #   - narrower 任务：50/50 特征 → narrower 特征
+    #   - wider 任务：50/50 特征 → wider 特征
+    --adapter_epochs 50
+    --adapter_lr 5e-4
+    # --bypass_adapter  # ⚠️ 不要跳过 adapter！这是修正特征分布的关键
     --batch_size 32
     --device "${DEVICE}"
     --use_default_datasets
@@ -199,11 +204,10 @@ TRAIN_ARGS=(
     --num-episodes 32
     --use_sparse_merge
     --sparse_merge_lambda 1.0
-    --warmup_ratio 0.0
-    --no_cosine_schedule
+    --warmup_ratio 0.1
     --gradient_accumulation_steps 4
     --max_grad_norm 1.0
-    --weight_decay 0.0
+    --weight_decay 0.01
 )
 
 # ⭐ 添加 Weights & Biases 参数（如果启用）
