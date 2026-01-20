@@ -1342,6 +1342,7 @@ def run_mergevla_merge(args):
         accelerator=accelerator,
         wandb_run=wandb_run if use_wandb else None,
         log_interval=getattr(args, 'log_interval', 10),
+        bypass_adapter=getattr(args, 'bypass_adapter', False),  # ⭐ 诊断模式
     )
     
     # 保存（只在主进程保存）
@@ -1585,6 +1586,11 @@ def main():
                        help="W&B entity/team name (default: None, uses personal account)")
     parser.add_argument("--log_interval", type=int, default=10,
                        help="How often to log metrics to W&B (default: every 10 steps)")
+    
+    # ⭐ 诊断模式
+    parser.add_argument("--bypass_adapter", action="store_true", default=False,
+                       help="⭐ Diagnostic mode: bypass LoRA adapter and use original backbone features. "
+                            "Use this to test if the problem is in the adapter or elsewhere.")
     
     args = parser.parse_args()
     

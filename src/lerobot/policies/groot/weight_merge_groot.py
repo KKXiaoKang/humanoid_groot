@@ -2432,6 +2432,7 @@ class MergedModelWithMoE(nn.Module):
         inputs: dict, 
         task_id: torch.Tensor = None,
         use_smart_routing: bool = True,
+        bypass_adapter: bool = False,  # ⭐ 诊断模式：跳过 adapter
     ) -> dict:
         """
         前向传播（训练模式）
@@ -2440,6 +2441,7 @@ class MergedModelWithMoE(nn.Module):
             inputs: 模型输入
             task_id: (B,) - 任务ID，如果提供则使用固定路由
             use_smart_routing: 如果 task_id=None，是否使用智能路由
+            bypass_adapter: ⭐ 诊断模式 - 如果 True，跳过 adapter，直接使用原始 backbone features
         """
         device = next(self.base_model.parameters()).device
         use_bf16 = getattr(self.base_model, "compute_dtype", None) == "bfloat16"
@@ -2451,7 +2453,7 @@ class MergedModelWithMoE(nn.Module):
             # 2. 通过 backbone
             backbone_outputs = self.base_model.backbone(backbone_inputs)
             
-            # 3. 通过适配层
+            # 3. 通过适配层（或跳过）
             backbone_features = backbone_outputs[BACKBONE_FEATURE_KEY]
             
             # 计算路由权重（如果需要）
@@ -2459,12 +2461,16 @@ class MergedModelWithMoE(nn.Module):
             if task_id is None and use_smart_routing:
                 routing_weights = self.adapter.adapter.compute_task_routing_scores(backbone_features)
             
-            # 应用适配
-            adapted_features = self.adapter(
-                backbone_features, 
-                task_id=task_id,
-                use_smart_routing=use_smart_routing
-            )
+            if bypass_adapter:
+                # ⭐ 诊断模式：跳过 adapter，直接使用原始 backbone features
+                adapted_features = backbone_features
+            else:
+                # 应用适配
+                adapted_features = self.adapter(
+                    backbone_features, 
+                    task_id=task_id,
+                    use_smart_routing=use_smart_routing
+                )
             backbone_outputs[BACKBONE_FEATURE_KEY] = adapted_features
             
             # 4. 通过 MoE 动作头
@@ -3111,6 +3117,7 @@ class MergeVLAMerger:
         accelerator=None,  # 多卡训练支持
         wandb_run=None,  # Weights & Biases 实时监控
         log_interval: int = 10,  # 日志记录间隔
+        bypass_adapter: bool = False,  # ⭐ 诊断模式：跳过 adapter，测试原始模型 loss
     ):
         """
         训练稀疏 LoRA 适配器（MergeVLA 风格 + 稳定性改进）
@@ -3148,7 +3155,11 @@ class MergeVLAMerger:
         
         if is_main:
             print(f"\n{'='*60}")
-            print(f"🏋️ Training MergeVLA Adapter")
+            if bypass_adapter:
+                print(f"🔬 DIAGNOSTIC MODE: Bypassing LoRA Adapter")
+                print(f"   ⚠️ Adapter is DISABLED - testing original model loss")
+            else:
+                print(f"🏋️ Training MergeVLA Adapter")
             if use_accelerate:
                 print(f"   🚀 多卡训练: {accelerator.num_processes} GPUs")
             print(f"   Epochs: {num_epochs}")
@@ -3163,6 +3174,7 @@ class MergeVLAMerger:
             print(f"      Weight decay: {weight_decay}")
             print(f"      EMA: {use_ema} (decay={ema_decay})")
             print(f"      Gradient accumulation: {gradient_accumulation_steps}")
+            print(f"      Bypass adapter: {bypass_adapter}")
             print(f"{'='*60}\n")
         
         # ⭐ 优化器配置（更保守的参数）
@@ -3273,13 +3285,21 @@ class MergeVLAMerger:
                 observation = self._prepare_observation(batch)
                 
                 # 获取任务ID（如果可用）
+                # ⚠️ 关键：task_id 应该是整个 batch 的，不只是第一个样本！
                 task_id = None
                 if 'task_source' in batch:
                     task_source = batch['task_source']
                     if isinstance(task_source, torch.Tensor):
                         task_id = task_source.to(self.device)
                     elif isinstance(task_source, (list, tuple)):
-                        task_id = torch.tensor(task_source[0], device=self.device).unsqueeze(0)
+                        # 转换整个 list 为 tensor
+                        task_id = torch.tensor(task_source, device=self.device)
+                    
+                    # 诊断：打印任务分布（仅前几个 batch）
+                    if batch_idx < 3 and is_main:
+                        unique_tasks, counts = torch.unique(task_id, return_counts=True)
+                        task_dist = {f"task_{t.item()}": c.item() for t, c in zip(unique_tasks, counts)}
+                        print(f"   📊 Batch {batch_idx} task distribution: {task_dist}")
                 
                 # 使用预处理器处理输入
                 if self.preprocessor is not None:
@@ -3298,10 +3318,10 @@ class MergeVLAMerger:
                     # ⭐ 多卡训练时使用 accelerate 的 autocast
                     if use_accelerate:
                         with accelerator.autocast():
-                            outputs = self.merged_model(inputs, task_id=task_id)
+                            outputs = self.merged_model(inputs, task_id=task_id, bypass_adapter=bypass_adapter)
                     else:
                         with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16):
-                            outputs = self.merged_model(inputs, task_id=task_id)
+                            outputs = self.merged_model(inputs, task_id=task_id, bypass_adapter=bypass_adapter)
                     
                     if hasattr(outputs, 'data'):
                         outputs_dict = outputs.data
