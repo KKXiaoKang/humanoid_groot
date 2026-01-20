@@ -198,7 +198,7 @@ TRAIN_ARGS=(
     --num-episodes 32
     --use_sparse_merge
     --sparse_merge_lambda 1.0
-    --warmup_ratio 0.1
+    --warmup_ratio 0.05
     --use_cosine_schedule
     --gradient_accumulation_steps 4
     --max_grad_norm 1.0

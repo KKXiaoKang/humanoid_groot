@@ -1196,7 +1196,8 @@ def run_mergevla_merge(args):
             "adapter_epochs": args.adapter_epochs,
             "adapter_lr": args.adapter_lr,
             "batch_size": args.batch_size,
-            "warmup_ratio": getattr(args, 'warmup_ratio', 0.1),
+            "warmup_ratio": getattr(args, 'warmup_ratio', 0.05),
+            "decay_lr_ratio": getattr(args, 'decay_lr_ratio', 0.1),
             "use_cosine_schedule": getattr(args, 'use_cosine_schedule', True),
             "gradient_accumulation_steps": getattr(args, 'gradient_accumulation_steps', 1),
             "max_grad_norm": getattr(args, 'max_grad_norm', 1.0),
@@ -1320,12 +1321,13 @@ def run_mergevla_merge(args):
             print(f"   缩放因子: {scale_factor:.3f} (num_gpus^0.3)")
             print(f"   缩放后学习率: {learning_rate:.2e}")
     
-    # 训练适配层（使用稳定训练配置）
+    # 训练适配层（使用稳定训练配置，对齐 LeRobot/GROOT）
     merger.train_adapter(
         train_dataloader=dataloader,
         num_epochs=args.adapter_epochs,
         learning_rate=learning_rate,
-        warmup_ratio=getattr(args, 'warmup_ratio', 0.1),
+        decay_lr_ratio=getattr(args, 'decay_lr_ratio', 0.1),  # ⭐ 衰减到 peak_lr * 0.1
+        warmup_ratio=getattr(args, 'warmup_ratio', 0.05),  # ⭐ 5% warmup (GROOT 默认)
         use_cosine_schedule=getattr(args, 'use_cosine_schedule', True),
         gradient_accumulation_steps=getattr(args, 'gradient_accumulation_steps', 1),
         max_grad_norm=getattr(args, 'max_grad_norm', 1.0),
@@ -1536,12 +1538,14 @@ def main():
     
     parser.add_argument("--adapter_epochs", type=int, default=20,
                        help="Number of epochs to train the distribution adapter")
-    parser.add_argument("--adapter_lr", type=float, default=1e-3,
-                       help="Learning rate for adapter training (MergeVLA uses larger LR, default: 1e-3)")
+    parser.add_argument("--adapter_lr", type=float, default=1e-4,
+                       help="Learning rate for adapter training (对齐 LeRobot/GROOT, default: 1e-4)")
     
     # ⭐ 稳定训练参数 (LeRobot 风格)
     parser.add_argument("--warmup_ratio", type=float, default=0.05,
-                       help="Warmup ratio (default: 0.05, 最多 100 步快速预热，类似 LeRobot)")
+                       help="Warmup ratio (default: 0.05, 对齐 GROOT 配置)")
+    parser.add_argument("--decay_lr_ratio", type=float, default=0.1,
+                       help="Decay LR ratio, final_lr = peak_lr * ratio (default: 0.1, 对齐 LeRobot)")
     parser.add_argument("--use_cosine_schedule", action="store_true", default=True,
                        help="Use cosine learning rate schedule with warmup (default: True)")
     parser.add_argument("--no_cosine_schedule", action="store_false", dest="use_cosine_schedule",
