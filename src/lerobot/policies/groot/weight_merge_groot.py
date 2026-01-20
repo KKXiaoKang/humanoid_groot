@@ -1228,10 +1228,19 @@ class SparseLoRAAdapter(nn.Module):
     这样可以减少不同任务之间的冲突
     
     参考 MergeVLA 论文：Sparsely activated LoRA adapters via task masks
+    https://arxiv.org/pdf/2511.18810
     
-    ⭐ MergeVLA 测试时任务路由（Test-Time Task Routing）：
+    ⭐ MergeVLA 测试时任务路由（Test-Time Task Routing）- Section 3.3：
     当任务身份未知时，根据模型内部参数子空间（value projection）
     直接推断任务相关性，无需训练。
+    
+    路由算法：
+    1. 对每个候选任务 m，用任务掩码 S_m 处理隐藏状态
+    2. 分析值投影矩阵 V_T 和 V_A（任务和动作条件路径）
+    3. 通过 SVD 保留前 k_r 个右奇异向量形成主成分 P_T 和 P_A
+    4. 计算激活强度：r_{T,m} = ||P_T h_{A,m}||_2 和 r_{A,m} = ||P_A h_{T,m}||_2
+    5. 综合得分 r_m = (r_{T,m} + r_{A,m}) / 2
+    6. 通过 softmax 计算路由概率
     """
     
     def __init__(
@@ -1242,7 +1251,8 @@ class SparseLoRAAdapter(nn.Module):
         num_tasks: int = 2,  # 任务数量（narrower, wider）
         sparsity: float = 0.5,  # 稀疏度：每个任务激活的参数比例
         dropout: float = 0.0,
-        routing_temperature: float = 0.1,  # 路由分数的温度参数
+        routing_temperature: float = 1.0,  # 路由分数的温度参数（改为 1.0，更温和）
+        svd_rank: int = 32,  # ⭐ SVD 保留的奇异向量数量 k_r
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -1251,6 +1261,7 @@ class SparseLoRAAdapter(nn.Module):
         self.num_tasks = num_tasks
         self.sparsity = sparsity
         self.routing_temperature = routing_temperature
+        self.svd_rank = svd_rank
         
         # 为每个任务创建独立的 LoRA 参数
         # A: (num_tasks, hidden_size, rank)
@@ -1292,25 +1303,339 @@ class SparseLoRAAdapter(nn.Module):
         self._routing_call_count = 0
         self._routing_stats = {'task_0': 0, 'task_1': 0, 'mixed': 0}
         
+        # ⭐ SVD 缓存：避免每次推理都重新计算
+        self._svd_cache = None
+        self._svd_cache_valid = False
+        
+        # ⭐ 引用 action head 用于 SVD 路由（需要通过 set_action_heads 设置）
+        self._action_heads = None
+        
         print(f"   Sparse LoRA Adapter (MergeVLA style):")
         print(f"      rank={rank}, alpha={alpha}, num_tasks={num_tasks}")
         print(f"      sparsity={sparsity}, params={self._count_params():,}")
-        print(f"      ⭐ Test-Time Task Routing enabled (temperature={routing_temperature})")
+        print(f"      ⭐ MergeVLA SVD-based Test-Time Routing enabled")
+        print(f"         temperature={routing_temperature}, svd_rank={svd_rank}")
     
     def _count_params(self):
         return self.lora_A.numel() + self.lora_B.numel() + self.task_masks.numel() + 1
+    
+    def set_action_heads(self, action_heads: list):
+        """
+        ⭐ 设置专家 action heads 用于 SVD-based 路由
+        
+        MergeVLA 论文 Section 3.3：
+        需要访问动作专家的值投影矩阵进行 SVD 分解
+        
+        Args:
+            action_heads: 各任务的 action head 模块列表
+        """
+        self._action_heads = action_heads
+        self._svd_cache_valid = False  # 需要重新计算 SVD
+        print(f"   ⭐ Action heads set for SVD routing: {len(action_heads)} experts")
+    
+    def _get_value_projection_weights(self, action_head) -> list[torch.Tensor]:
+        """
+        ⭐ 从 action head 提取值投影矩阵
+        
+        GROOT 使用 DiT (Diffusion Transformer)，包含多个 BasicTransformerBlock
+        每个 block 有 attn1 (Attention)，其中包含 to_v (value projection)
+        
+        Args:
+            action_head: FlowmatchingActionHead 或其 model (DiT)
+        
+        Returns:
+            list of value projection weights from all attention layers
+        """
+        value_weights = []
+        
+        # 检查是否是 FlowmatchingActionHead
+        if hasattr(action_head, 'model'):
+            dit_model = action_head.model
+        else:
+            dit_model = action_head
+        
+        # 遍历 DiT 的 transformer blocks
+        if hasattr(dit_model, 'transformer_blocks'):
+            for block in dit_model.transformer_blocks:
+                if hasattr(block, 'attn1') and hasattr(block.attn1, 'to_v'):
+                    # Attention.to_v 是值投影层
+                    v_weight = block.attn1.to_v.weight  # (inner_dim, dim)
+                    value_weights.append(v_weight)
+        
+        return value_weights
+    
+    def _compute_svd_principal_components(self) -> dict:
+        """
+        ⭐ 计算各任务值投影矩阵的 SVD 主成分
+        
+        MergeVLA 论文 Section 3.3：
+        通过 SVD 保留前 k_r 个右奇异向量形成主成分 P_T 和 P_A
+        
+        Returns:
+            dict with 'P_T' and 'P_A' principal components for each task
+        """
+        if self._svd_cache_valid and self._svd_cache is not None:
+            return self._svd_cache
+        
+        if self._action_heads is None or len(self._action_heads) == 0:
+            print("   ⚠️ Warning: No action heads set for SVD routing, falling back to LoRA-based routing")
+            return None
+        
+        device = self.lora_A.device
+        dtype = self.lora_A.dtype
+        k_r = self.svd_rank
+        
+        svd_cache = {}
+        
+        for task_idx, action_head in enumerate(self._action_heads):
+            # 提取值投影矩阵
+            v_weights = self._get_value_projection_weights(action_head)
+            
+            if len(v_weights) == 0:
+                print(f"   ⚠️ Warning: No value projections found in task {task_idx} action head")
+                continue
+            
+            # ⚠️ 关键修复：GROOT DiT 使用交替的 cross-attention 和 self-attention
+            # - Cross-attention: to_v 形状为 [inner_dim, cross_attention_dim] = [1536, 2048]
+            # - Self-attention: to_v 形状为 [inner_dim, inner_dim] = [1536, 1536]
+            # 我们只使用与 hidden_size (2048) 匹配的 cross-attention 层
+            # 因为它们与 backbone 输出直接相关
+            
+            # 按形状分组值投影矩阵
+            cross_attn_weights = []  # 与 backbone 相关的 cross-attention
+            self_attn_weights = []   # self-attention
+            
+            for w in v_weights:
+                if w.shape[1] == self.hidden_size:  # cross-attention (dim == hidden_size)
+                    cross_attn_weights.append(w)
+                else:  # self-attention
+                    self_attn_weights.append(w)
+            
+            # 优先使用 cross-attention 层（与 backbone 输出直接相关）
+            if cross_attn_weights:
+                # 使用最后几个 cross-attention 层
+                num_layers_to_use = min(2, len(cross_attn_weights))
+                selected_weights = cross_attn_weights[-num_layers_to_use:]
+                
+                # 合并选定层的权重
+                combined_weight = torch.stack(
+                    [w.to(device=device, dtype=torch.float32) for w in selected_weights],
+                    dim=0
+                ).mean(dim=0)  # (inner_dim, hidden_size)
+            elif v_weights:
+                # 如果没有 cross-attention，使用最后一个值投影
+                combined_weight = v_weights[-1].to(device=device, dtype=torch.float32)
+            else:
+                continue
+            
+            # 进行 SVD 分解
+            # V = U @ S @ V^T，我们需要右奇异向量 V
+            try:
+                U, S, Vh = torch.linalg.svd(combined_weight, full_matrices=False)
+                # 保留前 k_r 个右奇异向量
+                # Vh: (min(m,n), n)，我们取 Vh[:k_r, :] 作为主成分
+                actual_k = min(k_r, Vh.shape[0])
+                P = Vh[:actual_k, :].T  # (n, k_r) - 主成分投影矩阵
+                P = P.to(dtype=dtype)
+                
+                svd_cache[f'P_{task_idx}'] = P
+                svd_cache[f'S_{task_idx}'] = S[:actual_k].to(dtype=dtype)  # 奇异值，用于加权
+                svd_cache[f'dim_{task_idx}'] = combined_weight.shape[1]  # 记录维度
+                
+                if task_idx == 0:
+                    print(f"   📐 SVD: 使用 {len(selected_weights if cross_attn_weights else [v_weights[-1]])} 个值投影层")
+                    print(f"      Combined weight shape: {combined_weight.shape}")
+                    print(f"      Principal components shape: {P.shape}")
+                
+            except Exception as e:
+                print(f"   ⚠️ Warning: SVD failed for task {task_idx}: {e}")
+                continue
+        
+        if len(svd_cache) >= self.num_tasks:
+            self._svd_cache = svd_cache
+            self._svd_cache_valid = True
+            print(f"   ✅ SVD principal components computed and cached for {self.num_tasks} tasks")
+        
+        return svd_cache
+    
+    def compute_task_routing_scores_svd(self, x: torch.Tensor, task_masks: torch.Tensor) -> torch.Tensor:
+        """
+        ⭐ MergeVLA SVD-based 测试时任务路由
+        
+        实现论文 Section 3.3 的完整算法：
+        1. 对每个任务 m，用任务掩码 S_m 处理隐藏状态得到 h_m
+        2. 将 h_m 投影到各任务的 SVD 主成分空间
+        3. 计算激活强度 r_{T,m} 和 r_{A,m}
+        4. 综合得分并通过 softmax 归一化
+        
+        Args:
+            x: (B, T, hidden_size) 输入特征（backbone 输出）
+            task_masks: (num_tasks, hidden_size) 任务掩码（sigmoid 后）
+        
+        Returns:
+            (B, num_tasks) 任务路由权重
+        """
+        svd_cache = self._compute_svd_principal_components()
+        
+        if svd_cache is None:
+            # 回退到简单的 LoRA-based 路由
+            return self._compute_task_routing_scores_lora(x, task_masks)
+        
+        B, T, H = x.shape
+        device = x.device
+        dtype = x.dtype
+        
+        scores = []
+        
+        for m in range(self.num_tasks):
+            # Step 1: 用任务掩码处理隐藏状态
+            # h_m = x * S_m（按维度掩码）
+            mask_m = task_masks[m].unsqueeze(0).unsqueeze(0)  # (1, 1, H)
+            h_m = x * mask_m  # (B, T, H)
+            
+            # Step 2: 投影到各任务的 SVD 主成分空间并计算激活强度
+            # MergeVLA: r_{T,m} = ||P_T h_{A,m}||_2 和 r_{A,m} = ||P_A h_{T,m}||_2
+            # 我们简化为：计算 h_m 在各任务主成分上的投影范数
+            
+            r_scores = []
+            for t in range(self.num_tasks):
+                P_key = f'P_{t}'
+                if P_key not in svd_cache:
+                    continue
+                    
+                P_t = svd_cache[P_key].to(device=device, dtype=dtype)  # (dim, k_r)
+                S_t = svd_cache.get(f'S_{t}', None)  # 奇异值
+                
+                # 投影: proj = h_m @ P_t  (B, T, k_r)
+                # 对于大的 hidden_size，可能需要分块计算
+                if H == P_t.shape[0]:
+                    proj = h_m @ P_t  # (B, T, k_r)
+                else:
+                    # 维度不匹配，跳过
+                    continue
+                
+                # 计算投影范数（激活强度）
+                # 使用奇异值加权（可选，论文没有明确说明）
+                if S_t is not None:
+                    # 加权范数：更重要的主成分贡献更大
+                    weighted_proj = proj * S_t.unsqueeze(0).unsqueeze(0)
+                    r_t = weighted_proj.norm(dim=-1).mean(dim=-1)  # (B,)
+                else:
+                    r_t = proj.norm(dim=-1).mean(dim=-1)  # (B,)
+                
+                r_scores.append(r_t)
+            
+            if len(r_scores) > 0:
+                # 综合各任务主成分的激活强度
+                # MergeVLA: r_m = (r_{T,m} + r_{A,m}) / 2
+                # 我们计算所有任务的加权和，但对当前任务 m 给更高权重
+                r_all = torch.stack(r_scores, dim=-1)  # (B, num_tasks)
+                
+                # 对当前任务 m 的主成分给更高权重
+                # 如果输入与任务 m 相关，它在任务 m 的主成分上激活应该更强
+                r_m = r_all[:, m] if m < r_all.shape[1] else r_all.mean(dim=-1)
+                scores.append(r_m)
+            else:
+                # 无法计算，使用零分数
+                scores.append(torch.zeros(B, device=device, dtype=dtype))
+        
+        if len(scores) == 0:
+            # 回退到 LoRA-based 路由
+            return self._compute_task_routing_scores_lora(x, task_masks)
+        
+        # 堆叠并归一化为概率分布
+        scores = torch.stack(scores, dim=-1)  # (B, num_tasks)
+        
+        # 使用 softmax 归一化
+        routing_weights = F.softmax(scores / self.routing_temperature, dim=-1)
+        
+        return routing_weights
+    
+    def _compute_task_routing_scores_lora(self, x: torch.Tensor, task_masks: torch.Tensor) -> torch.Tensor:
+        """
+        ⭐ 基于 LoRA 的任务路由（SVD 的备选方案）
+        
+        使用 LoRA 参数作为任务表示，通过输入投影的相对范数计算路由分数
+        
+        Args:
+            x: (B, T, hidden_size) 输入特征
+            task_masks: (num_tasks, hidden_size) 任务掩码（sigmoid 后）
+        
+        Returns:
+            (B, num_tasks) 任务路由权重
+        """
+        B, T, H = x.shape
+        lora_A = self.lora_A.to(dtype=x.dtype)
+        
+        scores = []
+        lora_outputs = []
+        
+        for t in range(self.num_tasks):
+            # 应用任务掩码
+            A_t = lora_A[t] * task_masks[t].unsqueeze(-1)  # (H, rank)
+            
+            # 计算 LoRA 变换
+            # x: (B, T, H), A_t: (H, rank)
+            delta = x @ A_t  # (B, T, rank)
+            lora_outputs.append(delta)
+            
+            # ⭐ 新方法：计算 LoRA 变换的相对强度
+            # 变换越强，说明输入与该任务的 LoRA 参数越匹配
+            x_norm = x.norm(dim=-1, keepdim=True) + 1e-8  # (B, T, 1)
+            delta_norm = delta.norm(dim=-1, keepdim=True)  # (B, T, 1)
+            
+            # 相对信号强度
+            relative_signal = (delta_norm / x_norm).mean(dim=(1, 2))  # (B,)
+            scores.append(relative_signal)
+        
+        scores = torch.stack(scores, dim=-1)  # (B, num_tasks)
+        
+        # ⭐ 新方法：同时考虑方向一致性
+        # 如果两个任务的 LoRA 输出方向差异大，说明它们在不同的特征子空间工作
+        if len(lora_outputs) == 2:
+            delta_0 = lora_outputs[0]  # (B, T, rank)
+            delta_1 = lora_outputs[1]  # (B, T, rank)
+            
+            # 展平并计算方向相似度
+            delta_0_flat = delta_0.reshape(B, -1)  # (B, T*rank)
+            delta_1_flat = delta_1.reshape(B, -1)  # (B, T*rank)
+            
+            # 归一化
+            delta_0_flat_norm = delta_0_flat / (delta_0_flat.norm(dim=-1, keepdim=True) + 1e-8)
+            delta_1_flat_norm = delta_1_flat / (delta_1_flat.norm(dim=-1, keepdim=True) + 1e-8)
+            
+            # 计算输入与各任务方向的一致性
+            x_flat = x.reshape(B, -1)  # (B, T*H)
+            x_flat_norm = x_flat / (x_flat.norm(dim=-1, keepdim=True) + 1e-8)
+            
+            # 由于维度不同，我们使用 delta 输出的方向
+            direction_scores = []
+            for delta_flat_norm in [delta_0_flat_norm, delta_1_flat_norm]:
+                # 与输入方向的余弦相似度（绝对值，因为方向可以相反）
+                cos_sim = (x_flat_norm * delta_flat_norm).sum(dim=-1).abs()  # (B,)
+                direction_scores.append(cos_sim)
+            
+            direction_scores = torch.stack(direction_scores, dim=-1)  # (B, num_tasks)
+            
+            # 综合信号强度和方向一致性
+            alpha = 0.5
+            combined_scores = (1 - alpha) * scores + alpha * direction_scores
+        else:
+            combined_scores = scores
+        
+        # 使用 softmax 归一化
+        routing_weights = F.softmax(combined_scores / self.routing_temperature, dim=-1)
+        
+        return routing_weights
     
     def compute_task_routing_scores(self, x: torch.Tensor) -> torch.Tensor:
         """
         ⭐ MergeVLA 测试时任务路由（Test-Time Task Routing）
         
-        当任务身份未知时，根据输入特征与各任务 LoRA 参数子空间的相似度
-        来推断任务相关性。
-        
-        核心思想（参考 MergeVLA 论文 Section 3.3）：
-        - 使用 LoRA A 参数作为各任务的"任务表示"（value projection 的代理）
-        - 将输入投影到各任务的 LoRA 子空间
-        - 投影后的范数越大，表示输入与该任务越相关
+        实现论文 Section 3.3 的 SVD-based 路由算法：
+        1. 对每个候选任务 m，用任务掩码 S_m 处理隐藏状态
+        2. 分析值投影矩阵的 SVD 主成分
+        3. 计算激活强度并归一化
         
         Args:
             x: (B, T, hidden_size) 输入特征
@@ -1319,42 +1644,60 @@ class SparseLoRAAdapter(nn.Module):
             (B, num_tasks) 任务路由权重（softmax 归一化后的概率分布）
         """
         B, T, H = x.shape
-        
-        # 使用 LoRA A 参数作为任务表示
-        # lora_A: (num_tasks, hidden_size, rank)
-        lora_A = self.lora_A.to(dtype=x.dtype)
         task_masks = torch.sigmoid(self.task_masks).to(dtype=x.dtype)  # (num_tasks, hidden_size)
         
-        # 计算各任务的"任务表示"：使用掩码后的 LoRA A
-        # masked_A[t]: (hidden_size, rank) - 第 t 个任务的特征投影矩阵
+        # 诊断信息（仅第一次调用）
+        if self._routing_call_count == 0:
+            print(f"\n📊 Task Routing Diagnosis:")
+            # 检查任务掩码的差异性
+            with torch.no_grad():
+                mask_0 = (task_masks[0] > 0.5).float()
+                mask_1 = (task_masks[1] > 0.5).float()
+                active_0 = mask_0.sum().item()
+                active_1 = mask_1.sum().item()
+                overlap = (mask_0 * mask_1).sum().item()
+                cos_sim = F.cosine_similarity(task_masks[0].unsqueeze(0), task_masks[1].unsqueeze(0)).item()
+                print(f"   Mask 0 (narrower) active dims: {int(active_0)}/{H}")
+                print(f"   Mask 1 (wider) active dims: {int(active_1)}/{H}")
+                print(f"   Mask cosine similarity: {cos_sim:.4f}")
+                
+                # LoRA 参数差异
+                lora_A = self.lora_A.to(dtype=x.dtype)
+                lora_A_0_norm = lora_A[0].norm().item()
+                lora_A_1_norm = lora_A[1].norm().item()
+                print(f"   LoRA A norms: task_0={lora_A_0_norm:.4f}, task_1={lora_A_1_norm:.4f}")
         
-        scores = []
-        for t in range(self.num_tasks):
-            # 应用任务掩码
-            A_t = lora_A[t] * task_masks[t].unsqueeze(-1)  # (hidden_size, rank)
-            
-            # ⚠️ 关键修复：归一化 A 矩阵，消除范数差异的影响
-            # 否则范数更大的任务会永远被选中，无论输入是什么
-            A_t_normalized = A_t / (A_t.norm() + 1e-8)
-            
-            # 将输入投影到任务子空间
-            # x: (B, T, hidden_size), A_t_normalized: (hidden_size, rank)
-            # projection: (B, T, rank)
-            projection = x @ A_t_normalized
-            
-            # 计算投影的范数作为相似度分数
-            # 归一化后，分数只取决于输入特征与任务表示的"方向相似性"
-            # 使用 L2 范数，对时间维度取平均
-            score = projection.norm(dim=-1).mean(dim=-1)  # (B,)
-            scores.append(score)
+        # ⭐ 尝试使用 SVD-based 路由
+        if self._action_heads is not None and len(self._action_heads) > 0:
+            routing_weights = self.compute_task_routing_scores_svd(x, task_masks)
+        else:
+            # 回退到 LoRA-based 路由
+            routing_weights = self._compute_task_routing_scores_lora(x, task_masks)
         
-        # 堆叠并归一化为概率分布
-        scores = torch.stack(scores, dim=-1)  # (B, num_tasks)
-        
-        # 使用 softmax 归一化，temperature 控制分布的锐度
-        # temperature 越小，分布越尖锐（更倾向于选择单一任务）
-        # temperature 越大，分布越平坦（更倾向于混合）
-        routing_weights = F.softmax(scores / self.routing_temperature, dim=-1)
+        # 诊断：记录路由统计
+        self._routing_call_count += 1
+        with torch.no_grad():
+            avg_weights = routing_weights.mean(dim=0)  # (num_tasks,)
+            dominant_task = avg_weights.argmax().item()
+            weight_diff = abs(avg_weights[0] - avg_weights[1]).item()
+            
+            if weight_diff > 0.3:  # 明显偏向某个任务
+                if dominant_task == 0:
+                    self._routing_stats['task_0'] += 1
+                else:
+                    self._routing_stats['task_1'] += 1
+            else:
+                self._routing_stats['mixed'] += 1
+            
+            # 前几次调用打印诊断信息
+            if self._routing_call_count <= 5:
+                print(f"\n   🎯 MergeVLA Smart Routing (call #{self._routing_call_count}):")
+                print(f"      Routing weights: task_0={avg_weights[0].item():.4f}, "
+                      f"task_1={avg_weights[1].item():.4f}")
+                if dominant_task == 0:
+                    print(f"      → Leaning towards task 0 (narrower)")
+                else:
+                    print(f"      → Leaning towards task 1 (wider)")
         
         return routing_weights
     
@@ -1683,6 +2026,19 @@ class DistributionAdapter(nn.Module):
         """重置路由统计（仅 sparse_lora 适配器支持）"""
         if self.adapter_type == "sparse_lora" and hasattr(self.adapter, 'reset_routing_stats'):
             self.adapter.reset_routing_stats()
+    
+    def set_action_heads(self, action_heads: list):
+        """
+        ⭐ 设置专家 action heads 用于 SVD-based 路由
+        
+        MergeVLA 论文 Section 3.3：
+        需要访问动作专家的值投影矩阵进行 SVD 分解
+        
+        Args:
+            action_heads: 各任务的 action head 模块列表
+        """
+        if self.adapter_type == "sparse_lora" and hasattr(self.adapter, 'set_action_heads'):
+            self.adapter.set_action_heads(action_heads)
 
 
 # ============================================================
@@ -2045,6 +2401,13 @@ class MergedModelWithMoE(nn.Module):
             num_tasks=num_experts,
             sparsity=sparsity,
         )
+        
+        # ⭐ 设置 action heads 用于 MergeVLA SVD-based 路由
+        # 这样 adapter 可以访问值投影矩阵进行 SVD 分解
+        if adapter_type == "sparse_lora" and hasattr(self.adapter, 'adapter'):
+            if hasattr(self.adapter.adapter, 'set_action_heads'):
+                self.adapter.adapter.set_action_heads(list(self.expert_heads))
+                print(f"   ⭐ SVD-based routing: Action heads connected to adapter")
         
         print(f"   ✅ 创建适配层: {sum(p.numel() for p in self.adapter.parameters()):,} params")
         print(f"{'='*60}\n")

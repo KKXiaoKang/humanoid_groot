@@ -364,6 +364,13 @@ def wrap_policy_with_moe(
         use_smart_routing: 是否使用智能任务路由
         swap_task_mapping: 是否交换任务映射
     """
+    # ⭐ 设置 action heads 用于 MergeVLA SVD-based 路由
+    # 这是论文 Section 3.3 的关键：需要访问值投影矩阵进行 SVD 分解
+    if hasattr(adapter, 'adapter') and hasattr(adapter.adapter, 'set_action_heads'):
+        if hasattr(moe_head, 'expert_heads'):
+            adapter.adapter.set_action_heads(list(moe_head.expert_heads))
+            logger.info(f"   ⭐ SVD-based routing: 已连接 {len(moe_head.expert_heads)} 个专家的 action heads")
+    
     # 设置 task_id
     if task_type == "narrower":
         actual_task_id = 1 if swap_task_mapping else 0
