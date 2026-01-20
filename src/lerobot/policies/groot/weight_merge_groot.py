@@ -3331,11 +3331,11 @@ class MergeVLAMerger:
                     state_dict[f"_groot_model.expert_heads.{i}.{k}"] = v
                 print(f"   ✅ Expert {expert_name}: {len(expert_state)} layers")
             
-            # 4. 同时保存默认的 action_head（兼容性：使用第一个专家）
-            # 这样不支持 MoE 的推理脚本也能加载（虽然只会使用 narrower）
-            first_expert_state = self.merged_model.expert_heads[0].state_dict()
-            for k, v in first_expert_state.items():
-                state_dict[f"_groot_model.action_head.{k}"] = v
+            # ⚠️ 修复：不再保存多余的 action_head 副本
+            # 之前保存了 expert_heads.0 + expert_heads.1 + action_head（副本），导致模型 16GB
+            # 现在只保存 expert_heads，模型大小约 11GB
+            # 推理脚本（eval_merged_groot.py 和 eval_merged_groot_on_dataset.py）已支持 MoE 模式
+            print(f"   💡 不保存 action_head 副本（节省 ~5GB）")
             
             # 克隆以处理共享内存
             state_dict_cloned = {k: v.clone().contiguous() for k, v in state_dict.items()}
