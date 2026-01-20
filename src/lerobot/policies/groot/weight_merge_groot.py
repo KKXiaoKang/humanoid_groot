@@ -3178,14 +3178,8 @@ class MergeVLAMerger:
             weight_decay=weight_decay,
         )
         
-        # ⭐ EMA（指数移动平均）用于平滑权重更新
+        # ⭐ EMA 将在模型移动到 GPU 后初始化
         ema_params = None
-        if use_ema:
-            # 复制初始参数作为 EMA
-            ema_params = {}
-            for name, param in self.merged_model.adapter.named_parameters():
-                if param.requires_grad:
-                    ema_params[name] = param.data.clone()
         
         # ⭐ 完全对齐 LeRobot 的 CosineDecayWithWarmup 调度器
         if use_cosine_schedule:
@@ -3251,6 +3245,16 @@ class MergeVLAMerger:
         self.merged_model.train()
         global_step = 0
         accumulated_loss = 0.0
+        
+        # ⭐ EMA（指数移动平均）：在模型移动到 GPU 后初始化
+        if use_ema:
+            ema_params = {}
+            for name, param in self.merged_model.adapter.named_parameters():
+                if param.requires_grad:
+                    # 确保 EMA 参数在同一设备上
+                    ema_params[name] = param.data.clone().to(param.device)
+            if is_main:
+                print(f"   ✅ EMA initialized on {self.device}")
         
         for epoch in range(num_epochs):
             epoch_losses = []
