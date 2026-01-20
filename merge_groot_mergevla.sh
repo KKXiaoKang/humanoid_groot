@@ -188,8 +188,8 @@ TRAIN_ARGS=(
     --adapter_type sparse_lora
     --lora_rank 16
     --sparsity 0.5
-    --adapter_epochs 30
-    --adapter_lr 2e-5
+    --adapter_epochs 20
+    --adapter_lr 5e-5
     --batch_size 32
     --device "${DEVICE}"
     --use_default_datasets
@@ -201,11 +201,10 @@ TRAIN_ARGS=(
     --warmup_ratio 0.1
     --use_cosine_schedule
     --gradient_accumulation_steps 4
-    --max_grad_norm 0.5
+    --max_grad_norm 1.0
     --weight_decay 1e-4
     --use_ema
     --ema_decay 0.999
-    --loss_scale 0.1
 )
 
 # ⭐ 添加 Weights & Biases 参数（如果启用）

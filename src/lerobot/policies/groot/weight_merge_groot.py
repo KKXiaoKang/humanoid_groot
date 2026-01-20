@@ -3101,16 +3101,16 @@ class MergeVLAMerger:
         self,
         train_dataloader,
         num_epochs: int = 20,
-        learning_rate: float = 2e-5,  # ⭐ 降低学习率以提高稳定性（从 1e-4 降到 2e-5）
+        learning_rate: float = 5e-5,  # ⭐ 适中的学习率（比 1e-4 小，比 2e-5 大）
         decay_lr_ratio: float = 0.1,  # ⭐ 衰减到峰值的 10%（LeRobot 风格）
-        warmup_ratio: float = 0.1,    # ⭐ 增加预热比例（从 5% 增到 10%）以提高稳定性
+        warmup_ratio: float = 0.1,    # ⭐ 10% 预热以提高稳定性
         use_cosine_schedule: bool = True,  # 使用 cosine 学习率衰减
         gradient_accumulation_steps: int = 1,  # 梯度累积步数
-        max_grad_norm: float = 0.5,   # ⭐ 降低梯度裁剪阈值（从 1.0 降到 0.5）
-        weight_decay: float = 1e-4,   # ⭐ 增加 weight decay（从 1e-5 增到 1e-4）
+        max_grad_norm: float = 1.0,   # ⭐ 恢复正常梯度裁剪
+        weight_decay: float = 1e-4,   # ⭐ weight decay 正则化
         use_ema: bool = True,         # ⭐ 使用 EMA（指数移动平均）平滑权重
         ema_decay: float = 0.999,     # ⭐ EMA 衰减率
-        loss_scale: float = 0.1,      # ⭐ Loss 缩放因子，减小梯度幅度
+        loss_scale: float = 1.0,      # ⭐ 不缩放 loss（之前 0.1 导致梯度太小）
         accelerator=None,  # ⭐ 多卡训练支持
         wandb_run=None,  # ⭐ Weights & Biases 实时监控
         log_interval: int = 10,  # ⭐ 日志记录间隔
@@ -3151,20 +3151,19 @@ class MergeVLAMerger:
         
         if is_main:
             print(f"\n{'='*60}")
-            print(f"🏋️ Training MergeVLA Adapter (稳定训练模式)")
+            print(f"🏋️ Training MergeVLA Adapter")
             if use_accelerate:
                 print(f"   🚀 多卡训练: {accelerator.num_processes} GPUs")
             print(f"   Epochs: {num_epochs}")
             print(f"   Adapter type: {self.adapter_type}")
-            print(f"   ⭐ 稳定训练配置:")
+            print(f"   ⭐ 训练配置:")
             print(f"      Steps per epoch: {steps_per_epoch}")
             print(f"      Total steps: {total_steps}")
             print(f"      Warmup steps: {warmup_steps} ({warmup_ratio*100:.0f}%)")
-            print(f"      Peak LR: {learning_rate:.1e} (降低以提高稳定性)")
+            print(f"      Peak LR: {learning_rate:.1e}")
             print(f"      Decay LR: {decay_lr:.1e}")
-            print(f"      Max grad norm: {max_grad_norm} (更强裁剪)")
-            print(f"      Weight decay: {weight_decay} (增强正则化)")
-            print(f"      Loss scale: {loss_scale} (缩小梯度)")
+            print(f"      Max grad norm: {max_grad_norm}")
+            print(f"      Weight decay: {weight_decay}")
             print(f"      EMA: {use_ema} (decay={ema_decay})")
             print(f"      Gradient accumulation: {gradient_accumulation_steps}")
             print(f"{'='*60}\n")
