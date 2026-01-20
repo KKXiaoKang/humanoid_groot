@@ -3246,15 +3246,24 @@ class MergeVLAMerger:
         global_step = 0
         accumulated_loss = 0.0
         
+        # ⭐ 获取未包装的模型（用于访问 adapter 参数）
+        # accelerate 会用 DDP 包装模型，需要 unwrap 才能访问原始参数
+        def get_adapter_params():
+            if use_accelerate:
+                unwrapped = accelerator.unwrap_model(self.merged_model)
+                return unwrapped.adapter.named_parameters()
+            else:
+                return self.merged_model.adapter.named_parameters()
+        
         # ⭐ EMA（指数移动平均）：在模型移动到 GPU 后初始化
         if use_ema:
             ema_params = {}
-            for name, param in self.merged_model.adapter.named_parameters():
+            for name, param in get_adapter_params():
                 if param.requires_grad:
                     # 确保 EMA 参数在同一设备上
-                    ema_params[name] = param.data.clone().to(param.device)
+                    ema_params[name] = param.data.clone()
             if is_main:
-                print(f"   ✅ EMA initialized on {self.device}")
+                print(f"   ✅ EMA initialized on {self.device}, {len(ema_params)} params")
         
         for epoch in range(num_epochs):
             epoch_losses = []
@@ -3341,9 +3350,10 @@ class MergeVLAMerger:
                 if (batch_idx + 1) % gradient_accumulation_steps == 0:
                     # 梯度裁剪
                     if use_accelerate:
-                        # ⭐ accelerate 的梯度裁剪方式
+                        # ⭐ accelerate 的梯度裁剪方式（使用 unwrap 后的参数）
+                        unwrapped = accelerator.unwrap_model(self.merged_model)
                         accelerator.clip_grad_norm_(
-                            self.merged_model.adapter.parameters(),
+                            unwrapped.adapter.parameters(),
                             max_norm=max_grad_norm,
                         )
                         grad_norm = 0.0  # accelerate 不返回 grad_norm
@@ -3358,7 +3368,7 @@ class MergeVLAMerger:
                     # ⭐ EMA 更新：平滑权重变化
                     if use_ema and ema_params is not None:
                         with torch.no_grad():
-                            for name, param in self.merged_model.adapter.named_parameters():
+                            for name, param in get_adapter_params():
                                 if param.requires_grad and name in ema_params:
                                     ema_params[name].mul_(ema_decay).add_(param.data, alpha=1 - ema_decay)
                     
@@ -3499,7 +3509,7 @@ class MergeVLAMerger:
         # ⭐ 将 EMA 参数复制回模型（使用更平滑的权重）
         if use_ema and ema_params is not None:
             with torch.no_grad():
-                for name, param in self.merged_model.adapter.named_parameters():
+                for name, param in get_adapter_params():
                     if param.requires_grad and name in ema_params:
                         param.data.copy_(ema_params[name])
             if is_main:
