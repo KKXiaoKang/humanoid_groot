@@ -3074,6 +3074,7 @@ class MergeVLAMerger:
         use_cosine_schedule: bool = True,  # 使用 cosine 学习率衰减
         gradient_accumulation_steps: int = 1,  # 梯度累积步数
         max_grad_norm: float = 1.0,   # 梯度裁剪阈值
+        accelerator=None,  # ⭐ 多卡训练支持
     ):
         """
         训练稀疏 LoRA 适配器（MergeVLA 风格）
@@ -3083,9 +3084,16 @@ class MergeVLAMerger:
         ⭐ 学习率调度（类似 LeRobot）：
         1. 快速预热: 前 5% 步数（或最多 100 步）快速达到峰值学习率
         2. Cosine 退火: 平滑衰减到最小学习率
+        
+        ⭐ 多卡训练支持：
+        传入 accelerator 参数以启用分布式训练
         """
         from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, LambdaLR
         import math
+        
+        # ⭐ 判断是否是主进程（用于控制打印）
+        is_main = accelerator is None or accelerator.is_main_process
+        use_accelerate = accelerator is not None
         
         # 计算总步数
         steps_per_epoch = len(train_dataloader) // gradient_accumulation_steps
@@ -3095,19 +3103,22 @@ class MergeVLAMerger:
         warmup_steps = min(int(total_steps * warmup_ratio), 100)  # 最多 100 步 warmup
         warmup_steps = max(warmup_steps, 10)  # 至少 10 步
         
-        print(f"\n{'='*60}")
-        print(f"🏋️ Training MergeVLA Adapter (LeRobot 风格调度)")
-        print(f"   Epochs: {num_epochs}")
-        print(f"   Learning rate: {learning_rate}")
-        print(f"   Adapter type: {self.adapter_type}")
-        print(f"   ⭐ 学习率调度配置 (类似 LeRobot):")
-        print(f"      Steps per epoch: {steps_per_epoch}")
-        print(f"      Total steps: {total_steps}")
-        print(f"      Warmup steps: {warmup_steps} (快速预热)")
-        print(f"      Cosine schedule: {use_cosine_schedule}")
-        print(f"      Gradient accumulation: {gradient_accumulation_steps}")
-        print(f"      Max grad norm: {max_grad_norm}")
-        print(f"{'='*60}\n")
+        if is_main:
+            print(f"\n{'='*60}")
+            print(f"🏋️ Training MergeVLA Adapter (LeRobot 风格调度)")
+            if use_accelerate:
+                print(f"   🚀 多卡训练: {accelerator.num_processes} GPUs")
+            print(f"   Epochs: {num_epochs}")
+            print(f"   Learning rate: {learning_rate}")
+            print(f"   Adapter type: {self.adapter_type}")
+            print(f"   ⭐ 学习率调度配置 (类似 LeRobot):")
+            print(f"      Steps per epoch: {steps_per_epoch}")
+            print(f"      Total steps: {total_steps}")
+            print(f"      Warmup steps: {warmup_steps} (快速预热)")
+            print(f"      Cosine schedule: {use_cosine_schedule}")
+            print(f"      Gradient accumulation: {gradient_accumulation_steps}")
+            print(f"      Max grad norm: {max_grad_norm}")
+            print(f"{'='*60}\n")
         
         optimizer = torch.optim.AdamW(
             self.merged_model.adapter.parameters(),
@@ -3136,6 +3147,21 @@ class MergeVLAMerger:
             scheduler = LambdaLR(optimizer, lr_lambda)
         else:
             scheduler = None
+        
+        # ⭐ 使用 accelerate 包装模型、优化器、数据加载器
+        if use_accelerate:
+            # 准备模型和优化器
+            self.merged_model.adapter, optimizer = accelerator.prepare(
+                self.merged_model.adapter, optimizer
+            )
+            # 准备数据加载器
+            train_dataloader = accelerator.prepare(train_dataloader)
+            # 准备调度器
+            if scheduler is not None:
+                scheduler = accelerator.prepare(scheduler)
+            
+            if is_main:
+                print(f"   ✅ Accelerate: 模型、优化器、数据加载器已准备")
         
         self.merged_model.train()
         global_step = 0
@@ -3167,7 +3193,7 @@ class MergeVLAMerger:
                         inputs = self.preprocessor(observation)
                         inputs = self._to_device(inputs)
                     except Exception as e:
-                        if batch_idx == 0:
+                        if batch_idx == 0 and is_main:
                             print(f"   ⚠️ Preprocessor failed: {e}")
                         continue
                 else:
@@ -3175,8 +3201,13 @@ class MergeVLAMerger:
                 
                 try:
                     # 前向传播（使用 Flow Matching loss）
-                    with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16):
-                        outputs = self.merged_model(inputs, task_id=task_id)
+                    # ⭐ 多卡训练时使用 accelerate 的 autocast
+                    if use_accelerate:
+                        with accelerator.autocast():
+                            outputs = self.merged_model(inputs, task_id=task_id)
+                    else:
+                        with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16):
+                            outputs = self.merged_model(inputs, task_id=task_id)
                     
                     if hasattr(outputs, 'data'):
                         outputs_dict = outputs.data
@@ -3195,7 +3226,7 @@ class MergeVLAMerger:
                         loss = loss / gradient_accumulation_steps
                     
                 except Exception as e:
-                    if batch_idx == 0:
+                    if batch_idx == 0 and is_main:
                         print(f"   ⚠️ Forward failed: {e}")
                         import traceback
                         traceback.print_exc()
@@ -3203,21 +3234,32 @@ class MergeVLAMerger:
                 
                 # 检查 NaN
                 if not torch.isfinite(loss):
-                    if batch_idx < 3:
+                    if batch_idx < 3 and is_main:
                         print(f"   ⚠️ Non-finite loss: {loss.item()}")
                     continue
                 
-                # 反向传播
-                loss.backward()
+                # ⭐ 反向传播：使用 accelerate 或标准方式
+                if use_accelerate:
+                    accelerator.backward(loss)
+                else:
+                    loss.backward()
                 accumulated_loss += loss.item()
                 
                 # 梯度累积：只在累积完成后更新
                 if (batch_idx + 1) % gradient_accumulation_steps == 0:
                     # 梯度裁剪
-                    grad_norm = torch.nn.utils.clip_grad_norm_(
-                        self.merged_model.adapter.parameters(),
-                        max_norm=max_grad_norm,
-                    )
+                    if use_accelerate:
+                        # ⭐ accelerate 的梯度裁剪方式
+                        accelerator.clip_grad_norm_(
+                            self.merged_model.adapter.parameters(),
+                            max_norm=max_grad_norm,
+                        )
+                        grad_norm = 0.0  # accelerate 不返回 grad_norm
+                    else:
+                        grad_norm = torch.nn.utils.clip_grad_norm_(
+                            self.merged_model.adapter.parameters(),
+                            max_norm=max_grad_norm,
+                        )
                     
                     optimizer.step()
                     
@@ -3232,16 +3274,22 @@ class MergeVLAMerger:
                     epoch_losses.append(actual_loss)
                     accumulated_loss = 0.0
                     
-                    if global_step % 10 == 0:
+                    if global_step % 10 == 0 and is_main:
                         current_lr = optimizer.param_groups[0]['lr']
+                        grad_info = f", grad_norm = {grad_norm:.4f}" if not use_accelerate else ""
                         print(f"   Epoch {epoch+1}/{num_epochs}, Step {global_step}: "
-                              f"loss = {actual_loss:.4f}, grad_norm = {grad_norm:.4f}, lr = {current_lr:.2e}")
+                              f"loss = {actual_loss:.4f}{grad_info}, lr = {current_lr:.2e}")
             
-            if epoch_losses:
+            if epoch_losses and is_main:
                 avg_loss = sum(epoch_losses) / len(epoch_losses)
                 print(f"\n📊 Epoch {epoch+1}/{num_epochs}: avg_loss = {avg_loss:.4f}")
         
-        print(f"\n✅ Adapter training completed")
+        # ⭐ 多卡训练时等待所有进程完成
+        if use_accelerate:
+            accelerator.wait_for_everyone()
+        
+        if is_main:
+            print(f"\n✅ Adapter training completed")
     
     def _prepare_observation(self, batch: dict) -> dict:
         """将 LeRobot batch 转换为预处理器期望的格式"""

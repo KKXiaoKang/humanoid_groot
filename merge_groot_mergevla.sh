@@ -3,35 +3,90 @@
 # 基于论文: https://arxiv.org/pdf/2511.18810
 #
 # 使用方式：
-#   ./merge_groot_mergevla.sh              # 默认使用 GPU 0
-#   ./merge_groot_mergevla.sh 4            # 使用 GPU 4
+#   ./merge_groot_mergevla.sh              # 默认使用 GPU 0（单卡）
+#   ./merge_groot_mergevla.sh 4            # 使用 GPU 4（单卡）
 #   ./merge_groot_mergevla.sh 0,1          # 使用多个 GPU（通过 CUDA_VISIBLE_DEVICES）
+#
+# ⭐ 多卡训练（推荐，使用 accelerate）：
+#   ./merge_groot_mergevla.sh --multi-gpu --num-gpus 2     # 使用 2 张卡
+#   ./merge_groot_mergevla.sh --multi-gpu --gpus 0,1       # 使用 GPU 0 和 1
+#   ./merge_groot_mergevla.sh --multi-gpu                  # 使用所有可用 GPU
 
 set -e
 
-# GPU 控制：第一个参数指定 GPU ID
-# ⚠️ 重要：始终使用 CUDA_VISIBLE_DEVICES 来确保只使用指定的 GPU
-# 这样不会影响其他 GPU 上的任务，也不会被之前的 CUDA_VISIBLE_DEVICES 影响
-if [ -n "$1" ]; then
-    GPU_ARG="$1"
-    # 检查是否包含逗号（多个 GPU）
-    if [[ "$GPU_ARG" == *","* ]]; then
-        # 多个 GPU：使用 CUDA_VISIBLE_DEVICES
-        export CUDA_VISIBLE_DEVICES="$GPU_ARG"
-        DEVICE="cuda:0"  # 在可见的 GPU 中，使用第一个
-        GPU_INFO="GPU: $GPU_ARG (CUDA_VISIBLE_DEVICES)"
+# ============================================================
+# 参数解析
+# ============================================================
+USE_MULTI_GPU=false
+NUM_GPUS=""
+GPU_IDS=""
+DEVICE="cuda:0"
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --multi-gpu|--multi_gpu)
+            USE_MULTI_GPU=true
+            shift
+            ;;
+        --num-gpus|--num_gpus)
+            NUM_GPUS="$2"
+            shift 2
+            ;;
+        --gpus)
+            GPU_IDS="$2"
+            shift 2
+            ;;
+        *)
+            # 兼容旧的位置参数（单个或多个 GPU ID）
+            if [ -z "$GPU_IDS" ]; then
+                GPU_IDS="$1"
+            fi
+            shift
+            ;;
+    esac
+done
+
+# ============================================================
+# GPU 配置
+# ============================================================
+if [ "$USE_MULTI_GPU" = true ]; then
+    # ⭐ 多卡训练模式（使用 accelerate）
+    if [ -n "$GPU_IDS" ]; then
+        export CUDA_VISIBLE_DEVICES="$GPU_IDS"
+        # 计算 GPU 数量
+        NUM_GPUS=$(echo "$GPU_IDS" | tr ',' '\n' | wc -l)
+        GPU_INFO="🚀 多卡训练: GPU $GPU_IDS ($NUM_GPUS 张卡，使用 accelerate)"
+    elif [ -n "$NUM_GPUS" ]; then
+        # 使用指定数量的 GPU（从 0 开始）
+        GPU_INFO="🚀 多卡训练: $NUM_GPUS 张卡（使用 accelerate）"
     else
-        # 单个 GPU：也使用 CUDA_VISIBLE_DEVICES 来限制只使用这个 GPU
-        export CUDA_VISIBLE_DEVICES="$GPU_ARG"
-        DEVICE="cuda:0"  # 在可见的 GPU 中，使用第一个（逻辑上就是指定的 GPU）
-        GPU_INFO="GPU: $GPU_ARG (CUDA_VISIBLE_DEVICES, device=cuda:0)"
+        # 使用所有可用 GPU
+        NUM_GPUS=$(python3 -c "import torch; print(torch.cuda.device_count())" 2>/dev/null || nvidia-smi --list-gpus | wc -l)
+        GPU_INFO="🚀 多卡训练: 所有可用 GPU ($NUM_GPUS 张卡，使用 accelerate)"
     fi
+    DEVICE="cuda:0"  # accelerate 会自动分配设备
 else
-    # 默认使用 cuda:0，但不设置 CUDA_VISIBLE_DEVICES（使用系统默认）
-    # 如果之前环境中有 CUDA_VISIBLE_DEVICES，需要清理
-    unset CUDA_VISIBLE_DEVICES
-    DEVICE="cuda:0"
-    GPU_INFO="GPU: $DEVICE (默认，未限制 CUDA_VISIBLE_DEVICES)"
+    # 单卡训练模式
+    if [ -n "$GPU_IDS" ]; then
+        # 检查是否包含逗号（多个 GPU）
+        if [[ "$GPU_IDS" == *","* ]]; then
+            # 多个 GPU：使用 CUDA_VISIBLE_DEVICES
+            export CUDA_VISIBLE_DEVICES="$GPU_IDS"
+            DEVICE="cuda:0"  # 在可见的 GPU 中，使用第一个
+            GPU_INFO="GPU: $GPU_IDS (CUDA_VISIBLE_DEVICES)"
+        else
+            # 单个 GPU：也使用 CUDA_VISIBLE_DEVICES 来限制只使用这个 GPU
+            export CUDA_VISIBLE_DEVICES="$GPU_IDS"
+            DEVICE="cuda:0"  # 在可见的 GPU 中，使用第一个（逻辑上就是指定的 GPU）
+            GPU_INFO="GPU: $GPU_IDS (CUDA_VISIBLE_DEVICES, device=cuda:0)"
+        fi
+    else
+        # 默认使用 cuda:0，但不设置 CUDA_VISIBLE_DEVICES（使用系统默认）
+        # 如果之前环境中有 CUDA_VISIBLE_DEVICES，需要清理
+        unset CUDA_VISIBLE_DEVICES
+        DEVICE="cuda:0"
+        GPU_INFO="GPU: $DEVICE (默认，未限制 CUDA_VISIBLE_DEVICES)"
+    fi
 fi
 
 # 模型路径（根据实际情况修改）
@@ -49,7 +104,13 @@ echo "Base: ${BASE_MODEL_PATH}"
 echo "Output: ${OUTPUT_PATH}"
 echo "${GPU_INFO}"
 if [ -n "$CUDA_VISIBLE_DEVICES" ]; then
-    echo "⚠️ CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} (只使用这些 GPU)"
+    echo "⚠️ CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
+fi
+if [ "$USE_MULTI_GPU" = true ]; then
+    echo ""
+    echo "💡 多卡训练提示:"
+    echo "   - 学习率会自动缩放: lr = base_lr × num_gpus^0.3"
+    echo "   - 有效 batch size = batch_size × num_gpus"
 fi
 echo "=========================================="
 echo ""
@@ -85,29 +146,56 @@ echo ""
 #   
 #   ❌ 错误方式：--merge_action_head（线性融合 DiT，会导致性能崩溃）
 #   ✅ 正确方式：--use_moe（保留两个独立的 DiT，通过路由选择）
-python scripts/train_weight_merge.py \
-    --method mergevla \
-    --narrower_path "${NARROWER_PATH}" \
-    --wider_path "${WIDER_PATH}" \
-    --base_model_path "${BASE_MODEL_PATH}" \
-    --output_path "${OUTPUT_PATH}" \
-    --adapter_type sparse_lora \
-    --lora_rank 32 \
-    --sparsity 0.6 \
-    --adapter_epochs 20 \
-    --adapter_lr 1e-4 \
-    --batch_size 96 \
-    --device "${DEVICE}" \
-    --use_default_datasets \
-    --use_moe \
-    --episode-based \
-    --num-episodes 32 \
-    --use_sparse_merge \
-    --sparse_merge_lambda 1.0 \
-    --warmup_ratio 0.1 \
-    --use_cosine_schedule \
-    --gradient_accumulation_steps 4 \
+
+# ============================================================
+# 训练参数
+# ============================================================
+TRAIN_ARGS=(
+    --method mergevla
+    --narrower_path "${NARROWER_PATH}"
+    --wider_path "${WIDER_PATH}"
+    --base_model_path "${BASE_MODEL_PATH}"
+    --output_path "${OUTPUT_PATH}"
+    --adapter_type sparse_lora
+    --lora_rank 32
+    --sparsity 0.6
+    --adapter_epochs 20
+    --adapter_lr 1e-4
+    --batch_size 96
+    --device "${DEVICE}"
+    --use_default_datasets
+    --use_moe
+    --episode-based
+    --num-episodes 32
+    --use_sparse_merge
+    --sparse_merge_lambda 1.0
+    --warmup_ratio 0.1
+    --use_cosine_schedule
+    --gradient_accumulation_steps 4
     --max_grad_norm 1.0
+)
+
+# ============================================================
+# 启动训练
+# ============================================================
+if [ "$USE_MULTI_GPU" = true ]; then
+    # ⭐ 多卡训练：使用 accelerate launch
+    echo ""
+    echo "🚀 使用 accelerate 启动多卡训练..."
+    echo "   GPU 数量: $NUM_GPUS"
+    echo ""
+    
+    accelerate launch \
+        --multi_gpu \
+        --num_processes=${NUM_GPUS} \
+        --mixed_precision=bf16 \
+        scripts/train_weight_merge.py \
+        "${TRAIN_ARGS[@]}"
+else
+    # 单卡训练：直接使用 python
+    python scripts/train_weight_merge.py \
+        "${TRAIN_ARGS[@]}"
+fi
 
 echo ""
 echo "=========================================="

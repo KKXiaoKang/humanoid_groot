@@ -30,6 +30,15 @@ https://arxiv.org/pdf/2509.25712
     # 方式3: 直接插值（无需训练，最简单）
     python scripts/train_weight_merge.py --method interpolation --alpha 0.5 --output_path ./outputs/merged_groot
 
+⭐ 多卡训练（使用 accelerate）：
+    # 使用 2 张卡训练
+    accelerate launch --multi_gpu --num_processes=2 --mixed_precision=bf16 \\
+        scripts/train_weight_merge.py \\
+        --method mergevla --use_moe --output_path ./outputs/merged_groot
+    
+    # 或使用封装脚本
+    ./merge_groot_mergevla.sh --multi_gpu --num_gpus 2
+
 训练后评估：
     python eval/eval_merged_groot.py --model_path ./outputs/merged_groot/pretrained_model
 """
@@ -48,8 +57,41 @@ from typing import Optional
 import torch
 import numpy as np
 
+# ⭐ 多卡训练支持
+try:
+    from accelerate import Accelerator
+    from accelerate.utils import DistributedDataParallelKwargs
+    HAS_ACCELERATE = True
+except ImportError:
+    HAS_ACCELERATE = False
+    Accelerator = None
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def is_main_process() -> bool:
+    """检查是否是主进程（用于多卡训练时只在主进程打印）"""
+    if HAS_ACCELERATE:
+        try:
+            from accelerate.state import AcceleratorState
+            state = AcceleratorState()
+            return state.is_main_process
+        except:
+            pass
+    return True
+
+
+def get_world_size() -> int:
+    """获取进程数量（GPU 数量）"""
+    if HAS_ACCELERATE:
+        try:
+            from accelerate.state import AcceleratorState
+            state = AcceleratorState()
+            return state.num_processes
+        except:
+            pass
+    return 1
 
 # 模型路径
 MODEL_NARROW_PATH = \
@@ -1061,32 +1103,61 @@ def run_mergevla_merge(args):
     - Backbone: 融合
     - Action Head (DiT): 保留每个任务独立的 Expert Head，不融合
     - 推理时使用 Smart Routing 选择使用哪个 Expert Head
+    
+    ⭐ 多卡训练支持（使用 accelerate）：
+    使用 accelerate launch 启动时自动启用分布式训练
     """
     from lerobot.policies.groot.weight_merge_groot import MergeVLAMerger
     
     use_moe = getattr(args, 'use_moe', False)
     use_soft_routing = getattr(args, 'use_soft_routing', False)
     
-    print(f"\n{'='*60}")
-    print(f"⭐ MergeVLA-Style Merging")
-    print(f"   基于论文: https://arxiv.org/pdf/2511.18810")
-    print(f"{'='*60}")
-    print(f"\n📋 方法说明：")
-    print(f"   1. 计算 Task Vectors: τ = θ_expert - θ_base")
-    print(f"   2. 融合权重: θ_merged = θ_base + α_narrower * τ_narrower + α_wider * τ_wider")
-    print(f"   3. 使用稀疏激活的 LoRA 适配器对齐分布（MergeVLA 核心）")
+    # ⭐ 检查是否使用 accelerate 多卡训练
+    accelerator = None
+    world_size = get_world_size()
+    is_distributed = world_size > 1
     
-    if use_moe:
-        print(f"\n🎯 MoE 模式已启用（基于论文 Section 3.2 Expert Head）")
-        print(f"   - Backbone: 融合")
-        print(f"   - Action Head (DiT): 保留每个任务独立的 Expert Head，不融合")
-        print(f"   - 推理时使用 Smart Routing 选择使用哪个 Expert Head")
-        print(f"   - 软路由: {'是' if use_soft_routing else '否（硬路由）'}")
+    if is_distributed and HAS_ACCELERATE:
+        # 创建 accelerator（DDP 配置）
+        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+        accelerator = Accelerator(
+            mixed_precision="bf16",
+            kwargs_handlers=[ddp_kwargs],
+        )
+        if accelerator.is_main_process:
+            print(f"\n🚀 多卡训练模式启用！")
+            print(f"   使用 {accelerator.num_processes} 张 GPU")
+            print(f"   混合精度: bf16")
+    
+    if is_main_process():
+        print(f"\n{'='*60}")
+        print(f"⭐ MergeVLA-Style Merging")
+        print(f"   基于论文: https://arxiv.org/pdf/2511.18810")
+        if is_distributed:
+            print(f"   🚀 多卡训练: {world_size} GPUs")
+        print(f"{'='*60}")
+        print(f"\n📋 方法说明：")
+        print(f"   1. 计算 Task Vectors: τ = θ_expert - θ_base")
+        print(f"   2. 融合权重: θ_merged = θ_base + α_narrower * τ_narrower + α_wider * τ_wider")
+        print(f"   3. 使用稀疏激活的 LoRA 适配器对齐分布（MergeVLA 核心）")
+        
+        if use_moe:
+            print(f"\n🎯 MoE 模式已启用（基于论文 Section 3.2 Expert Head）")
+            print(f"   - Backbone: 融合")
+            print(f"   - Action Head (DiT): 保留每个任务独立的 Expert Head，不融合")
+            print(f"   - 推理时使用 Smart Routing 选择使用哪个 Expert Head")
+            print(f"   - 软路由: {'是' if use_soft_routing else '否（硬路由）'}")
+        else:
+            print(f"   4. Action head: 只使用 narrower 的（wider 的 DiT 被丢弃！）")
+            print(f"   ⚠️ 警告：这会导致 wider 任务能力丢失！")
+            print(f"   💡 推荐使用 --use_moe 启用 MoE 模式")
+        print(f"\n")
+    
+    # 确定设备
+    if accelerator is not None:
+        device = accelerator.device
     else:
-        print(f"   4. Action head: 只使用 narrower 的（wider 的 DiT 被丢弃！）")
-        print(f"   ⚠️ 警告：这会导致 wider 任务能力丢失！")
-        print(f"   💡 推荐使用 --use_moe 启用 MoE 模式")
-    print(f"\n")
+        device = args.device
     
     # 创建 MergeVLA 融合器
     merger = MergeVLAMerger(
@@ -1096,7 +1167,7 @@ def run_mergevla_merge(args):
         narrower_weight=args.narrower_weight,
         wider_weight=args.wider_weight,
         adapter_type=args.adapter_type,
-        device=args.device,
+        device=str(device),
         lora_rank=args.lora_rank,
         sparsity=getattr(args, 'sparsity', 0.5),
         merge_action_head=getattr(args, 'merge_action_head', False),
@@ -1106,7 +1177,7 @@ def run_mergevla_merge(args):
         use_soft_routing=use_soft_routing,  # ⭐ 软路由
     )
     
-    # 加载并融合
+    # 加载并融合（只需要在一个进程上做，然后广播）
     merger.load_and_merge()
     
     # 创建数据加载器
@@ -1117,7 +1188,7 @@ def run_mergevla_merge(args):
     episode_based = getattr(args, 'episode_based', False)
     num_episodes = getattr(args, 'num_episodes', None)
     
-    if use_all_frames or episode_based:
+    if is_main_process() and (use_all_frames or episode_based):
         print(f"\n⭐ 使用 Episode-based 采样模式")
         print(f"   use_all_frames={use_all_frames}")
         print(f"   episode_based={episode_based}")
@@ -1134,19 +1205,34 @@ def run_mergevla_merge(args):
         num_episodes=num_episodes,
     )
     
+    # ⭐ 多卡训练：学习率缩放
+    learning_rate = args.adapter_lr
+    if is_distributed:
+        # 使用保守的学习率缩放: lr = base_lr × num_gpus^0.3
+        import math
+        scale_factor = math.pow(world_size, 0.3)
+        learning_rate = args.adapter_lr * scale_factor
+        if is_main_process():
+            print(f"\n🔧 多卡训练学习率缩放:")
+            print(f"   基础学习率: {args.adapter_lr}")
+            print(f"   缩放因子: {scale_factor:.3f} (num_gpus^0.3)")
+            print(f"   缩放后学习率: {learning_rate:.2e}")
+    
     # 训练适配层（使用稳定训练配置）
     merger.train_adapter(
         train_dataloader=dataloader,
         num_epochs=args.adapter_epochs,
-        learning_rate=args.adapter_lr,
+        learning_rate=learning_rate,
         warmup_ratio=getattr(args, 'warmup_ratio', 0.1),
         use_cosine_schedule=getattr(args, 'use_cosine_schedule', True),
         gradient_accumulation_steps=getattr(args, 'gradient_accumulation_steps', 1),
         max_grad_norm=getattr(args, 'max_grad_norm', 1.0),
+        accelerator=accelerator,  # ⭐ 传递 accelerator
     )
     
-    # 保存
-    merger.save(args.output_path)
+    # 保存（只在主进程保存）
+    if accelerator is None or accelerator.is_main_process:
+        merger.save(args.output_path)
 
 
 def run_two_stage_merge(args):
