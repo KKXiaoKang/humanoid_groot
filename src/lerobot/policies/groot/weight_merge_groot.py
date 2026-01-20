@@ -23,6 +23,7 @@ import copy
 import json
 import glob
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -1250,9 +1251,10 @@ class SparseLoRAAdapter(nn.Module):
         alpha: float = 16.0,
         num_tasks: int = 2,  # 任务数量（narrower, wider）
         sparsity: float = 0.5,  # 稀疏度：每个任务激活的参数比例
-        dropout: float = 0.0,
+        dropout: float = 0.1,  # ⭐ 默认启用 dropout 增加稳定性
         routing_temperature: float = 1.0,  # 路由分数的温度参数（改为 1.0，更温和）
         svd_rank: int = 32,  # ⭐ SVD 保留的奇异向量数量 k_r
+        use_stable_init: bool = True,  # ⭐ 使用稳定初始化（类似 DuDe/Kaiming）
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -1263,11 +1265,27 @@ class SparseLoRAAdapter(nn.Module):
         self.routing_temperature = routing_temperature
         self.svd_rank = svd_rank
         
+        # ⭐ 稳定训练：使用更小的 alpha/rank 比例（推荐 1.0-2.0）
+        # 原来 alpha=rank 导致 scaling=1.0，可能太大
+        # 论文建议 alpha/rank ≤ 2 可以提高稳定性
+        self.scaling = self.alpha / self.rank
+        
         # 为每个任务创建独立的 LoRA 参数
         # A: (num_tasks, hidden_size, rank)
         # B: (num_tasks, rank, hidden_size)
-        self.lora_A = nn.Parameter(torch.randn(num_tasks, hidden_size, rank) * 0.02)
-        self.lora_B = nn.Parameter(torch.zeros(num_tasks, rank, hidden_size))
+        
+        # ⭐ 稳定初始化（参考 DuDe 和 Kaiming 初始化）
+        if use_stable_init:
+            # A: 使用 Kaiming 初始化，确保正向传播时激活值方差稳定
+            # std = sqrt(2 / hidden_size) 
+            std_A = math.sqrt(2.0 / hidden_size)
+            self.lora_A = nn.Parameter(torch.randn(num_tasks, hidden_size, rank) * std_A)
+            # B: 初始化为零，使 LoRA 初始输出为零（保守起步）
+            self.lora_B = nn.Parameter(torch.zeros(num_tasks, rank, hidden_size))
+        else:
+            # 原始初始化
+            self.lora_A = nn.Parameter(torch.randn(num_tasks, hidden_size, rank) * 0.02)
+            self.lora_B = nn.Parameter(torch.zeros(num_tasks, rank, hidden_size))
         
         # 任务掩码：每个任务激活哪些参数
         # mask: (num_tasks, hidden_size) - 二进制掩码
@@ -3083,41 +3101,38 @@ class MergeVLAMerger:
         self,
         train_dataloader,
         num_epochs: int = 20,
-        learning_rate: float = 1e-4,  # ⭐ 对齐 LeRobot/GROOT 默认学习率
+        learning_rate: float = 2e-5,  # ⭐ 降低学习率以提高稳定性（从 1e-4 降到 2e-5）
         decay_lr_ratio: float = 0.1,  # ⭐ 衰减到峰值的 10%（LeRobot 风格）
-        warmup_ratio: float = 0.05,   # 预热步数占比（5%，与 GROOT 一致）
+        warmup_ratio: float = 0.1,    # ⭐ 增加预热比例（从 5% 增到 10%）以提高稳定性
         use_cosine_schedule: bool = True,  # 使用 cosine 学习率衰减
         gradient_accumulation_steps: int = 1,  # 梯度累积步数
-        max_grad_norm: float = 1.0,   # 梯度裁剪阈值
+        max_grad_norm: float = 0.5,   # ⭐ 降低梯度裁剪阈值（从 1.0 降到 0.5）
+        weight_decay: float = 1e-4,   # ⭐ 增加 weight decay（从 1e-5 增到 1e-4）
+        use_ema: bool = True,         # ⭐ 使用 EMA（指数移动平均）平滑权重
+        ema_decay: float = 0.999,     # ⭐ EMA 衰减率
+        loss_scale: float = 0.1,      # ⭐ Loss 缩放因子，减小梯度幅度
         accelerator=None,  # ⭐ 多卡训练支持
         wandb_run=None,  # ⭐ Weights & Biases 实时监控
         log_interval: int = 10,  # ⭐ 日志记录间隔
     ):
         """
-        训练稀疏 LoRA 适配器（MergeVLA 风格）
+        训练稀疏 LoRA 适配器（MergeVLA 风格 + 稳定性改进）
         
-        使用 action loss 来优化适配层
+        ⭐ 稳定训练改进（基于 2025-2026 最新研究）：
         
-        ⭐ 学习率调度（完全对齐 LeRobot CosineDecayWithWarmup）：
-        基于 src/lerobot/optim/schedulers.py 的 CosineDecayWithWarmupSchedulerConfig
+        1. 降低学习率: 2e-5（而不是 1e-4），避免梯度爆炸
+        2. 更强梯度裁剪: max_grad_norm=0.5（而不是 1.0）
+        3. 更长 Warmup: 10%（而不是 5%），让模型平稳进入训练
+        4. 增加 Weight Decay: 1e-4（而不是 1e-5），正则化防止过拟合
+        5. EMA 权重平滑: 避免权重剧烈波动
+        6. Loss 缩放: 减小梯度幅度，提高数值稳定性
         
-        1. Linear Warmup: 线性从 1/(warmup_steps+1) 增长到 peak_lr
-        2. Cosine Decay: 从 peak_lr 衰减到 decay_lr（默认 peak_lr * 0.1）
-        
-        关键参数（与 GROOT 配置对齐）：
-        - learning_rate: 1e-4 （GROOT 默认值）
-        - warmup_ratio: 0.05 （5% 预热）
-        - decay_lr: peak_lr * 0.1 （衰减到 1e-5）
-        - optimizer: AdamW with betas=(0.95, 0.999), eps=1e-8, weight_decay=1e-5
-        
-        ⭐ 多卡训练支持：
-        传入 accelerator 参数以启用分布式训练
-        
-        ⭐ Weights & Biases 实时监控：
-        传入 wandb_run 以启用实时监控
+        参考研究:
+        - SRLoRA: Subspace Recomposition (arxiv.org/abs/2505.12433)
+        - DoRAN: Dynamic LoRA (arxiv.org/abs/2510.04331)
+        - DuDe: SVD-based initialization (arxiv.org/abs/2505.14367)
         """
         from torch.optim.lr_scheduler import LambdaLR
-        import math
         
         # ⭐ 判断是否是主进程（用于控制打印）
         is_main = accelerator is None or accelerator.is_main_process
@@ -3127,56 +3142,61 @@ class MergeVLAMerger:
         steps_per_epoch = len(train_dataloader) // gradient_accumulation_steps
         total_steps = num_epochs * steps_per_epoch
         
-        # ⭐ 对齐 LeRobot: warmup_steps 按比例计算
+        # ⭐ 更长的 warmup 以提高稳定性
         warmup_steps = int(total_steps * warmup_ratio)
-        warmup_steps = max(warmup_steps, 10)  # 至少 10 步
+        warmup_steps = max(warmup_steps, 50)  # 至少 50 步
         
         # ⭐ 衰减目标学习率（LeRobot 风格：衰减到 peak_lr 的 10%）
         decay_lr = learning_rate * decay_lr_ratio
         
         if is_main:
             print(f"\n{'='*60}")
-            print(f"🏋️ Training MergeVLA Adapter (LeRobot CosineDecayWithWarmup)")
+            print(f"🏋️ Training MergeVLA Adapter (稳定训练模式)")
             if use_accelerate:
                 print(f"   🚀 多卡训练: {accelerator.num_processes} GPUs")
             print(f"   Epochs: {num_epochs}")
             print(f"   Adapter type: {self.adapter_type}")
-            print(f"   ⭐ 学习率调度配置 (对齐 LeRobot/GROOT):")
+            print(f"   ⭐ 稳定训练配置:")
             print(f"      Steps per epoch: {steps_per_epoch}")
-            print(f"      Total steps (num_decay_steps): {total_steps}")
-            print(f"      Warmup steps (num_warmup_steps): {warmup_steps} ({warmup_ratio*100:.0f}%)")
-            print(f"      Peak LR: {learning_rate:.1e}")
-            print(f"      Decay LR: {decay_lr:.1e} (peak * {decay_lr_ratio})")
-            print(f"      Cosine schedule: {use_cosine_schedule}")
+            print(f"      Total steps: {total_steps}")
+            print(f"      Warmup steps: {warmup_steps} ({warmup_ratio*100:.0f}%)")
+            print(f"      Peak LR: {learning_rate:.1e} (降低以提高稳定性)")
+            print(f"      Decay LR: {decay_lr:.1e}")
+            print(f"      Max grad norm: {max_grad_norm} (更强裁剪)")
+            print(f"      Weight decay: {weight_decay} (增强正则化)")
+            print(f"      Loss scale: {loss_scale} (缩小梯度)")
+            print(f"      EMA: {use_ema} (decay={ema_decay})")
             print(f"      Gradient accumulation: {gradient_accumulation_steps}")
-            print(f"      Max grad norm: {max_grad_norm}")
             print(f"{'='*60}\n")
         
-        # ⭐ 对齐 GROOT 的优化器配置
-        # 参考 src/lerobot/policies/groot/configuration_groot.py
+        # ⭐ 优化器配置（更保守的参数）
         optimizer = torch.optim.AdamW(
             self.merged_model.adapter.parameters(),
             lr=learning_rate,
-            betas=(0.95, 0.999),  # ⭐ GROOT 默认 betas
+            betas=(0.9, 0.999),  # ⭐ 使用更标准的 betas（比 0.95, 0.999 更稳定）
             eps=1e-8,
-            weight_decay=1e-5,   # ⭐ GROOT 默认 weight_decay
+            weight_decay=weight_decay,
         )
         
+        # ⭐ EMA（指数移动平均）用于平滑权重更新
+        ema_params = None
+        if use_ema:
+            # 复制初始参数作为 EMA
+            ema_params = {}
+            for name, param in self.merged_model.adapter.named_parameters():
+                if param.requires_grad:
+                    ema_params[name] = param.data.clone()
+        
         # ⭐ 完全对齐 LeRobot 的 CosineDecayWithWarmup 调度器
-        # 参考 src/lerobot/optim/schedulers.py CosineDecayWithWarmupSchedulerConfig
         if use_cosine_schedule:
-            # 使用与 total_steps 相同的 decay_steps
             actual_warmup_steps = warmup_steps
             actual_decay_steps = total_steps
             
             def lr_lambda(current_step: int) -> float:
                 """
                 LeRobot CosineDecayWithWarmup 精确实现
-                
-                Warmup 阶段: 线性从 1/(warmup_steps+1) 增长到 1.0
-                Decay 阶段: Cosine 从 1.0 衰减到 alpha (decay_lr/peak_lr)
                 """
-                alpha = decay_lr / learning_rate  # 通常是 0.1
+                alpha = decay_lr / learning_rate
                 
                 def linear_warmup_schedule(step):
                     if step <= 0:
@@ -3286,6 +3306,9 @@ class MergeVLAMerger:
                     
                     loss = outputs_dict['loss']
                     
+                    # ⭐ Loss 缩放：减小梯度幅度，提高稳定性
+                    loss = loss * loss_scale
+                    
                     # 梯度累积：缩放 loss
                     if gradient_accumulation_steps > 1:
                         loss = loss / gradient_accumulation_steps
@@ -3328,14 +3351,21 @@ class MergeVLAMerger:
                     
                     optimizer.step()
                     
+                    # ⭐ EMA 更新：平滑权重变化
+                    if use_ema and ema_params is not None:
+                        with torch.no_grad():
+                            for name, param in self.merged_model.adapter.named_parameters():
+                                if param.requires_grad and name in ema_params:
+                                    ema_params[name].mul_(ema_decay).add_(param.data, alpha=1 - ema_decay)
+                    
                     # 更新学习率
                     if scheduler is not None:
                         scheduler.step()
                     
                     global_step += 1
                     
-                    # 记录实际 loss（还原累积的平均）
-                    actual_loss = accumulated_loss * gradient_accumulation_steps
+                    # 记录实际 loss（还原累积的平均，并除以 loss_scale 还原真实值）
+                    actual_loss = (accumulated_loss * gradient_accumulation_steps) / loss_scale
                     epoch_losses.append(actual_loss)
                     accumulated_loss = 0.0
                     
@@ -3461,6 +3491,15 @@ class MergeVLAMerger:
         # ⭐ 多卡训练时等待所有进程完成
         if use_accelerate:
             accelerator.wait_for_everyone()
+        
+        # ⭐ 将 EMA 参数复制回模型（使用更平滑的权重）
+        if use_ema and ema_params is not None:
+            with torch.no_grad():
+                for name, param in self.merged_model.adapter.named_parameters():
+                    if param.requires_grad and name in ema_params:
+                        param.data.copy_(ema_params[name])
+            if is_main:
+                print(f"   ✅ Applied EMA weights (decay={ema_decay})")
         
         if is_main:
             print(f"\n✅ Adapter training completed")
