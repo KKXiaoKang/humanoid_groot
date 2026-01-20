@@ -1248,13 +1248,13 @@ class SparseLoRAAdapter(nn.Module):
         self,
         hidden_size: int = 1024,
         rank: int = 16,
-        alpha: float = 16.0,
+        alpha: float = 1.0,  # ⭐ 降低到 1.0，使 scaling = 1/16 = 0.0625
         num_tasks: int = 2,  # 任务数量（narrower, wider）
         sparsity: float = 0.5,  # 稀疏度：每个任务激活的参数比例
-        dropout: float = 0.1,  # ⭐ 默认启用 dropout 增加稳定性
-        routing_temperature: float = 1.0,  # 路由分数的温度参数（改为 1.0，更温和）
-        svd_rank: int = 32,  # ⭐ SVD 保留的奇异向量数量 k_r
-        use_stable_init: bool = True,  # ⭐ 使用稳定初始化（类似 DuDe/Kaiming）
+        dropout: float = 0.0,  # ⭐ 禁用 dropout，减少训练不稳定因素
+        routing_temperature: float = 1.0,  # 路由分数的温度参数
+        svd_rank: int = 32,  # SVD 保留的奇异向量数量 k_r
+        use_stable_init: bool = True,  # 使用稳定初始化
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -1265,9 +1265,9 @@ class SparseLoRAAdapter(nn.Module):
         self.routing_temperature = routing_temperature
         self.svd_rank = svd_rank
         
-        # ⭐ 稳定训练：使用更小的 alpha/rank 比例（推荐 1.0-2.0）
-        # 原来 alpha=rank 导致 scaling=1.0，可能太大
-        # 论文建议 alpha/rank ≤ 2 可以提高稳定性
+        # ⭐ 关键：使用小的 scaling 来限制 LoRA 影响
+        # scaling = alpha/rank = 1.0/16 = 0.0625
+        # 配合 residual_scale=0.01，总体影响非常小
         self.scaling = self.alpha / self.rank
         
         # 为每个任务创建独立的 LoRA 参数
@@ -1276,12 +1276,12 @@ class SparseLoRAAdapter(nn.Module):
         
         # ⭐ 标准 LoRA 初始化（参考原始 LoRA 论文）
         # A: 使用 Kaiming uniform 初始化
-        # B: 使用小的随机值初始化（不是零！），让 LoRA 从一开始就有输出
+        # B: 初始化为零（标准做法），让 LoRA 初始输出为零
+        # 这样初始时不会破坏 backbone features 的分布
         std_A = math.sqrt(2.0 / hidden_size)
-        std_B = math.sqrt(2.0 / rank)  # ⚠️ 关键修复：B 也用小的随机值
         
         self.lora_A = nn.Parameter(torch.randn(num_tasks, hidden_size, rank) * std_A)
-        self.lora_B = nn.Parameter(torch.randn(num_tasks, rank, hidden_size) * std_B * 0.1)  # 比 A 小一点
+        self.lora_B = nn.Parameter(torch.zeros(num_tasks, rank, hidden_size))  # ⭐ 关键：B=0 让初始输出为零
         
         # 任务掩码：每个任务激活哪些参数
         # mask: (num_tasks, hidden_size) - 二进制掩码
@@ -1303,10 +1303,11 @@ class SparseLoRAAdapter(nn.Module):
         self.task_masks = nn.Parameter(mask_init)
         
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
-        # ⚠️ 关键修复：residual_scale 控制 LoRA 输出的权重
-        # 设为 1.0 让 LoRA 输出有完整的影响力
-        # 配合 scaling = alpha/rank 来控制总体大小
-        self.residual_scale = nn.Parameter(torch.full((1,), 1.0))
+        # ⭐ 关键修复：residual_scale 初始为很小的值（可学习）
+        # 因为 lora_B=0，初始时 LoRA 输出为零
+        # 但 residual_scale 不能为 0，否则梯度会是 0
+        # 0.01 足够小不会破坏特征，同时允许梯度流动
+        self.residual_scale = nn.Parameter(torch.full((1,), 0.01))
         
         # ⚠️ 关键：输出分布归一化（防止 chunk 变"平"）
         # 如果适配器改变特征分布过大，Flow Matching 的迭代去噪会崩溃
@@ -1939,10 +1940,10 @@ class DistributionAdapter(nn.Module):
             self.adapter = SparseLoRAAdapter(
                 hidden_size=hidden_size,
                 rank=lora_rank,
-                alpha=16.0,
+                alpha=1.0,  # ⭐ 使用小的 alpha，scaling = 1/16 = 0.0625
                 num_tasks=num_tasks,
                 sparsity=sparsity,
-                dropout=dropout,
+                dropout=0.0,  # 禁用 dropout
             )
             self.residual_scale = None
         elif adapter_type == "lora":
