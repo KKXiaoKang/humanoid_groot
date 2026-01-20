@@ -1274,18 +1274,14 @@ class SparseLoRAAdapter(nn.Module):
         # A: (num_tasks, hidden_size, rank)
         # B: (num_tasks, rank, hidden_size)
         
-        # ⭐ 稳定初始化（参考 DuDe 和 Kaiming 初始化）
-        if use_stable_init:
-            # A: 使用 Kaiming 初始化，确保正向传播时激活值方差稳定
-            # std = sqrt(2 / hidden_size) 
-            std_A = math.sqrt(2.0 / hidden_size)
-            self.lora_A = nn.Parameter(torch.randn(num_tasks, hidden_size, rank) * std_A)
-            # B: 初始化为零，使 LoRA 初始输出为零（保守起步）
-            self.lora_B = nn.Parameter(torch.zeros(num_tasks, rank, hidden_size))
-        else:
-            # 原始初始化
-            self.lora_A = nn.Parameter(torch.randn(num_tasks, hidden_size, rank) * 0.02)
-            self.lora_B = nn.Parameter(torch.zeros(num_tasks, rank, hidden_size))
+        # ⭐ 标准 LoRA 初始化（参考原始 LoRA 论文）
+        # A: 使用 Kaiming uniform 初始化
+        # B: 使用小的随机值初始化（不是零！），让 LoRA 从一开始就有输出
+        std_A = math.sqrt(2.0 / hidden_size)
+        std_B = math.sqrt(2.0 / rank)  # ⚠️ 关键修复：B 也用小的随机值
+        
+        self.lora_A = nn.Parameter(torch.randn(num_tasks, hidden_size, rank) * std_A)
+        self.lora_B = nn.Parameter(torch.randn(num_tasks, rank, hidden_size) * std_B * 0.1)  # 比 A 小一点
         
         # 任务掩码：每个任务激活哪些参数
         # mask: (num_tasks, hidden_size) - 二进制掩码
@@ -1307,10 +1303,10 @@ class SparseLoRAAdapter(nn.Module):
         self.task_masks = nn.Parameter(mask_init)
         
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
-        # ⚠️ 关键修复：使用更小的初始值，避免特征分布变化过大
-        # 原来是 torch.ones(1)=1.0，导致适配器输出权重太大
-        # 改为 0.1，让适配器以更温和的方式修改特征
-        self.residual_scale = nn.Parameter(torch.full((1,), 0.1))
+        # ⚠️ 关键修复：residual_scale 控制 LoRA 输出的权重
+        # 设为 1.0 让 LoRA 输出有完整的影响力
+        # 配合 scaling = alpha/rank 来控制总体大小
+        self.residual_scale = nn.Parameter(torch.full((1,), 1.0))
         
         # ⚠️ 关键：输出分布归一化（防止 chunk 变"平"）
         # 如果适配器改变特征分布过大，Flow Matching 的迭代去噪会崩溃
@@ -3101,14 +3097,14 @@ class MergeVLAMerger:
         self,
         train_dataloader,
         num_epochs: int = 20,
-        learning_rate: float = 1e-5,  # ⭐ 小而稳定的学习率
+        learning_rate: float = 1e-4,  # ⭐ LoRA 需要比 full fine-tuning 更高的学习率
         decay_lr_ratio: float = 0.1,  # 衰减到峰值的 10%
-        warmup_ratio: float = 0.0,    # ⭐ 不使用 warmup（直接开始训练）
-        use_cosine_schedule: bool = False,  # ⭐ 不使用 cosine decay（固定学习率）
+        warmup_ratio: float = 0.0,    # 不使用 warmup
+        use_cosine_schedule: bool = False,  # 固定学习率
         gradient_accumulation_steps: int = 1,  # 梯度累积步数
         max_grad_norm: float = 1.0,   # 梯度裁剪
-        weight_decay: float = 1e-4,   # weight decay 正则化
-        use_ema: bool = True,         # 使用 EMA 平滑权重
+        weight_decay: float = 0.0,    # ⭐ LoRA 通常不用 weight decay
+        use_ema: bool = False,        # ⭐ 暂时关闭 EMA，让训练更直接
         ema_decay: float = 0.999,     # EMA 衰减率
         loss_scale: float = 1.0,      # 不缩放 loss
         accelerator=None,  # 多卡训练支持

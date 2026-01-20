@@ -1545,18 +1545,18 @@ def main():
     
     parser.add_argument("--adapter_epochs", type=int, default=20,
                        help="Number of epochs to train the distribution adapter")
-    parser.add_argument("--adapter_lr", type=float, default=1e-5,
-                       help="Learning rate for adapter training (default: 1e-5, 固定学习率更稳定)")
+    parser.add_argument("--adapter_lr", type=float, default=1e-4,
+                       help="Learning rate for adapter training (default: 1e-4, LoRA 需要较高学习率)")
     
     # ⭐ 稳定训练参数 (LeRobot 风格)
     parser.add_argument("--warmup_ratio", type=float, default=0.0,
                        help="Warmup ratio (default: 0.0, 不使用 warmup)")
     parser.add_argument("--decay_lr_ratio", type=float, default=0.1,
                        help="Decay LR ratio, final_lr = peak_lr * ratio (default: 0.1)")
-    parser.add_argument("--weight_decay", type=float, default=1e-4,
-                       help="Weight decay for regularization (default: 1e-4)")
-    parser.add_argument("--use_ema", action="store_true", default=True,
-                       help="Use EMA (Exponential Moving Average) for stable training")
+    parser.add_argument("--weight_decay", type=float, default=0.0,
+                       help="Weight decay for regularization (default: 0.0 for LoRA)")
+    parser.add_argument("--use_ema", action="store_true", default=False,
+                       help="Use EMA (Exponential Moving Average) - disabled by default for direct training")
     parser.add_argument("--ema_decay", type=float, default=0.999,
                        help="EMA decay rate (default: 0.999)")
     parser.add_argument("--loss_scale", type=float, default=1.0,
