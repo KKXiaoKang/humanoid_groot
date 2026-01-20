@@ -230,6 +230,14 @@ fi
 # ============================================================
 # 启动训练
 # ============================================================
+
+# ⭐ 关键：设置离线模式，避免多卡训练时多进程同时尝试从 HuggingFace 下载
+# 这可以防止 SSL 连接错误和网络竞争条件
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+echo "🔒 已启用 HuggingFace 离线模式 (HF_HUB_OFFLINE=1)"
+echo "   请确保模型 nvidia/GR00T-N1.5-3B 已缓存在 ~/.cache/huggingface/hub/"
+
 if [ "$USE_MULTI_GPU" = true ]; then
     # ⭐ 多卡训练：使用 accelerate launch
     echo ""
@@ -246,7 +254,7 @@ if [ "$USE_MULTI_GPU" = true ]; then
         # ⭐ 只设置 CUDA_VISIBLE_DEVICES，不用 --gpu_ids
         # 因为 CUDA_VISIBLE_DEVICES 已经限制了可见性，accelerate 使用逻辑索引
         export CUDA_VISIBLE_DEVICES="$GPU_IDS"
-        accelerate launch \
+        HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 accelerate launch \
             --multi_gpu \
             --num_processes=${NUM_GPUS} \
             --mixed_precision=bf16 \
@@ -255,7 +263,7 @@ if [ "$USE_MULTI_GPU" = true ]; then
     else
         echo ""
         # 不指定 GPU IDs，让 accelerate 自动选择所有可用 GPU
-        accelerate launch \
+        HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 accelerate launch \
             --multi_gpu \
             --num_processes=${NUM_GPUS} \
             --mixed_precision=bf16 \
@@ -264,7 +272,7 @@ if [ "$USE_MULTI_GPU" = true ]; then
     fi
 else
     # 单卡训练：直接使用 python
-    python scripts/train_weight_merge.py \
+    HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python scripts/train_weight_merge.py \
         "${TRAIN_ARGS[@]}"
 fi
 
