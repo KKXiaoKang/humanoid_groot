@@ -3101,19 +3101,19 @@ class MergeVLAMerger:
         self,
         train_dataloader,
         num_epochs: int = 20,
-        learning_rate: float = 5e-5,  # ⭐ 适中的学习率（比 1e-4 小，比 2e-5 大）
-        decay_lr_ratio: float = 0.1,  # ⭐ 衰减到峰值的 10%（LeRobot 风格）
-        warmup_ratio: float = 0.1,    # ⭐ 10% 预热以提高稳定性
-        use_cosine_schedule: bool = True,  # 使用 cosine 学习率衰减
+        learning_rate: float = 1e-5,  # ⭐ 小而稳定的学习率
+        decay_lr_ratio: float = 0.1,  # 衰减到峰值的 10%
+        warmup_ratio: float = 0.0,    # ⭐ 不使用 warmup（直接开始训练）
+        use_cosine_schedule: bool = False,  # ⭐ 不使用 cosine decay（固定学习率）
         gradient_accumulation_steps: int = 1,  # 梯度累积步数
-        max_grad_norm: float = 1.0,   # ⭐ 恢复正常梯度裁剪
-        weight_decay: float = 1e-4,   # ⭐ weight decay 正则化
-        use_ema: bool = True,         # ⭐ 使用 EMA（指数移动平均）平滑权重
-        ema_decay: float = 0.999,     # ⭐ EMA 衰减率
-        loss_scale: float = 1.0,      # ⭐ 不缩放 loss（之前 0.1 导致梯度太小）
-        accelerator=None,  # ⭐ 多卡训练支持
-        wandb_run=None,  # ⭐ Weights & Biases 实时监控
-        log_interval: int = 10,  # ⭐ 日志记录间隔
+        max_grad_norm: float = 1.0,   # 梯度裁剪
+        weight_decay: float = 1e-4,   # weight decay 正则化
+        use_ema: bool = True,         # 使用 EMA 平滑权重
+        ema_decay: float = 0.999,     # EMA 衰减率
+        loss_scale: float = 1.0,      # 不缩放 loss
+        accelerator=None,  # 多卡训练支持
+        wandb_run=None,  # Weights & Biases 实时监控
+        log_interval: int = 10,  # 日志记录间隔
     ):
         """
         训练稀疏 LoRA 适配器（MergeVLA 风格 + 稳定性改进）
