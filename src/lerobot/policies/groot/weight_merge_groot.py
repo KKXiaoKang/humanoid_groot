@@ -2976,8 +2976,11 @@ class MergeVLAMerger:
         # 加载 base 模型结构
         # ⚠️ 重要：模型会在 CPU 上初始化，稍后移动到指定设备
         # 这避免了在 accelerate 设备分配之前占用错误的 GPU
+        # 注意：在多卡训练时，train_weight_merge.py 会在非主进程中设置 HF_HUB_OFFLINE=1
         from lerobot.policies.groot.modeling_groot import GrootPolicy
-        print(f"\n📦 Loading base model structure (on CPU first)...")
+        print(f"\n📦 Loading base model structure...")
+        print(f"   Using local path: {self.narrower_path}")
+        
         policy = GrootPolicy.from_pretrained(Path(self.narrower_path), strict=False)
         base_model = policy._groot_model
         print(f"   ✅ Base model loaded, will move to {self.device}")

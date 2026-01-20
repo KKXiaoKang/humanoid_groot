@@ -1185,8 +1185,43 @@ def run_mergevla_merge(args):
         use_soft_routing=use_soft_routing,  # ⭐ 软路由
     )
     
-    # 加载并融合（只需要在一个进程上做，然后广播）
-    merger.load_and_merge()
+    # ⭐ 多卡训练：只在主进程执行模型加载，避免多进程同时下载导致 SSL 错误
+    if accelerator is not None:
+        import os
+        
+        # 主进程先执行加载（允许从网络下载并缓存）
+        if accelerator.is_main_process:
+            print(f"\n📦 [Main Process] Loading and merging models...")
+            print(f"   (Other processes will wait and load from cache)")
+            merger.load_and_merge()
+            print(f"✅ [Main Process] Model loading completed, models cached")
+        
+        # 等待主进程完成下载和缓存
+        accelerator.wait_for_everyone()
+        
+        # 其他进程从本地缓存加载（设置离线模式）
+        if not accelerator.is_main_process:
+            print(f"\n📦 [Rank {accelerator.local_process_index}] Loading model from cache (offline mode)...")
+            # 设置离线模式，强制从缓存加载
+            original_offline = os.environ.get('HF_HUB_OFFLINE', None)
+            os.environ['HF_HUB_OFFLINE'] = '1'
+            try:
+                merger.load_and_merge()
+                print(f"✅ [Rank {accelerator.local_process_index}] Model loading completed")
+            finally:
+                # 恢复原始设置
+                if original_offline is not None:
+                    os.environ['HF_HUB_OFFLINE'] = original_offline
+                elif 'HF_HUB_OFFLINE' in os.environ:
+                    del os.environ['HF_HUB_OFFLINE']
+        
+        # 再次同步确保所有进程都加载完毕
+        accelerator.wait_for_everyone()
+        if accelerator.is_main_process:
+            print(f"✅ All processes have loaded models successfully")
+    else:
+        # 单卡模式：直接加载
+        merger.load_and_merge()
     
     # 创建数据加载器
     data_paths = args.data_path.split(",") if args.data_path else None
