@@ -3024,8 +3024,8 @@ class MergeVLAMerger:
             self.expert_state_dicts = [narrower_state_dict, wider_state_dict]
             
             # 创建 MoE 模型
-            # ⚠️ 注意：在多卡训练时，设备分配由 train_adapter 中的 accelerator 管理
-            # 这里先将模型创建在指定设备上，后续可能被 accelerator 重新分配
+            # ⚠️ 关键修复：模型先在 CPU 上创建，设备移动由 train_adapter 中的 accelerator 管理
+            # 这样可以避免在多卡模式下错误地使用 cuda:0
             self.merged_model = MergedModelWithMoE(
                 merged_backbone_state_dict=merged_state_dict,
                 expert_action_head_state_dicts=self.expert_state_dicts,
@@ -3037,12 +3037,9 @@ class MergeVLAMerger:
                 sparsity=self.sparsity,
                 use_soft_routing=self.use_soft_routing,
             )
-            # 只在单卡模式下立即移动到设备，多卡模式由 accelerator 处理
-            if not str(self.device).startswith("cuda:") or int(str(self.device).split(":")[-1]) == 0:
-                self.merged_model = self.merged_model.to(self.device)
-                print(f"   📱 Model moved to {self.device}")
-            else:
-                print(f"   📱 Model will be moved to device by accelerator")
+            # ⚠️ 不在这里移动到设备！由 train_adapter 处理
+            # 这确保在多卡模式下，每个进程使用正确的设备
+            print(f"   📱 Model created on CPU, will be moved to device in train_adapter")
         else:
             # 原有模式：只使用一个 action_head
             self.merged_model = MergedModelWithAdapter(
@@ -3055,11 +3052,8 @@ class MergeVLAMerger:
                 num_tasks=2,  # narrower, wider
                 sparsity=self.sparsity,
             )
-            if not str(self.device).startswith("cuda:") or int(str(self.device).split(":")[-1]) == 0:
-                self.merged_model = self.merged_model.to(self.device)
-                print(f"   📱 Model moved to {self.device}")
-            else:
-                print(f"   📱 Model will be moved to device by accelerator")
+            # ⚠️ 不在这里移动到设备！由 train_adapter 处理
+            print(f"   📱 Model created on CPU, will be moved to device in train_adapter")
         
         # 加载预处理器
         self._load_processors(self.narrower_path)
@@ -3172,10 +3166,11 @@ class MergeVLAMerger:
         if use_accelerate:
             # ⚠️ 重要：首先将整个模型移动到正确的设备
             # accelerator.device 会返回当前进程应该使用的设备
-            device = accelerator.device
+            # ⚠️ 关键修复：更新 self.device 为正确的设备
+            self.device = accelerator.device
             if is_main:
-                print(f"   📱 Moving model to {device}...")
-            self.merged_model = self.merged_model.to(device)
+                print(f"   📱 Moving model to {self.device}...")
+            self.merged_model = self.merged_model.to(self.device)
             
             # 准备模型和优化器
             # 注意：用整个模型而不只是 adapter
@@ -3190,6 +3185,11 @@ class MergeVLAMerger:
             
             if is_main:
                 print(f"   ✅ Accelerate: 模型、优化器、数据加载器已准备")
+        else:
+            # 单卡模式：移动模型到指定设备
+            if is_main:
+                print(f"   📱 Moving model to {self.device}...")
+            self.merged_model = self.merged_model.to(self.device)
         
         self.merged_model.train()
         global_step = 0

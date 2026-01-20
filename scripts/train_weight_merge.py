@@ -1126,10 +1126,10 @@ def run_mergevla_merge(args):
             mixed_precision="bf16",
             kwargs_handlers=[ddp_kwargs],
         )
-        # ⚠️ 关键：确保在正确的设备上进行后续操作
-        # accelerate 会设置每个进程的 CUDA_VISIBLE_DEVICES
-        import torch
-        torch.cuda.set_device(accelerator.local_process_index)
+        # ⚠️ 关键：不要手动调用 torch.cuda.set_device()
+        # accelerator 会自动管理设备分配，使用 accelerator.device 获取正确设备
+        # 当 CUDA_VISIBLE_DEVICES=6,7 时，accelerator.device 会正确返回 cuda:0 或 cuda:1
+        # 这些逻辑设备会映射到物理 GPU 6 和 7
         
         if accelerator.is_main_process:
             print(f"\n🚀 多卡训练模式启用！")

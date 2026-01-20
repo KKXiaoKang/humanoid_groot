@@ -51,11 +51,11 @@ done
 # ============================================================
 if [ "$USE_MULTI_GPU" = true ]; then
     # ⭐ 多卡训练模式（使用 accelerate）
+    # ⚠️ 注意：CUDA_VISIBLE_DEVICES 会在启动命令处设置，这里只计算数量和显示信息
     if [ -n "$GPU_IDS" ]; then
-        export CUDA_VISIBLE_DEVICES="$GPU_IDS"
-        # 计算 GPU 数量
+        # 计算 GPU 数量（不在这里设置 CUDA_VISIBLE_DEVICES，在启动时设置）
         NUM_GPUS=$(echo "$GPU_IDS" | tr ',' '\n' | wc -l)
-        GPU_INFO="🚀 多卡训练: GPU $GPU_IDS ($NUM_GPUS 张卡，使用 accelerate)"
+        GPU_INFO="🚀 多卡训练: 物理 GPU $GPU_IDS -> 逻辑 cuda:0~$((NUM_GPUS-1)) ($NUM_GPUS 张卡)"
     elif [ -n "$NUM_GPUS" ]; then
         # 使用指定数量的 GPU（从 0 开始）
         GPU_INFO="🚀 多卡训练: $NUM_GPUS 张卡（使用 accelerate）"
@@ -64,7 +64,7 @@ if [ "$USE_MULTI_GPU" = true ]; then
         NUM_GPUS=$(python3 -c "import torch; print(torch.cuda.device_count())" 2>/dev/null || nvidia-smi --list-gpus | wc -l)
         GPU_INFO="🚀 多卡训练: 所有可用 GPU ($NUM_GPUS 张卡，使用 accelerate)"
     fi
-    DEVICE="cuda:0"  # accelerate 会自动分配设备
+    DEVICE="cuda:0"  # accelerate 会自动分配设备，这个值不影响多卡训练
 else
     # 单卡训练模式
     if [ -n "$GPU_IDS" ]; then
@@ -184,22 +184,25 @@ if [ "$USE_MULTI_GPU" = true ]; then
     echo "🚀 使用 accelerate 启动多卡训练..."
     echo "   GPU 数量: $NUM_GPUS"
     
-    # ⚠️ 重要：使用 --gpu_ids 而不是依赖 CUDA_VISIBLE_DEVICES
-    # accelerate 会自己管理 GPU 分配
+    # ⚠️ 关键修复：使用 CUDA_VISIBLE_DEVICES 限制可见 GPU
+    # accelerate 然后使用逻辑索引 (0, 1, 2...) 访问这些 GPU
+    # 例如：CUDA_VISIBLE_DEVICES=6,7 时，GPU 6 变成逻辑 cuda:0，GPU 7 变成 cuda:1
     if [ -n "$GPU_IDS" ]; then
-        echo "   GPU IDs: $GPU_IDS"
+        echo "   物理 GPU IDs: $GPU_IDS"
+        echo "   逻辑映射: GPU $GPU_IDS -> cuda:0, cuda:1, ..."
         echo ""
-        # 使用 accelerate 的 --gpu_ids 参数明确指定使用哪些 GPU
+        # ⭐ 只设置 CUDA_VISIBLE_DEVICES，不用 --gpu_ids
+        # 因为 CUDA_VISIBLE_DEVICES 已经限制了可见性，accelerate 使用逻辑索引
+        export CUDA_VISIBLE_DEVICES="$GPU_IDS"
         accelerate launch \
             --multi_gpu \
             --num_processes=${NUM_GPUS} \
-            --gpu_ids="${GPU_IDS}" \
             --mixed_precision=bf16 \
             scripts/train_weight_merge.py \
             "${TRAIN_ARGS[@]}"
     else
         echo ""
-        # 不指定 GPU IDs，让 accelerate 自动选择
+        # 不指定 GPU IDs，让 accelerate 自动选择所有可用 GPU
         accelerate launch \
             --multi_gpu \
             --num_processes=${NUM_GPUS} \
