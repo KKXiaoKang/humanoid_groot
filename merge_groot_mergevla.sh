@@ -11,6 +11,12 @@
 #   ./merge_groot_mergevla.sh --multi-gpu --num-gpus 2     # 使用 2 张卡
 #   ./merge_groot_mergevla.sh --multi-gpu --gpus 0,1       # 使用 GPU 0 和 1
 #   ./merge_groot_mergevla.sh --multi-gpu                  # 使用所有可用 GPU
+#
+# ⭐ Weights & Biases 实时监控：
+#   ./merge_groot_mergevla.sh --wandb                                   # 启用 wandb 监控
+#   ./merge_groot_mergevla.sh --wandb --wandb-project my-project        # 自定义项目名
+#   ./merge_groot_mergevla.sh --wandb --wandb-run my-run                # 自定义运行名
+#   ./merge_groot_mergevla.sh --multi-gpu --gpus 6,7 --wandb            # 多卡 + wandb
 
 set -e
 
@@ -21,6 +27,12 @@ USE_MULTI_GPU=false
 NUM_GPUS=""
 GPU_IDS=""
 DEVICE="cuda:0"
+
+# ⭐ Weights & Biases 实时监控参数
+USE_WANDB=false
+WANDB_PROJECT="groot-mergevla"
+WANDB_RUN_NAME=""
+WANDB_ENTITY=""
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -34,6 +46,23 @@ while [[ $# -gt 0 ]]; do
             ;;
         --gpus)
             GPU_IDS="$2"
+            shift 2
+            ;;
+        # ⭐ Weights & Biases 参数
+        --wandb)
+            USE_WANDB=true
+            shift
+            ;;
+        --wandb-project|--wandb_project)
+            WANDB_PROJECT="$2"
+            shift 2
+            ;;
+        --wandb-run|--wandb_run)
+            WANDB_RUN_NAME="$2"
+            shift 2
+            ;;
+        --wandb-entity|--wandb_entity)
+            WANDB_ENTITY="$2"
             shift 2
             ;;
         *)
@@ -174,6 +203,23 @@ TRAIN_ARGS=(
     --gradient_accumulation_steps 4
     --max_grad_norm 1.0
 )
+
+# ⭐ 添加 Weights & Biases 参数（如果启用）
+if [ "$USE_WANDB" = true ]; then
+    TRAIN_ARGS+=( --use_wandb )
+    TRAIN_ARGS+=( --wandb_project "${WANDB_PROJECT}" )
+    if [ -n "$WANDB_RUN_NAME" ]; then
+        TRAIN_ARGS+=( --wandb_run_name "${WANDB_RUN_NAME}" )
+    fi
+    if [ -n "$WANDB_ENTITY" ]; then
+        TRAIN_ARGS+=( --wandb_entity "${WANDB_ENTITY}" )
+    fi
+    echo "📊 Weights & Biases 实时监控已启用"
+    echo "   Project: ${WANDB_PROJECT}"
+    [ -n "$WANDB_RUN_NAME" ] && echo "   Run: ${WANDB_RUN_NAME}"
+    [ -n "$WANDB_ENTITY" ] && echo "   Entity: ${WANDB_ENTITY}"
+    echo ""
+fi
 
 # ============================================================
 # 启动训练

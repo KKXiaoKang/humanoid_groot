@@ -3089,6 +3089,8 @@ class MergeVLAMerger:
         gradient_accumulation_steps: int = 1,  # 梯度累积步数
         max_grad_norm: float = 1.0,   # 梯度裁剪阈值
         accelerator=None,  # ⭐ 多卡训练支持
+        wandb_run=None,  # ⭐ Weights & Biases 实时监控
+        log_interval: int = 10,  # ⭐ 日志记录间隔
     ):
         """
         训练稀疏 LoRA 适配器（MergeVLA 风格）
@@ -3101,6 +3103,14 @@ class MergeVLAMerger:
         
         ⭐ 多卡训练支持：
         传入 accelerator 参数以启用分布式训练
+        
+        ⭐ Weights & Biases 实时监控：
+        传入 wandb_run 以启用实时监控，记录：
+        - Loss（总 loss、各组件 loss）
+        - 学习率
+        - 梯度范数
+        - LoRA 参数统计（权重范数、稀疏度）
+        - 路由统计（任务路由权重）
         """
         from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, LambdaLR
         import math
@@ -3302,15 +3312,124 @@ class MergeVLAMerger:
                     epoch_losses.append(actual_loss)
                     accumulated_loss = 0.0
                     
-                    if global_step % 10 == 0 and is_main:
-                        current_lr = optimizer.param_groups[0]['lr']
+                    current_lr = optimizer.param_groups[0]['lr']
+                    
+                    # ⭐ Weights & Biases 实时日志记录
+                    if wandb_run is not None and is_main and global_step % log_interval == 0:
+                        # 基本指标
+                        wandb_log = {
+                            "train/loss": actual_loss,
+                            "train/learning_rate": current_lr,
+                            "train/epoch": epoch + (batch_idx + 1) / len(train_dataloader),
+                            "train/global_step": global_step,
+                        }
+                        
+                        # 梯度范数（如果可用）
+                        if not use_accelerate and grad_norm is not None:
+                            wandb_log["train/grad_norm"] = grad_norm.item() if hasattr(grad_norm, 'item') else grad_norm
+                        
+                        # ⭐ LoRA 参数统计
+                        try:
+                            adapter = self.merged_model.adapter
+                            if hasattr(adapter, 'adapter') and hasattr(adapter.adapter, 'lora_A'):
+                                lora_adapter = adapter.adapter
+                                # LoRA A 和 B 的权重统计
+                                lora_A = lora_adapter.lora_A
+                                lora_B = lora_adapter.lora_B
+                                
+                                wandb_log["lora/A_weight_norm"] = lora_A.norm().item()
+                                wandb_log["lora/A_weight_mean"] = lora_A.abs().mean().item()
+                                wandb_log["lora/B_weight_norm"] = lora_B.norm().item()
+                                wandb_log["lora/B_weight_mean"] = lora_B.abs().mean().item()
+                                
+                                # 残差缩放
+                                if hasattr(lora_adapter, 'residual_scale'):
+                                    wandb_log["lora/residual_scale"] = lora_adapter.residual_scale.item()
+                                
+                                # 任务掩码统计
+                                if hasattr(lora_adapter, 'task_masks'):
+                                    task_masks = torch.sigmoid(lora_adapter.task_masks)
+                                    for t in range(task_masks.shape[0]):
+                                        mask_active = (task_masks[t] > 0.5).float().mean().item()
+                                        wandb_log[f"lora/task_{t}_mask_active_ratio"] = mask_active
+                                
+                                # 梯度统计（如果有）
+                                if lora_A.grad is not None:
+                                    wandb_log["lora/A_grad_norm"] = lora_A.grad.norm().item()
+                                if lora_B.grad is not None:
+                                    wandb_log["lora/B_grad_norm"] = lora_B.grad.norm().item()
+                        except Exception as e:
+                            pass  # 忽略 LoRA 统计错误
+                        
+                        # ⭐ 路由统计（如果有 MoE）
+                        try:
+                            if hasattr(self.merged_model, 'get_routing_stats'):
+                                routing_stats = self.merged_model.get_routing_stats()
+                                if routing_stats:
+                                    adapter_stats = routing_stats.get('adapter', {})
+                                    if adapter_stats:
+                                        for k, v in adapter_stats.items():
+                                            if isinstance(v, (int, float)):
+                                                wandb_log[f"routing/adapter_{k}"] = v
+                                    
+                                    moe_stats = routing_stats.get('moe_head', {})
+                                    if moe_stats:
+                                        for k, v in moe_stats.items():
+                                            if isinstance(v, (int, float)):
+                                                wandb_log[f"routing/moe_{k}"] = v
+                        except Exception as e:
+                            pass  # 忽略路由统计错误
+                        
+                        # 发送到 wandb
+                        import wandb
+                        wandb.log(wandb_log, step=global_step)
+                    
+                    if global_step % log_interval == 0 and is_main:
                         grad_info = f", grad_norm = {grad_norm:.4f}" if not use_accelerate else ""
                         print(f"   Epoch {epoch+1}/{num_epochs}, Step {global_step}: "
                               f"loss = {actual_loss:.4f}{grad_info}, lr = {current_lr:.2e}")
             
             if epoch_losses and is_main:
                 avg_loss = sum(epoch_losses) / len(epoch_losses)
-                print(f"\n📊 Epoch {epoch+1}/{num_epochs}: avg_loss = {avg_loss:.4f}")
+                min_loss = min(epoch_losses)
+                max_loss = max(epoch_losses)
+                print(f"\n📊 Epoch {epoch+1}/{num_epochs}: avg_loss = {avg_loss:.4f}, "
+                      f"min = {min_loss:.4f}, max = {max_loss:.4f}")
+                
+                # ⭐ Epoch 级别的 wandb 日志
+                if wandb_run is not None:
+                    import wandb
+                    epoch_log = {
+                        "epoch/avg_loss": avg_loss,
+                        "epoch/min_loss": min_loss,
+                        "epoch/max_loss": max_loss,
+                        "epoch/num": epoch + 1,
+                        "epoch/lr": optimizer.param_groups[0]['lr'],
+                    }
+                    
+                    # ⭐ 详细的 LoRA 参数直方图（每个 epoch 记录一次）
+                    try:
+                        adapter = self.merged_model.adapter
+                        if hasattr(adapter, 'adapter') and hasattr(adapter.adapter, 'lora_A'):
+                            lora_adapter = adapter.adapter
+                            lora_A = lora_adapter.lora_A.detach().cpu()
+                            lora_B = lora_adapter.lora_B.detach().cpu()
+                            
+                            # 权重直方图
+                            wandb.log({
+                                "histograms/lora_A": wandb.Histogram(lora_A.flatten().numpy()),
+                                "histograms/lora_B": wandb.Histogram(lora_B.flatten().numpy()),
+                            }, step=global_step)
+                            
+                            # 任务掩码热力图
+                            if hasattr(lora_adapter, 'task_masks'):
+                                task_masks = torch.sigmoid(lora_adapter.task_masks).detach().cpu()
+                                for t in range(task_masks.shape[0]):
+                                    epoch_log[f"epoch/task_{t}_mask_mean"] = task_masks[t].mean().item()
+                    except Exception as e:
+                        pass
+                    
+                    wandb.log(epoch_log, step=global_step)
         
         # ⭐ 多卡训练时等待所有进程完成
         if use_accelerate:
@@ -3318,6 +3437,30 @@ class MergeVLAMerger:
         
         if is_main:
             print(f"\n✅ Adapter training completed")
+            
+            # ⭐ 最终统计报告
+            if wandb_run is not None:
+                import wandb
+                
+                # 记录最终模型参数
+                final_stats = {}
+                try:
+                    adapter = self.merged_model.adapter
+                    if hasattr(adapter, 'adapter'):
+                        lora_adapter = adapter.adapter
+                        total_params = sum(p.numel() for p in adapter.parameters())
+                        trainable_params = sum(p.numel() for p in adapter.parameters() if p.requires_grad)
+                        final_stats["final/total_params"] = total_params
+                        final_stats["final/trainable_params"] = trainable_params
+                        
+                        if hasattr(lora_adapter, 'lora_A'):
+                            final_stats["final/lora_A_norm"] = lora_adapter.lora_A.norm().item()
+                            final_stats["final/lora_B_norm"] = lora_adapter.lora_B.norm().item()
+                except Exception as e:
+                    pass
+                
+                if final_stats:
+                    wandb.log(final_stats)
     
     def _prepare_observation(self, batch: dict) -> dict:
         """将 LeRobot batch 转换为预处理器期望的格式"""

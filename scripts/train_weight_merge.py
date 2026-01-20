@@ -66,6 +66,14 @@ except ImportError:
     HAS_ACCELERATE = False
     Accelerator = None
 
+# ⭐ Weights & Biases 实时监控支持
+try:
+    import wandb
+    HAS_WANDB = True
+except ImportError:
+    HAS_WANDB = False
+    wandb = None
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -1108,9 +1116,14 @@ def run_mergevla_merge(args):
     使用 accelerate launch 启动时自动启用分布式训练
     """
     from lerobot.policies.groot.weight_merge_groot import MergeVLAMerger
+    from datetime import datetime
     
     use_moe = getattr(args, 'use_moe', False)
     use_soft_routing = getattr(args, 'use_soft_routing', False)
+    
+    # ⭐ 初始化 Weights & Biases（只在主进程）
+    use_wandb = getattr(args, 'use_wandb', False) and HAS_WANDB
+    wandb_run = None
     
     # ⭐ 检查是否使用 accelerate 多卡训练
     # 注意：必须在任何 CUDA 操作之前初始化 accelerator
@@ -1159,6 +1172,52 @@ def run_mergevla_merge(args):
             print(f"   4. Action head: 只使用 narrower 的（wider 的 DiT 被丢弃！）")
             print(f"   ⚠️ 警告：这会导致 wider 任务能力丢失！")
             print(f"   💡 推荐使用 --use_moe 启用 MoE 模式")
+        print(f"\n")
+    
+    # ⭐ 在主进程初始化 Weights & Biases
+    if use_wandb and is_main_process():
+        # 生成默认的 run name
+        if args.wandb_run_name is None:
+            timestamp = datetime.now().strftime("%m%d_%H%M")
+            run_name = f"mergevla_{args.adapter_type}_lr{args.adapter_lr}_{timestamp}"
+            if use_moe:
+                run_name = f"moe_{run_name}"
+        else:
+            run_name = args.wandb_run_name
+        
+        # 配置信息
+        wandb_config = {
+            "method": "mergevla",
+            "use_moe": use_moe,
+            "use_soft_routing": use_soft_routing,
+            "adapter_type": args.adapter_type,
+            "lora_rank": args.lora_rank,
+            "sparsity": args.sparsity,
+            "adapter_epochs": args.adapter_epochs,
+            "adapter_lr": args.adapter_lr,
+            "batch_size": args.batch_size,
+            "warmup_ratio": getattr(args, 'warmup_ratio', 0.1),
+            "use_cosine_schedule": getattr(args, 'use_cosine_schedule', True),
+            "gradient_accumulation_steps": getattr(args, 'gradient_accumulation_steps', 1),
+            "max_grad_norm": getattr(args, 'max_grad_norm', 1.0),
+            "narrower_weight": args.narrower_weight,
+            "wider_weight": args.wider_weight,
+            "use_sparse_merge": getattr(args, 'use_sparse_merge', True),
+            "sparse_merge_lambda": getattr(args, 'sparse_merge_lambda', 1.0),
+            "num_gpus": get_world_size(),
+        }
+        
+        wandb_run = wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=run_name,
+            config=wandb_config,
+            reinit=True,
+        )
+        print(f"\n📊 Weights & Biases 已初始化")
+        print(f"   Project: {args.wandb_project}")
+        print(f"   Run: {run_name}")
+        print(f"   URL: {wandb_run.url}")
         print(f"\n")
     
     # 确定设备
@@ -1271,11 +1330,21 @@ def run_mergevla_merge(args):
         gradient_accumulation_steps=getattr(args, 'gradient_accumulation_steps', 1),
         max_grad_norm=getattr(args, 'max_grad_norm', 1.0),
         accelerator=accelerator,  # ⭐ 传递 accelerator
+        # ⭐ Weights & Biases 实时监控
+        wandb_run=wandb_run if use_wandb else None,
+        log_interval=getattr(args, 'log_interval', 10),
     )
     
     # 保存（只在主进程保存）
     if accelerator is None or accelerator.is_main_process:
         merger.save(args.output_path)
+    
+    # ⭐ 结束 wandb 运行
+    if wandb_run is not None:
+        # 记录最终模型路径
+        wandb.log({"model_path": str(args.output_path)})
+        wandb.finish()
+        print(f"\n📊 Weights & Biases 运行已完成")
 
 
 def run_two_stage_merge(args):
@@ -1485,6 +1554,18 @@ def main():
     # 设备
     parser.add_argument("--device", type=str, default="cuda:0",
                        help="Device for training")
+    
+    # ⭐ Weights & Biases 实时监控
+    parser.add_argument("--use_wandb", action="store_true", default=False,
+                       help="Enable Weights & Biases logging for real-time monitoring")
+    parser.add_argument("--wandb_project", type=str, default="groot-mergevla",
+                       help="W&B project name (default: groot-mergevla)")
+    parser.add_argument("--wandb_run_name", type=str, default=None,
+                       help="W&B run name (default: auto-generated based on settings)")
+    parser.add_argument("--wandb_entity", type=str, default=None,
+                       help="W&B entity/team name (default: None, uses personal account)")
+    parser.add_argument("--log_interval", type=int, default=10,
+                       help="How often to log metrics to W&B (default: every 10 steps)")
     
     args = parser.parse_args()
     
