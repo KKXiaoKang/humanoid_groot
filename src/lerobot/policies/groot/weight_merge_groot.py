@@ -2186,7 +2186,7 @@ class MoEActionHead(nn.Module):
                 if not mask.any():
                     continue
                 
-                # 提取这些样本的输入
+                # 提取这些样本的 backbone 输出
                 expert_backbone_outputs_dict = {
                     k: v[mask] if isinstance(v, torch.Tensor) and v.shape[0] == B else v
                     for k, v in backbone_outputs.items()
@@ -2194,10 +2194,30 @@ class MoEActionHead(nn.Module):
                 # ⚠️ 关键修复：包装成可属性访问的对象
                 expert_backbone_outputs = self._wrap_backbone_outputs(expert_backbone_outputs_dict)
                 
+                # ⭐ 关键修复：action_inputs 也需要用 mask 过滤！
+                # action_inputs 包含了 action、state 等信息，维度必须与 backbone_outputs 匹配
+                if hasattr(action_inputs, 'data'):
+                    # BatchFeature 类型
+                    expert_action_inputs_dict = {
+                        k: v[mask] if isinstance(v, torch.Tensor) and v.dim() > 0 and v.shape[0] == B else v
+                        for k, v in action_inputs.data.items()
+                    }
+                    from transformers import BatchFeature
+                    expert_action_inputs = BatchFeature(data=expert_action_inputs_dict)
+                elif isinstance(action_inputs, dict):
+                    # 普通 dict 类型
+                    expert_action_inputs = {
+                        k: v[mask] if isinstance(v, torch.Tensor) and v.dim() > 0 and v.shape[0] == B else v
+                        for k, v in action_inputs.items()
+                    }
+                else:
+                    # 其他类型，直接使用（可能会报错，但至少能追踪问题）
+                    expert_action_inputs = action_inputs
+                
                 # 通过专家头
                 expert_output = self.expert_heads[expert_idx](
                     expert_backbone_outputs, 
-                    action_inputs
+                    expert_action_inputs
                 )
                 
                 if hasattr(expert_output, 'data'):
