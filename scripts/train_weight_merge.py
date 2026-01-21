@@ -1369,12 +1369,20 @@ def run_mergevla_merge(args):
             bypass_adapter=getattr(args, 'bypass_adapter', False),
         )
     
+    # ⭐ 多卡训练：在保存之前同步所有进程
+    if accelerator is not None:
+        accelerator.wait_for_everyone()
+    
     # 保存（只在主进程保存）
     if accelerator is None or accelerator.is_main_process:
         merger.save(args.output_path)
     
-    # ⭐ 结束 wandb 运行
-    if wandb_run is not None:
+    # ⭐ 多卡训练：保存完成后再次同步，确保所有进程等待主进程保存完毕
+    if accelerator is not None:
+        accelerator.wait_for_everyone()
+    
+    # ⭐ 结束 wandb 运行（只在主进程）
+    if wandb_run is not None and (accelerator is None or accelerator.is_main_process):
         # 记录最终模型路径
         wandb.log({"model_path": str(args.output_path)})
         wandb.finish()
