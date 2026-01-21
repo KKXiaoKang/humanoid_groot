@@ -534,6 +534,8 @@ def wrap_policy_with_moe(
     task_type: str = None,
     use_smart_routing: bool = False,
     swap_task_mapping: bool = False,
+    use_action_head_voting: bool = False,  # 🗳️ Action Head Voting 模式
+    use_router_network: bool = False,  # 🧠 Router Network 模式
 ):
     """
     ⭐ 包装 GrootPolicy，使其使用 MoE 动作头
@@ -543,6 +545,13 @@ def wrap_policy_with_moe(
     - Adapter: Sparse LoRA 适配层
     - MoE Head: 多个独立的 Expert Head (action_head)
     
+    路由优先级：
+    1. task_type（固定路由）
+    2. use_router_network（🧠 Router Network，最智能！）
+    3. use_action_head_voting（让所有专家推理，选择最佳）
+    4. use_smart_routing（SVD-based routing）
+    5. 默认第一个专家
+    
     Args:
         policy: GrootPolicy 实例
         adapter: DistributionAdapter 实例
@@ -550,6 +559,8 @@ def wrap_policy_with_moe(
         task_type: 任务类型 ("narrower", "wider", None)
         use_smart_routing: 是否使用智能任务路由
         swap_task_mapping: 是否交换任务映射
+        use_action_head_voting: 🗳️ Action Head Voting 模式
+        use_router_network: 🧠 Router Network 模式
     """
     if adapter is None or moe_head is None:
         return
@@ -561,18 +572,35 @@ def wrap_policy_with_moe(
             adapter.adapter.set_action_heads(list(moe_head.expert_heads))
             print(f"   ⭐ SVD-based routing: 已连接 {len(moe_head.expert_heads)} 个专家的 action heads")
     
-    # 设置 task_id
+    # 设置 task_id 和路由模式
+    # ⚠️ 优先级：task_type > router_network > action_head_voting > smart_routing > 默认
+    actual_use_router = use_router_network and task_type is None
+    actual_use_voting = use_action_head_voting and task_type is None and not use_router_network
+    actual_use_smart = use_smart_routing and task_type is None and not use_router_network and not use_action_head_voting
+    
     if task_type == "narrower":
         actual_task_id = 1 if swap_task_mapping else 0
         fixed_task_id = torch.tensor([actual_task_id], device=next(adapter.parameters()).device)
         print(f"   🎯 MoE 路由: task_type=narrower → task_id={actual_task_id} → 使用 {moe_head.expert_names[actual_task_id]} 专家")
+        if use_router_network:
+            print(f"      ⚠️ 忽略 --router-network（已指定 task_type）")
+        if use_action_head_voting:
+            print(f"      ⚠️ 忽略 --action-head-voting（已指定 task_type）")
     elif task_type == "wider":
         actual_task_id = 0 if swap_task_mapping else 1
         fixed_task_id = torch.tensor([actual_task_id], device=next(adapter.parameters()).device)
         print(f"   🎯 MoE 路由: task_type=wider → task_id={actual_task_id} → 使用 {moe_head.expert_names[actual_task_id]} 专家")
+        if use_router_network:
+            print(f"      ⚠️ 忽略 --router-network（已指定 task_type）")
+        if use_action_head_voting:
+            print(f"      ⚠️ 忽略 --action-head-voting（已指定 task_type）")
     else:
         fixed_task_id = None
-        if use_smart_routing:
+        if actual_use_router:
+            print(f"   🧠 MoE Router Network (使用训练好的网络预测专家)")
+        elif actual_use_voting:
+            print(f"   🗳️ MoE Action Head Voting (让所有专家推理，选择最佳)")
+        elif actual_use_smart:
             print(f"   ⭐ MoE 智能任务路由 (根据输入特征自动选择专家)")
         else:
             print(f"   ⚠️ MoE: 未指定任务类型，使用默认专家 ({moe_head.expert_names[0]})")
@@ -586,16 +614,16 @@ def wrap_policy_with_moe(
         # 通过适配层
         backbone_features = backbone_outputs[BACKBONE_FEATURE_KEY]
         
-        # 计算路由权重（如果使用智能路由）
+        # 计算路由权重（如果使用 SVD 智能路由且不使用其他模式且没有固定 task_id）
         routing_weights = None
-        if fixed_task_id is None and use_smart_routing:
+        if fixed_task_id is None and actual_use_smart:
             routing_weights = adapter.adapter.compute_task_routing_scores(backbone_features)
         
         # 应用适配
         adapted_features = adapter(
             backbone_features, 
             task_id=fixed_task_id,
-            use_smart_routing=use_smart_routing
+            use_smart_routing=actual_use_smart
         )
         backbone_outputs[BACKBONE_FEATURE_KEY] = adapted_features
         
@@ -606,12 +634,23 @@ def wrap_policy_with_moe(
             action_inputs, 
             task_id=fixed_task_id,
             routing_weights=routing_weights,
+            use_action_head_voting=actual_use_voting,
+            use_router_network=actual_use_router,  # 🧠 Router Network
             rtc_enabled=rtc_enabled,
             **kwargs
         )
     
     policy._groot_model.get_action = get_action_with_moe
-    routing_mode = "智能任务路由" if use_smart_routing else ("固定专家" if fixed_task_id is not None else "默认专家")
+    
+    # 路由模式打印（基于实际使用的模式）
+    if fixed_task_id is not None:
+        routing_mode = "固定专家"
+    elif actual_use_voting:
+        routing_mode = "Action Head Voting"
+    elif actual_use_smart:
+        routing_mode = "智能任务路由"
+    else:
+        routing_mode = "默认专家"
     print(f"   ✅ Policy 已包装 MoE 动作头 (路由模式: {routing_mode})")
 
 
@@ -628,6 +667,9 @@ def eval_on_dataset(
     task_type: str = None,
     use_smart_routing: bool = False,  # ⭐ 是否使用 MergeVLA 智能任务路由
     swap_task_mapping: bool = False,  # ⚠️ 是否交换任务映射
+    use_action_head_voting: bool = False,  # 🗳️ Action Head Voting 模式
+    use_router_network: bool = False,  # 🧠 Router Network 模式
+    router_path: str = None,  # Router Network 权重路径
 ):
     """
     在数据集上评估融合模型
@@ -649,6 +691,9 @@ def eval_on_dataset(
                           当任务身份未知时，根据模型内部参数子空间
         swap_task_mapping: ⚠️ 是否交换任务映射（如果 Smart Routing 结果相反）
                           自动推断任务相关性（参考 MergeVLA 论文 Section 3.3）
+        use_action_head_voting: 🗳️ Action Head Voting 模式
+                               让所有专家都推理，选择置信度最高的
+                               ⭐ 推荐：当 smart_routing 效果不好时使用此模式
     """
     infer_per_frame = max(1, infer_per_frame)  # 至少每帧推理一次
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
@@ -819,6 +864,44 @@ def eval_on_dataset(
                 # ⭐ MoE 模式：加载多个专家头
                 moe_head = load_moe_expert_heads(policy, model_path, merge_config, device)
                 if moe_head is not None:
+                    # 🧠 如果启用 Router Network，加载训练好的 Router
+                    if use_router_network:
+                        router_file = router_path or os.path.join(model_path, "router_network.pt")
+                        if os.path.exists(router_file):
+                            print(f"\n🧠 Loading Router Network from {router_file}...")
+                            try:
+                                from lerobot.policies.groot.weight_merge_groot import RouterNetwork
+                                router_checkpoint = torch.load(router_file, map_location=device)
+                                router_config = router_checkpoint.get('config', {})
+                                
+                                router_network = RouterNetwork(
+                                    hidden_dim=router_config.get('hidden_dim', 2048),
+                                    num_experts=router_config.get('num_experts', len(moe_head.expert_heads)),
+                                    intermediate_dim=router_config.get('intermediate_dim', 256),
+                                )
+                                router_network.load_state_dict(router_checkpoint['state_dict'])
+                                router_network.to(device)
+                                router_network.eval()
+                                
+                                # 将 Router Network 绑定到 moe_head
+                                moe_head.router_network = router_network
+                                
+                                best_acc = router_checkpoint.get('best_val_acc', 'N/A')
+                                print(f"   ✅ Router Network loaded!")
+                                print(f"   📊 Best validation accuracy: {best_acc}%")
+                                print(f"   Task names: {router_config.get('task_names', 'N/A')}")
+                            except Exception as e:
+                                print(f"   ❌ Error loading Router Network: {e}")
+                                print(f"   ⚠️ Falling back to Action Head Voting...")
+                                use_router_network = False
+                                use_action_head_voting = True
+                        else:
+                            print(f"\n❌ Router Network file not found: {router_file}")
+                            print(f"   💡 Train it first: python scripts/train_router_network.py ...")
+                            print(f"   ⚠️ Falling back to Action Head Voting...")
+                            use_router_network = False
+                            use_action_head_voting = True
+                    
                     wrap_policy_with_moe(
                         policy, 
                         adapter,
@@ -826,6 +909,8 @@ def eval_on_dataset(
                         task_type=task_type,
                         use_smart_routing=use_smart_routing,
                         swap_task_mapping=swap_task_mapping,
+                        use_action_head_voting=use_action_head_voting,  # 🗳️ Action Head Voting
+                        use_router_network=use_router_network,  # 🧠 Router Network
                     )
                 else:
                     # MoE 头加载失败，回退到单 action_head 模式
@@ -1500,6 +1585,21 @@ if __name__ == "__main__":
                             'Use this if Smart Routing gives opposite results. '
                             'When enabled: --task-type narrower uses task_id=1, '
                             '--task-type wider uses task_id=0.')
+    parser.add_argument('--action-head-voting', action='store_true',
+                       dest='action_head_voting',
+                       help='🗳️ Enable Action Head Voting mode. '
+                            'All expert heads run inference, then select the one with highest confidence. '
+                            'Confidence is based on: sampling consistency, action smoothness, and value range. '
+                            '⭐ RECOMMENDED when --smart-routing does not work well! '
+                            'This bypasses backbone-based routing and directly compares action outputs.')
+    parser.add_argument('--router-network', action='store_true',
+                       dest='router_network',
+                       help='🧠 Enable Router Network mode. '
+                            'Use a trained neural network to predict which expert to use. '
+                            '⭐⭐ BEST OPTION: Train the router first with train_router_network.py! '
+                            'This is the most intelligent and accurate routing method.')
+    parser.add_argument('--router-path', type=str, default=None,
+                       help='Path to trained Router Network weights (default: model_path/router_network.pt)')
     
     args = parser.parse_args()
     
@@ -1519,12 +1619,21 @@ if __name__ == "__main__":
     # 打印任务路由模式
     if args.task_type:
         print(f"🎯 Task Routing: Fixed task_type={args.task_type}")
+    elif args.router_network:
+        print(f"🧠 Task Routing: Router Network (智能神经网络路由)")
+        print(f"   ⭐⭐ 最佳选项：使用训练好的网络预测专家")
+        router_path = args.router_path or os.path.join(args.model_path, "router_network.pt")
+        print(f"   📁 Router path: {router_path}")
+    elif args.action_head_voting:
+        print(f"🗳️ Task Routing: Action Head Voting (让所有专家推理，选择最佳)")
+        print(f"   ⭐ 置信度衡量: 历史一致性 + 动作平滑度 + 数值范围合理性")
+        print(f"   💡 推荐：当 --smart-routing 效果不好时使用此模式")
     elif args.smart_routing:
         print(f"⭐ Task Routing: MergeVLA Smart Routing (自动推断任务类型)")
         print(f"   🔥 自动选择 postprocessor: 根据每次推理的路由决策动态选择")
     else:
         print(f"⚠️ Task Routing: Simple Average (可能导致动作混乱！)")
-        print(f"   建议：使用 --smart-routing 自动推断任务类型和 postprocessor")
+        print(f"   建议：使用 --router-network 或 --action-head-voting")
     print("="*80)
     
     eval_on_dataset(
@@ -1540,4 +1649,7 @@ if __name__ == "__main__":
         task_type=args.task_type,
         use_smart_routing=args.smart_routing,  # ⭐ MergeVLA 智能任务路由
         swap_task_mapping=args.swap_task_mapping,  # ⚠️ 交换任务映射
+        use_action_head_voting=args.action_head_voting,  # 🗳️ Action Head Voting 模式
+        use_router_network=args.router_network,  # 🧠 Router Network 模式
+        router_path=args.router_path,  # Router Network 权重路径
     )

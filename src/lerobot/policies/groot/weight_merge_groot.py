@@ -2106,6 +2106,168 @@ class DictWithAttrAccess:
         return self._data.get(key, default)
 
 
+class RouterNetwork(nn.Module):
+    """
+    🧠 Router Network：智能路由网络
+    
+    这是一个可训练的小型神经网络，用于根据 backbone 特征预测应该使用哪个专家。
+    这是 MoE (Mixture of Experts) 的标准做法。
+    
+    架构:
+        Input: backbone_features (B, seq_len, hidden_dim)
+        → Mean Pooling → (B, hidden_dim)
+        → MLP → (B, num_experts)
+        → Softmax → 专家选择概率
+    
+    训练方式:
+        使用原始训练数据集，以任务标签（narrower/wider）作为监督信号，
+        训练 Router Network 学习从视觉特征到任务类型的映射。
+    
+    优势:
+        1. 真正的"智能"路由，而非启发式规则
+        2. 可以单独训练，不影响已有的专家
+        3. 训练数据已经有了（原来的训练数据集）
+        4. 推理时只需一次前向传播，非常快
+    """
+    
+    def __init__(
+        self,
+        hidden_dim: int,           # backbone 特征维度 (e.g., 2048)
+        num_experts: int,          # 专家数量 (e.g., 2)
+        intermediate_dim: int = 256,  # 中间层维度
+        dropout: float = 0.1,      # Dropout 比例
+    ):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.num_experts = num_experts
+        
+        # MLP 分类器
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_dim, intermediate_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(intermediate_dim, intermediate_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(intermediate_dim // 2, num_experts),
+        )
+        
+        # 初始化
+        self._init_weights()
+        
+        # 统计信息
+        self._call_count = 0
+        self._routing_history = []
+        
+        print(f"   🧠 Router Network initialized:")
+        print(f"      Input dim: {hidden_dim}")
+        print(f"      Num experts: {num_experts}")
+        print(f"      Intermediate dim: {intermediate_dim}")
+        print(f"      Parameters: {sum(p.numel() for p in self.parameters()):,}")
+    
+    def _init_weights(self):
+        """Xavier 初始化"""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+    
+    def forward(
+        self, 
+        backbone_features: torch.Tensor,  # (B, seq_len, hidden_dim) 或 (B, hidden_dim)
+        return_logits: bool = False,
+        temperature: float = 1.0,
+    ) -> torch.Tensor:
+        """
+        前向传播，预测专家选择概率
+        
+        Args:
+            backbone_features: backbone 特征
+            return_logits: 是否返回 logits（用于训练时计算 loss）
+            temperature: softmax 温度（越小越"硬"）
+        
+        Returns:
+            如果 return_logits=True: logits (B, num_experts)
+            否则: 专家概率 (B, num_experts)
+        """
+        # 如果是 3D tensor，做 mean pooling
+        if backbone_features.dim() == 3:
+            # (B, seq_len, hidden_dim) → (B, hidden_dim)
+            pooled = backbone_features.mean(dim=1)
+        else:
+            pooled = backbone_features
+        
+        # 通过分类器
+        logits = self.classifier(pooled)  # (B, num_experts)
+        
+        if return_logits:
+            return logits
+        
+        # Softmax with temperature
+        probs = F.softmax(logits / temperature, dim=-1)
+        
+        return probs
+    
+    def predict_expert(
+        self, 
+        backbone_features: torch.Tensor,
+        temperature: float = 1.0,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        预测应该使用哪个专家
+        
+        Args:
+            backbone_features: backbone 特征
+            temperature: softmax 温度
+        
+        Returns:
+            expert_idx: (B,) 专家索引
+            confidence: (B,) 置信度（最大概率）
+        """
+        probs = self.forward(backbone_features, temperature=temperature)
+        confidence, expert_idx = probs.max(dim=-1)
+        
+        # 记录统计
+        self._call_count += 1
+        self._routing_history.append(expert_idx.detach().cpu().tolist())
+        
+        return expert_idx, confidence
+    
+    def get_routing_stats(self) -> dict:
+        """获取路由统计信息"""
+        if not self._routing_history:
+            return {"call_count": 0}
+        
+        # 展平历史记录
+        flat_history = []
+        for batch in self._routing_history:
+            if isinstance(batch, list):
+                flat_history.extend(batch)
+            else:
+                flat_history.append(batch)
+        
+        # 统计每个专家被选中的次数
+        expert_counts = {}
+        for idx in flat_history:
+            expert_counts[idx] = expert_counts.get(idx, 0) + 1
+        
+        total = len(flat_history)
+        expert_ratios = {k: v / total for k, v in expert_counts.items()}
+        
+        return {
+            "call_count": self._call_count,
+            "total_predictions": total,
+            "expert_counts": expert_counts,
+            "expert_ratios": expert_ratios,
+        }
+    
+    def reset_stats(self):
+        """重置统计信息"""
+        self._call_count = 0
+        self._routing_history = []
+
+
 class MoEActionHead(nn.Module):
     """
     MoE 风格的多专家动作头 ⭐
@@ -2125,6 +2287,7 @@ class MoEActionHead(nn.Module):
         expert_names: list[str] = None,  # 专家名称（用于调试）
         routing_temperature: float = 0.1,  # 路由温度（越小越倾向于硬路由）
         use_soft_routing: bool = False,  # 是否使用软路由（加权平均）
+        router_network: RouterNetwork = None,  # 🧠 可选的 Router Network
     ):
         super().__init__()
         self.expert_heads = expert_heads
@@ -2132,6 +2295,7 @@ class MoEActionHead(nn.Module):
         self.expert_names = expert_names or [f"expert_{i}" for i in range(self.num_experts)]
         self.routing_temperature = routing_temperature
         self.use_soft_routing = use_soft_routing
+        self.router_network = router_network  # 🧠 Router Network
         
         # 路由统计
         self._routing_stats = {name: 0 for name in self.expert_names}
@@ -2141,6 +2305,8 @@ class MoEActionHead(nn.Module):
         print(f"      Experts: {self.expert_names}")
         print(f"      Soft routing: {use_soft_routing}")
         print(f"      Temperature: {routing_temperature}")
+        if router_network is not None:
+            print(f"      🧠 Router Network: ✅ Enabled")
     
     def _wrap_backbone_outputs(self, backbone_outputs):
         """
@@ -2270,22 +2436,36 @@ class MoEActionHead(nn.Module):
         action_inputs, 
         task_id: torch.Tensor = None,
         routing_weights: torch.Tensor = None,
+        use_action_head_voting: bool = False,  # Action Head Voting 模式
+        use_router_network: bool = False,  # 🧠 Router Network 模式（推荐！）
         **kwargs
     ) -> dict:
         """
         MoE 推理（获取动作）
+        
+        路由优先级：
+        1. task_id（固定路由）
+        2. use_router_network（🧠 Router Network，推荐！）
+        3. use_action_head_voting（让所有专家推理，选择最佳）
+        4. routing_weights（SVD routing）
+        5. 默认第一个专家
         
         Args:
             backbone_outputs: backbone 输出（包含 adapted_features）
             action_inputs: action_head 需要的输入
             task_id: (B,) - 如果提供，使用固定路由
             routing_weights: (B, num_experts) - 如果提供，使用软路由权重
+            use_action_head_voting: 如果 True，让所有专家都推理，选择置信度最高的
+            use_router_network: 如果 True，使用训练好的 Router Network 预测专家
         
         Returns:
             dict with 'action_pred' and other outputs
         """
         # ⚠️ 关键修复：包装成可属性访问的对象
         wrapped_outputs = self._wrap_backbone_outputs(backbone_outputs)
+        
+        # 获取 backbone features（用于 Router Network）
+        backbone_features = backbone_outputs.get(BACKBONE_FEATURE_KEY, None)
         
         if task_id is not None:
             # 固定路由：选择指定专家
@@ -2298,6 +2478,16 @@ class MoEActionHead(nn.Module):
             return self.expert_heads[expert_idx].get_action(
                 wrapped_outputs, action_inputs, **kwargs
             )
+        
+        elif use_router_network and self.router_network is not None and backbone_features is not None:
+            # 🧠 Router Network 模式：使用训练好的网络预测专家
+            return self._get_action_with_router_network(
+                wrapped_outputs, action_inputs, backbone_features, **kwargs
+            )
+        
+        elif use_action_head_voting and self.num_experts > 1:
+            # Action Head Voting：让所有专家都推理，选择置信度最高的
+            return self._get_action_with_voting(wrapped_outputs, action_inputs, **kwargs)
         
         elif routing_weights is not None:
             # 根据路由权重选择专家
@@ -2315,6 +2505,187 @@ class MoEActionHead(nn.Module):
             # 默认：使用第一个专家
             self._routing_stats[self.expert_names[0]] += 1
             self._routing_call_count += 1
+            return self.expert_heads[0].get_action(wrapped_outputs, action_inputs, **kwargs)
+    
+    def _get_action_with_router_network(
+        self,
+        wrapped_outputs: dict,
+        action_inputs,
+        backbone_features: torch.Tensor,
+        **kwargs
+    ) -> dict:
+        """
+        🧠 使用 Router Network 预测专家并获取动作
+        
+        这是真正"智能"的路由方法：
+        1. 使用训练好的 Router Network 预测当前输入应该使用哪个专家
+        2. 一次前向传播，非常快
+        3. 准确性取决于 Router Network 的训练质量
+        """
+        # 预测专家
+        expert_idx, confidence = self.router_network.predict_expert(
+            backbone_features,
+            temperature=self.routing_temperature
+        )
+        
+        # 获取第一个样本的专家索引（假设 batch_size=1 或所有样本使用相同专家）
+        selected_expert = expert_idx[0].item()
+        selected_confidence = confidence[0].item()
+        
+        # 更新统计
+        self._routing_stats[self.expert_names[selected_expert]] += 1
+        self._routing_call_count += 1
+        
+        # 每 10 次打印一次诊断
+        if self._routing_call_count % 10 == 1:
+            print(f"\n   🧠 Router Network (call #{self._routing_call_count}):")
+            print(f"      → Expert {self.expert_names[selected_expert]}: confidence={selected_confidence:.4f}")
+        
+        return self.expert_heads[selected_expert].get_action(
+            wrapped_outputs, action_inputs, **kwargs
+        )
+    
+    def _get_action_with_voting(
+        self, 
+        wrapped_outputs: dict, 
+        action_inputs, 
+        num_samples: int = 1,  # Flow Matching 是确定性的，多次采样无意义
+        **kwargs
+    ) -> dict:
+        """
+        ⭐ Action Head Voting V2：让所有专家都推理，基于历史一致性选择
+        
+        ⚠️ 关键发现：Flow Matching 推理是确定性的（没有随机采样），
+           所以不能用"采样方差"来衡量置信度！
+        
+        改进的置信度衡量方式：
+        1. 历史一致性：与上一帧预测的连续性（最重要！）
+        2. 动作范围合理性：超出典型范围的惩罚
+        3. 专家历史偏好：如果某个专家连续被选中多次，增加其偏好
+        
+        这种方法利用了一个关键假设：正确的专家会产生时间上连续的动作
+        """
+        all_expert_results = []
+        all_expert_confidences = []
+        all_confidence_details = []  # 用于调试
+        
+        for expert_idx, expert_head in enumerate(self.expert_heads):
+            # 只采样一次（Flow Matching 是确定性的）
+            result = expert_head.get_action(wrapped_outputs, action_inputs, **kwargs)
+            
+            if 'action_pred' not in result:
+                all_expert_results.append(None)
+                all_expert_confidences.append(float('-inf'))
+                all_confidence_details.append({})
+                continue
+            
+            action_pred = result['action_pred']  # (B, chunk, action_dim)
+            
+            # === 置信度指标 ===
+            
+            # 1. 历史一致性（最重要！）
+            # 如果有上一帧的预测，检查当前预测与上一帧的连续性
+            history_continuity = 0.0
+            expert_name = self.expert_names[expert_idx]
+            
+            if hasattr(self, '_last_expert_actions') and expert_name in self._last_expert_actions:
+                last_action = self._last_expert_actions[expert_name]
+                if last_action is not None:
+                    # 比较第一个时间步与上一帧最后一个时间步
+                    # 注意：上一帧是 (B, chunk, dim)，当前帧也是 (B, chunk, dim)
+                    # 我们比较 last_action[:, -1, :] 和 action_pred[:, 0, :]
+                    try:
+                        last_step = last_action[:, -1:, :]  # (B, 1, dim)
+                        curr_step = action_pred[:, :1, :]   # (B, 1, dim)
+                        
+                        # 计算 L2 距离（越小越好）
+                        history_diff = (last_step - curr_step).pow(2).mean().sqrt().item()
+                        
+                        # 转换为奖励（历史差异越小，奖励越大）
+                        history_continuity = -history_diff  # 负的距离 = 正的奖励
+                    except Exception:
+                        history_continuity = 0.0
+            
+            # 2. Chunk 内部平滑度
+            if action_pred.shape[1] > 1:
+                # 计算相邻时间步的差异
+                temporal_diff = (action_pred[:, 1:, :] - action_pred[:, :-1, :]).abs().mean().item()
+            else:
+                temporal_diff = 0.0
+            
+            # 3. 动作范围合理性（使用更宽松的范围，因为不同任务可能有不同范围）
+            # 注意：不要对最后两个维度（claw）做范围检查，因为它们可能有特殊值
+            arm_action = action_pred[:, :, :14]  # 前 14 维是手臂
+            claw_action = action_pred[:, :, 14:]  # 后 2 维是夹爪
+            
+            arm_range_penalty = (arm_action.abs() > 2.0).float().mean().item()
+            # claw 可能有很大的值（比如夹爪开合），不做惩罚
+            
+            # 4. 专家历史偏好（连续选择相同专家的 bonus）
+            expert_history_bonus = 0.0
+            if hasattr(self, '_consecutive_expert_count'):
+                if hasattr(self, '_last_selected_expert') and self._last_selected_expert == expert_idx:
+                    # 增加连续选择相同专家的 bonus（避免频繁切换）
+                    expert_history_bonus = 0.1 * min(self._consecutive_expert_count, 5)
+            
+            # === 综合置信度 ===
+            # 权重设计：历史一致性 > 内部平滑度 > 范围合理性
+            confidence = (
+                2.0 * history_continuity +      # 历史一致性（最重要）
+                -0.3 * temporal_diff +           # 内部平滑度（越小越好）
+                -1.0 * arm_range_penalty +       # 范围惩罚（越小越好）
+                expert_history_bonus             # 历史偏好 bonus
+            )
+            
+            all_expert_results.append({'action_pred': action_pred})
+            all_expert_confidences.append(confidence)
+            all_confidence_details.append({
+                'history_cont': history_continuity,
+                'temporal_diff': temporal_diff,
+                'range_penalty': arm_range_penalty,
+                'history_bonus': expert_history_bonus,
+            })
+            
+            # 保存当前专家的预测，供下一帧使用
+            if not hasattr(self, '_last_expert_actions'):
+                self._last_expert_actions = {}
+            self._last_expert_actions[expert_name] = action_pred.detach().clone()
+        
+        # 选择置信度最高的专家
+        best_idx = max(range(len(all_expert_confidences)), key=lambda i: all_expert_confidences[i])
+        
+        # 更新连续选择计数
+        if not hasattr(self, '_consecutive_expert_count'):
+            self._consecutive_expert_count = 0
+        if not hasattr(self, '_last_selected_expert'):
+            self._last_selected_expert = None
+            
+        if self._last_selected_expert == best_idx:
+            self._consecutive_expert_count += 1
+        else:
+            self._consecutive_expert_count = 1
+        self._last_selected_expert = best_idx
+        
+        # 记录统计
+        self._routing_stats[self.expert_names[best_idx]] += 1
+        self._routing_call_count += 1
+        
+        # 每 10 次打印一次诊断
+        if self._routing_call_count % 10 == 1:
+            print(f"\n   🗳️ Action Head Voting V2 (call #{self._routing_call_count}):")
+            for i, (name, conf, details) in enumerate(zip(self.expert_names, all_expert_confidences, all_confidence_details)):
+                marker = "→ " if i == best_idx else "  "
+                if details:
+                    print(f"      {marker}Expert {name}: conf={conf:.4f} "
+                          f"(hist={details['history_cont']:.4f}, smooth={details['temporal_diff']:.4f}, "
+                          f"range={details['range_penalty']:.4f}, bonus={details['history_bonus']:.2f})")
+                else:
+                    print(f"      {marker}Expert {name}: conf={conf:.4f}")
+        
+        if all_expert_results[best_idx] is not None:
+            return all_expert_results[best_idx]
+        else:
+            # Fallback
             return self.expert_heads[0].get_action(wrapped_outputs, action_inputs, **kwargs)
     
     def get_routing_stats(self) -> dict:
@@ -2508,6 +2879,7 @@ class MergedModelWithMoE(nn.Module):
         inputs: dict, 
         task_id: torch.Tensor = None,
         use_smart_routing: bool = True,
+        use_action_head_voting: bool = False,  # ⭐ 新增：Action Head Voting 模式
         **kwargs
     ) -> dict:
         """
@@ -2516,7 +2888,9 @@ class MergedModelWithMoE(nn.Module):
         Args:
             inputs: 模型输入
             task_id: (B,) - 任务ID，如果提供则使用固定路由
-            use_smart_routing: 如果 task_id=None，是否使用智能路由
+            use_smart_routing: 如果 task_id=None，是否使用智能路由（基于backbone特征）
+            use_action_head_voting: 如果 True，让所有专家都推理，选择置信度最高的
+                                    ⭐ 推荐：当 smart_routing 效果不好时使用此模式
         """
         # 1. 通过 backbone
         backbone_inputs, action_inputs = self.base_model.prepare_input(inputs)
@@ -2525,16 +2899,16 @@ class MergedModelWithMoE(nn.Module):
         # 2. 通过适配层
         backbone_features = backbone_outputs[BACKBONE_FEATURE_KEY]
         
-        # 计算路由权重
+        # 计算路由权重（仅当使用 smart_routing 且不使用 voting 时）
         routing_weights = None
-        if task_id is None and use_smart_routing:
+        if task_id is None and use_smart_routing and not use_action_head_voting:
             routing_weights = self.adapter.adapter.compute_task_routing_scores(backbone_features)
         
         # 应用适配
         adapted_features = self.adapter(
             backbone_features, 
             task_id=task_id,
-            use_smart_routing=use_smart_routing
+            use_smart_routing=use_smart_routing and not use_action_head_voting
         )
         backbone_outputs[BACKBONE_FEATURE_KEY] = adapted_features
         
@@ -2545,6 +2919,7 @@ class MergedModelWithMoE(nn.Module):
             action_inputs,
             task_id=task_id,
             routing_weights=routing_weights,
+            use_action_head_voting=use_action_head_voting,  # ⭐ 传递 voting 模式
             rtc_enabled=rtc_enabled,
             **kwargs
         )
