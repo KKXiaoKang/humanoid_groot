@@ -569,16 +569,22 @@ def create_lerobot_dataloader(
                 result[key] = values
         return result
     
-    # ⚠️ 关键：Episode-based 模式下不 shuffle，保持时序顺序
-    should_shuffle = not (use_all_frames or episode_based)
+    # ⭐ 修复：Episode-based 模式下也需要 shuffle！
+    # 原来的问题：shuffle=False 导致 ConcatDataset 按顺序遍历
+    #            先遍历完所有 narrower，再遍历 wider
+    #            这导致 adapter 训练严重不平衡！
+    # 
+    # 修复：启用 shuffle，打乱样本顺序，让 narrower 和 wider 混合出现
+    #       每个样本的 episode_idx 和 frame_in_episode 信息仍然保留
+    #       shuffle 只是打乱了样本在 batch 中的顺序，不影响 episode 元数据
+    should_shuffle = True  # ⭐ 始终 shuffle 以确保任务平衡
     
-    if not should_shuffle:
-        logger.info(f"   ⚠️ 禁用 shuffle 以保持时序顺序")
+    logger.info(f"   ✅ 启用 shuffle 以确保 narrower/wider 任务平衡训练")
     
     return DataLoader(
         combined_dataset, 
         batch_size=batch_size, 
-        shuffle=should_shuffle,  # Episode-based 模式下不 shuffle
+        shuffle=should_shuffle,  # ⭐ 始终 shuffle
         collate_fn=collate_fn,
         num_workers=0,  # 避免多进程问题
         pin_memory=torch.cuda.is_available(),
