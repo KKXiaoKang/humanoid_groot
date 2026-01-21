@@ -186,15 +186,16 @@ TRAIN_ARGS=(
     --base_model_path "${BASE_MODEL_PATH}"
     --output_path "${OUTPUT_PATH}"
     --adapter_type sparse_lora
-    --lora_rank 32
-    --sparsity 0.5
+    # ⭐ 增强配置：增加 Adapter 容量以提高 wider 任务精度
+    --lora_rank 32           # 从 32 增加到 64，参数量翻倍
+    --sparsity 0.6           # 从 0.5 增加到 0.6，激活更多参数
     # ⭐ 关键修改：启用 adapter 训练来修正特征分布偏移！
     # 由于融合后的 backbone 是 50/50 混合，对 wider DiT 来说是"陌生"的分布
     # adapter 会学习：
     #   - narrower 任务：50/50 特征 → narrower 特征
     #   - wider 任务：50/50 特征 → wider 特征
-    --adapter_epochs 50
-    --adapter_lr 5e-4
+    --adapter_epochs 10      # 50 个 epoch
+    --adapter_lr 5e-4        # 略微降低学习率，提高稳定性
     # --bypass_adapter  # ⚠️ 不要跳过 adapter！这是修正特征分布的关键
     --batch_size 32
     --device "${DEVICE}"

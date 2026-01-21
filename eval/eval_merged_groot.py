@@ -113,7 +113,7 @@ class MergeVLAConfig:
     # 值太小可能导致队列耗尽，动作断档
     # 推荐：设置为 execution_horizon * 5 左右（如 10 * 5 = 50）
     action_queue_size_to_get_new_actions: int = field(
-        default=90,  # 从90改为50，减少推理频率
+        default=50,  # 从90改为50，减少推理频率
         metadata={"help": "触发新推理的动作队列阈值（推荐: execution_horizon * 5）"}
     )
     
@@ -136,10 +136,36 @@ class ModelWrapper:
     preprocessor: object
     postprocessor: object
     adapter: object = None
+    # ⭐ 智能路由支持：存储两个专家的 postprocessor
+    expert_postprocessors: dict = None  # {"narrower": postprocessor, "wider": postprocessor}
+    use_smart_postprocessor: bool = False  # 是否使用智能 postprocessor 选择
     
     def reset(self):
         self.policy.reset()
         self.policy.init_rtc_processor()
+    
+    def get_postprocessor_for_task(self, task_decision: str = None):
+        """
+        根据任务决策获取对应的 postprocessor
+        
+        Args:
+            task_decision: "narrower" 或 "wider"，如果为 None 则使用默认 postprocessor
+        
+        Returns:
+            对应任务的 postprocessor
+        """
+        if not self.use_smart_postprocessor or self.expert_postprocessors is None:
+            return self.postprocessor
+        
+        if task_decision is None:
+            # 尝试从 adapter 获取最后一次路由决策
+            if self.adapter is not None and hasattr(self.adapter, 'get_last_task_decision'):
+                task_decision = self.adapter.get_last_task_decision()
+        
+        if task_decision and task_decision in self.expert_postprocessors:
+            return self.expert_postprocessors[task_decision]
+        
+        return self.postprocessor  # 默认 postprocessor
 
 
 def load_merge_config(model_path: str) -> dict | None:
@@ -482,12 +508,72 @@ def load_mergevla_model(cfg: MergeVLAConfig) -> ModelWrapper:
     else:
         logger.warning("⚠️ 适配层已禁用")
     
-    # 加载预处理器
+    # 加载预处理器和默认 postprocessor
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=config,
         pretrained_path=cfg.model_path,
         preprocessor_overrides={"device_processor": {"device": cfg.device}},
     )
+    
+    # ⭐ 智能路由支持：加载两个专家的 postprocessor
+    expert_postprocessors = None
+    use_smart_postprocessor = False
+    
+    if use_moe:
+        from lerobot.processor import PolicyProcessorPipeline
+        from lerobot.processor.converters import policy_action_to_transition, transition_to_policy_action
+        
+        # ⭐ 智能路由模式：加载所有专家的 postprocessor
+        if cfg.smart_routing and cfg.task_type is None:
+            logger.info(f"   ⭐ 智能路由模式: 加载所有专家的 postprocessor")
+            expert_postprocessors = {}
+            expert_names = ["narrower", "wider"]
+            
+            for expert_name in expert_names:
+                expert_post_dir = Path(cfg.model_path) / "expert_postprocessors" / expert_name
+                if expert_post_dir.exists():
+                    try:
+                        expert_postprocessors[expert_name] = PolicyProcessorPipeline.from_pretrained(
+                            pretrained_model_name_or_path=str(expert_post_dir),
+                            config_filename="policy_postprocessor.json",
+                            overrides={},
+                            to_transition=policy_action_to_transition,
+                            to_output=transition_to_policy_action,
+                        )
+                        logger.info(f"      ✅ 已加载 {expert_name} 专家的 postprocessor")
+                    except Exception as e:
+                        logger.warning(f"      ⚠️ 加载 {expert_name} postprocessor 失败: {e}")
+                else:
+                    logger.warning(f"      ⚠️ {expert_name} postprocessor 目录不存在: {expert_post_dir}")
+            
+            if len(expert_postprocessors) == 2:
+                use_smart_postprocessor = True
+                logger.info(f"   ✅ 智能 postprocessor 选择已启用")
+                logger.info(f"      根据每次推理的路由决策动态选择 postprocessor")
+            else:
+                logger.warning(f"   ⚠️ 无法加载所有专家 postprocessor，使用默认 postprocessor")
+        
+        # 固定任务类型模式：只加载指定专家的 postprocessor
+        elif cfg.task_type is not None:
+            expert_post_dir = Path(cfg.model_path) / "expert_postprocessors" / cfg.task_type
+            if expert_post_dir.exists():
+                logger.info(f"   ⭐ MoE 模式: 将使用 {cfg.task_type} 专家的 postprocessor")
+                logger.info(f"      路径: {expert_post_dir}")
+                try:
+                    postprocessor = PolicyProcessorPipeline.from_pretrained(
+                        pretrained_model_name_or_path=str(expert_post_dir),
+                        config_filename="policy_postprocessor.json",
+                        overrides={},
+                        to_transition=policy_action_to_transition,
+                        to_output=transition_to_policy_action,
+                    )
+                    logger.info(f"   ✅ 已加载 {cfg.task_type} 专家的 postprocessor")
+                except Exception as e:
+                    logger.warning(f"   ⚠️ 加载专家 postprocessor 失败: {e}")
+                    logger.warning(f"      使用默认 postprocessor")
+            else:
+                logger.warning(f"   ⚠️ 专家 postprocessor 目录不存在: {expert_post_dir}")
+                logger.warning(f"      使用默认 postprocessor（可能导致 {cfg.task_type} 任务不准确）")
     
     return ModelWrapper(
         name="mergevla_model",
@@ -495,6 +581,8 @@ def load_mergevla_model(cfg: MergeVLAConfig) -> ModelWrapper:
         preprocessor=preprocessor,
         postprocessor=postprocessor,
         adapter=adapter,
+        expert_postprocessors=expert_postprocessors,
+        use_smart_postprocessor=use_smart_postprocessor,
     )
 
 
@@ -587,11 +675,15 @@ def get_actions(
                 
                 original_actions = actions.squeeze(0).clone()
                 
+                # ⭐ 智能 postprocessor 选择：根据路由决策选择对应的 postprocessor
+                # 推理后，adapter 中会记录最后一次路由决策
+                postprocessor = model.get_postprocessor_for_task()
+                
                 # 后处理
                 _, chunk_size, _ = actions.shape
                 processed_actions = []
                 for i in range(chunk_size):
-                    processed_action = model.postprocessor(actions[:, i, :])
+                    processed_action = postprocessor(actions[:, i, :])
                     processed_actions.append(processed_action)
                 
                 postprocessed_actions = torch.stack(processed_actions, dim=1)[0].clone()
@@ -713,8 +805,11 @@ def main(cfg: MergeVLAConfig):
         print(f"   🎯 任务路由: 固定 task_type={cfg.task_type}{swap_info}")
     elif cfg.smart_routing:
         print(f"   ⭐ 任务路由: MergeVLA 智能路由")
+        if model.use_smart_postprocessor:
+            print(f"   🔥 智能 postprocessor: 根据路由决策自动选择")
     else:
         print(f"   ⚠️ 任务路由: 简单平均（可能导致动作混乱！）")
+        print(f"   💡 建议: 使用 --smart_routing=true 自动推断任务")
     print(f"{'='*60}")
     print(f"   推理频率: {cfg.fps} Hz")
     print(f"   推理周期: {cfg.duration} 秒")

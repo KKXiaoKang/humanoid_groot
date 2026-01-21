@@ -3728,6 +3728,41 @@ class MergeVLAMerger:
             for src in narrower_path.glob(pattern):
                 shutil.copy(src, output_path / src.name)
         
+        # ⭐ MoE 模式：保存各专家的 postprocessor（用于正确的动作反归一化）
+        # ⚠️ 关键：narrower 和 wider 的动作归一化范围不同！
+        #    如果使用 narrower 的 postprocessor 去 unnormalize wider 专家的输出，
+        #    某些关节维度会产生明显误差！
+        if self.use_moe:
+            wider_path = Path(self.wider_path)
+            
+            # 创建专家专用的 postprocessor 目录
+            experts_dir = output_path / "expert_postprocessors"
+            experts_dir.mkdir(parents=True, exist_ok=True)
+            
+            # 保存 narrower 专家的 postprocessor
+            narrower_post_dir = experts_dir / "narrower"
+            narrower_post_dir.mkdir(parents=True, exist_ok=True)
+            for config_file in ["policy_postprocessor.json"]:
+                src = narrower_path / config_file
+                if src.exists():
+                    shutil.copy(src, narrower_post_dir / config_file)
+            for src in narrower_path.glob("policy_postprocessor*.safetensors"):
+                shutil.copy(src, narrower_post_dir / src.name)
+            
+            # 保存 wider 专家的 postprocessor
+            wider_post_dir = experts_dir / "wider"
+            wider_post_dir.mkdir(parents=True, exist_ok=True)
+            for config_file in ["policy_postprocessor.json"]:
+                src = wider_path / config_file
+                if src.exists():
+                    shutil.copy(src, wider_post_dir / config_file)
+            for src in wider_path.glob("policy_postprocessor*.safetensors"):
+                shutil.copy(src, wider_post_dir / src.name)
+            
+            print(f"   ⭐ 已保存专家级 postprocessor:")
+            print(f"      - narrower: {narrower_post_dir}")
+            print(f"      - wider: {wider_post_dir}")
+        
         # 保存融合配置
         merge_config = {
             "merge_method": "mergevla_moe" if self.use_moe else "mergevla",

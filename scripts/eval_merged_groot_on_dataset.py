@@ -736,15 +736,77 @@ def eval_on_dataset(
     
     # 加载 preprocessor 和 postprocessor
     print(f"🔧 加载 preprocessor 和 postprocessor...")
+    
+    # ⭐ 检测 MoE 模式
+    use_moe = merge_config.get('use_moe', False) if merge_config else False
+    
+    # 先加载默认的 preprocessor 和 postprocessor
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=policy.config,
         pretrained_path=model_path,
     )
+    
+    # ⭐ 智能路由支持：加载两个专家的 postprocessor
+    expert_postprocessors = {}
+    use_smart_postprocessor = False
+    
+    if use_moe:
+        from lerobot.processor import PolicyProcessorPipeline
+        from lerobot.processor.converters import policy_action_to_transition, transition_to_policy_action
+        
+        # ⭐ 智能路由模式（task_type=None + use_smart_routing=True）
+        if use_smart_routing and task_type is None:
+            print(f"   ⭐ 智能路由模式: 加载所有专家的 postprocessor")
+            expert_names = ["narrower", "wider"]
+            
+            for expert_name in expert_names:
+                expert_post_dir = Path(model_path) / "expert_postprocessors" / expert_name
+                if expert_post_dir.exists():
+                    try:
+                        expert_postprocessors[expert_name] = PolicyProcessorPipeline.from_pretrained(
+                            pretrained_model_name_or_path=str(expert_post_dir),
+                            config_filename="policy_postprocessor.json",
+                            overrides={},
+                            to_transition=policy_action_to_transition,
+                            to_output=transition_to_policy_action,
+                        )
+                        print(f"      ✅ 已加载 {expert_name} 专家的 postprocessor")
+                    except Exception as e:
+                        print(f"      ⚠️ 加载 {expert_name} postprocessor 失败: {e}")
+                else:
+                    print(f"      ⚠️ {expert_name} postprocessor 目录不存在: {expert_post_dir}")
+            
+            if len(expert_postprocessors) == 2:
+                use_smart_postprocessor = True
+                print(f"   ✅ 智能 postprocessor 选择已启用")
+                print(f"      根据每次推理的路由决策动态选择 postprocessor")
+            else:
+                print(f"   ⚠️ 无法加载所有专家 postprocessor，使用默认 postprocessor")
+        
+        # 固定任务类型模式
+        elif task_type is not None:
+            expert_post_dir = Path(model_path) / "expert_postprocessors" / task_type
+            if expert_post_dir.exists():
+                print(f"   ⭐ MoE 模式: 将使用 {task_type} 专家的 postprocessor")
+                print(f"      路径: {expert_post_dir}")
+                try:
+                    postprocessor = PolicyProcessorPipeline.from_pretrained(
+                        pretrained_model_name_or_path=str(expert_post_dir),
+                        config_filename="policy_postprocessor.json",
+                        overrides={},
+                        to_transition=policy_action_to_transition,
+                        to_output=transition_to_policy_action,
+                    )
+                    print(f"   ✅ 已加载 {task_type} 专家的 postprocessor")
+                except Exception as e:
+                    print(f"   ⚠️ 加载专家 postprocessor 失败: {e}")
+                    print(f"      使用默认 postprocessor")
+            else:
+                print(f"   ⚠️ 专家 postprocessor 目录不存在: {expert_post_dir}")
+                print(f"      使用默认 postprocessor（可能导致 {task_type} 任务不准确）")
+    
     print("✅ 模型加载完成")
     
-    # ⚠️ 关键：如果是 two_stage_adapter/mergevla 方法，需要加载适配层
-    # ⭐ 检测 MoE 模式
-    use_moe = merge_config.get('use_moe', False) if merge_config else False
     if use_moe:
         print(f"\n🎯 检测到 MoE 模式（多专家动作头）")
     
@@ -885,6 +947,10 @@ def eval_on_dataset(
                         vizer=vizer,
                         kb=kb,
                         infer_per_frame=infer_per_frame,
+                        # ⭐ 智能 postprocessor 支持
+                        adapter=adapter,
+                        expert_postprocessors=expert_postprocessors,
+                        use_smart_postprocessor=use_smart_postprocessor,
                     )
                     dataset_results.append(result)
                 except Exception as e:
@@ -939,6 +1005,10 @@ def eval_on_dataset(
             vizer=vizer,
             kb=kb,
             infer_per_frame=infer_per_frame,
+            # ⭐ 智能 postprocessor 支持
+            adapter=adapter,
+            expert_postprocessors=expert_postprocessors,
+            use_smart_postprocessor=use_smart_postprocessor,
         )
         
         print_single_result(result)
@@ -981,15 +1051,37 @@ def eval_single_episode(
     vizer = None,
     kb = None,
     infer_per_frame: int = 1,
+    # ⭐ 智能 postprocessor 选择支持
+    adapter = None,  # DistributionAdapter 实例（用于获取路由决策）
+    expert_postprocessors: dict = None,  # {"narrower": postprocessor, "wider": postprocessor}
+    use_smart_postprocessor: bool = False,  # 是否使用智能 postprocessor 选择
 ) -> dict:
     """评估单个 episode
     
     Args:
         infer_per_frame: 每隔多少帧重新推理一次（>=1，默认1=每帧推理）
+        adapter: DistributionAdapter 实例（用于智能 postprocessor 选择）
+        expert_postprocessors: 专家 postprocessor 字典（用于智能选择）
+        use_smart_postprocessor: 是否启用智能 postprocessor 选择
     """
     infer_per_frame = max(1, infer_per_frame)
     last_inferred_chunk: np.ndarray | None = None
     last_inference_step: int = -1
+    
+    # ⭐ 智能 postprocessor 选择辅助函数
+    def get_current_postprocessor():
+        """根据最后一次路由决策选择 postprocessor"""
+        if not use_smart_postprocessor or expert_postprocessors is None:
+            return postprocessor
+        
+        # 从 adapter 获取最后一次路由决策
+        if adapter is not None and hasattr(adapter, 'get_last_task_decision'):
+            task_decision = adapter.get_last_task_decision()
+            if task_decision and task_decision in expert_postprocessors:
+                return expert_postprocessors[task_decision]
+        
+        return postprocessor  # 默认 postprocessor
+    
     # 加载数据集
     dataset_name = Path(dataset_path).name
     dataset = LeRobotDataset(repo_id=dataset_name, root=dataset_path, episodes=[episode])
@@ -1140,10 +1232,13 @@ def eval_single_episode(
             
             # 使用 postprocessor 进行反归一化
             _, chunk_size, _ = pred_actions.shape
+            # ⭐ 智能 postprocessor 选择：推理后根据路由决策选择 postprocessor
+            current_postprocessor = get_current_postprocessor()
+            
             processed_actions = []
             for i in range(chunk_size):
                 single_action = pred_actions[:, i, :]
-                processed_action = postprocessor(single_action)
+                processed_action = current_postprocessor(single_action)
                 processed_actions.append(processed_action)
             
             pred_actions_unnorm = torch.stack(processed_actions, dim=1)
@@ -1184,10 +1279,13 @@ def eval_single_episode(
                 inference_times.append(inference_time)
                 
                 _, chunk_size, _ = pred_actions.shape
+                # ⭐ 智能 postprocessor 选择
+                current_postprocessor = get_current_postprocessor()
+                
                 processed_actions = []
                 for i in range(chunk_size):
                     single_action = pred_actions[:, i, :]
-                    processed_action = postprocessor(single_action)
+                    processed_action = current_postprocessor(single_action)
                     processed_actions.append(processed_action)
                 
                 pred_actions_unnorm = torch.stack(processed_actions, dim=1)
@@ -1394,8 +1492,8 @@ if __name__ == "__main__":
                        help='⭐ Enable MergeVLA-style Test-Time Task Routing. '
                             'When task identity is unknown, automatically infer task relevance '
                             'based on model internal parameter subspaces (value projection). '
-                            'This is the recommended mode for mixed-task evaluation! '
-                            '(Reference: MergeVLA paper Section 3.3)')
+                            '🔥 NEW: Also auto-selects the correct postprocessor for each task! '
+                            'No need to specify --task-type. (Reference: MergeVLA paper Section 3.3)')
     parser.add_argument('--swap-task-mapping', action='store_true',
                        dest='swap_task_mapping',
                        help='⚠️ Swap task mapping: narrower↔wider. '
@@ -1423,9 +1521,10 @@ if __name__ == "__main__":
         print(f"🎯 Task Routing: Fixed task_type={args.task_type}")
     elif args.smart_routing:
         print(f"⭐ Task Routing: MergeVLA Smart Routing (自动推断任务类型)")
+        print(f"   🔥 自动选择 postprocessor: 根据每次推理的路由决策动态选择")
     else:
         print(f"⚠️ Task Routing: Simple Average (可能导致动作混乱！)")
-        print(f"   建议：使用 --smart-routing 或 --task-type narrower/wider")
+        print(f"   建议：使用 --smart-routing 自动推断任务类型和 postprocessor")
     print("="*80)
     
     eval_on_dataset(
