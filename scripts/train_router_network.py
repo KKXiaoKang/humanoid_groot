@@ -177,8 +177,7 @@ def extract_backbone_features(
 
 def train_router_network(
     model_path: str,
-    dataset_paths: list[str],
-    task_names: list[str],
+    task_datasets: dict[str, list[str]],  # {task_name: [dataset_paths]}
     output_path: str,
     epochs: int = 20,
     batch_size: int = 8,
@@ -187,15 +186,15 @@ def train_router_network(
     intermediate_dim: int = 256,
     val_split: float = 0.1,
     device: str = "cuda:0",
-    samples_per_task: int = 500,
+    samples_per_task: int | None = None,  # 如果为 None，使用所有数据
 ):
     """
     训练 Router Network
     
     Args:
         model_path: 融合模型路径
-        dataset_paths: 各任务数据集路径列表
-        task_names: 任务名称列表（与 dataset_paths 一一对应）
+        task_datasets: 任务数据集字典，格式为 {task_name: [dataset_paths]}
+                      例如: {"narrower": ["/path/to/ds1", "/path/to/ds2"], "wider": ["/path/to/ds3"]}
         output_path: Router Network 保存路径
         epochs: 训练轮数
         batch_size: 批次大小
@@ -204,21 +203,28 @@ def train_router_network(
         intermediate_dim: Router Network 中间层维度
         val_split: 验证集比例
         device: 设备
-        samples_per_task: 每个任务采样的样本数
+        samples_per_task: 每个任务采样的样本数（如果为 None，使用所有数据）
     """
     print("=" * 80)
     print("🧠 Router Network Training")
     print("=" * 80)
     print(f"Model: {model_path}")
-    print(f"Tasks: {task_names}")
-    print(f"Datasets: {dataset_paths}")
+    print(f"Tasks: {list(task_datasets.keys())}")
+    for task_name, paths in task_datasets.items():
+        print(f"   {task_name}: {len(paths)} dataset(s)")
+        for path in paths:
+            print(f"      - {path}")
     print(f"Epochs: {epochs}")
     print(f"Batch size: {batch_size}")
-    print(f"Samples per task: {samples_per_task}")
+    if samples_per_task is None:
+        print(f"Samples per task: all (使用所有数据)")
+    else:
+        print(f"Samples per task: {samples_per_task}")
     print("=" * 80)
     
     device = torch.device(device)
-    num_experts = len(dataset_paths)
+    task_names = list(task_datasets.keys())
+    num_experts = len(task_names)
     
     # === 1. 加载融合模型 ===
     print("\n📦 Loading merged model (backbone only)...")
@@ -250,30 +256,69 @@ def train_router_network(
     print("\n📊 Loading datasets...")
     all_datasets = []
     
-    for task_idx, (dataset_path, task_name) in enumerate(zip(dataset_paths, task_names)):
-        print(f"   Loading {task_name} from {dataset_path}...")
+    for task_idx, task_name in enumerate(task_names):
+        dataset_paths = task_datasets[task_name]
+        print(f"\n   📦 Task: {task_name} (task_id={task_idx})")
+        print(f"      Loading {len(dataset_paths)} dataset(s)...")
         
-        try:
-            # 尝试加载 LeRobotDataset
-            lerobot_ds = LeRobotDataset(
-                repo_id=dataset_path,
-                root=dataset_path if os.path.isdir(dataset_path) else None,
-                # local_files_only=True,
-            )
-            
-            # 如果数据集太大，随机采样
-            if len(lerobot_ds) > samples_per_task:
-                indices = torch.randperm(len(lerobot_ds))[:samples_per_task].tolist()
-                lerobot_ds = torch.utils.data.Subset(lerobot_ds, indices)
-            
-            # 包装为 RouterDataset
-            router_ds = RouterDataset(lerobot_ds, task_idx, task_name)
-            all_datasets.append(router_ds)
-            
-            print(f"      ✅ Loaded {len(router_ds)} samples")
-        except Exception as e:
-            print(f"      ❌ Error loading dataset: {e}")
+        task_datasets_list = []
+        total_samples = 0
+        
+        for dataset_path in dataset_paths:
+            print(f"      Loading from: {dataset_path}...")
+            try:
+                # 尝试加载 LeRobotDataset
+                lerobot_ds = LeRobotDataset(
+                    repo_id=dataset_path,
+                    root=dataset_path if os.path.isdir(dataset_path) else None,
+                    # local_files_only=True,
+                )
+                
+                dataset_size = len(lerobot_ds)
+                print(f"         Dataset size: {dataset_size} samples")
+                
+                # 如果指定了 samples_per_task，进行采样
+                if samples_per_task is not None and dataset_size > 0:
+                    # 计算每个数据集应该采样的数量（按比例分配）
+                    # 先加载所有数据集，然后统一采样
+                    task_datasets_list.append(lerobot_ds)
+                    total_samples += dataset_size
+                else:
+                    # 不使用采样，直接添加
+                    task_datasets_list.append(lerobot_ds)
+                    total_samples += dataset_size
+                
+                print(f"         ✅ Loaded {dataset_size} samples")
+            except Exception as e:
+                print(f"         ❌ Error loading dataset: {e}")
+                import traceback
+                traceback.print_exc()
+                continue
+        
+        if not task_datasets_list:
+            print(f"      ⚠️  Warning: No datasets loaded for task {task_name}, skipping...")
             continue
+        
+        # 合并该任务的所有数据集
+        if len(task_datasets_list) > 1:
+            combined_task_dataset = ConcatDataset(task_datasets_list)
+            print(f"      📊 Combined {len(task_datasets_list)} datasets: {total_samples} total samples")
+        else:
+            combined_task_dataset = task_datasets_list[0]
+            print(f"      📊 Single dataset: {total_samples} samples")
+        
+        # 如果指定了 samples_per_task，进行采样
+        if samples_per_task is not None and total_samples > samples_per_task:
+            print(f"      🎲 Sampling {samples_per_task} samples from {total_samples} total...")
+            indices = torch.randperm(total_samples)[:samples_per_task].tolist()
+            combined_task_dataset = torch.utils.data.Subset(combined_task_dataset, indices)
+            print(f"      ✅ Sampled {len(combined_task_dataset)} samples")
+        
+        # 包装为 RouterDataset
+        router_ds = RouterDataset(combined_task_dataset, task_idx, task_name)
+        all_datasets.append(router_ds)
+        
+        print(f"      ✅ Task {task_name}: {len(router_ds)} samples ready")
     
     if not all_datasets:
         print("❌ No datasets loaded!")
@@ -506,6 +551,7 @@ def train_router_network(
             'task_names': task_names,
         },
         'best_val_acc': best_val_acc,
+        'task_datasets': task_datasets,  # 保存使用的数据集路径（用于记录）
     }
     
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
@@ -529,12 +575,8 @@ def train_router_network(
 def main():
     parser = argparse.ArgumentParser(description="Train Router Network for MoE expert selection")
     
-    parser.add_argument('--model-path', type=str, required=True,
-                       help='Path to merged GROOT model')
-    parser.add_argument('--dataset-paths', type=str, nargs='+', required=True,
-                       help='Paths to task datasets (one per task)')
-    parser.add_argument('--task-names', type=str, nargs='+', required=True,
-                       help='Task names (one per dataset, same order)')
+    parser.add_argument('--model-path', type=str, default=None,
+                       help='Path to merged GROOT model (if not provided, uses hardcoded default)')
     parser.add_argument('--output-path', type=str, default=None,
                        help='Output path for Router Network (default: model_path/router_network.pt)')
     parser.add_argument('--epochs', type=int, default=20,
@@ -547,27 +589,53 @@ def main():
                        help='Backbone feature dimension')
     parser.add_argument('--intermediate-dim', type=int, default=256,
                        help='Router Network intermediate dimension')
-    parser.add_argument('--samples-per-task', type=int, default=500,
-                       help='Number of samples per task')
+    parser.add_argument('--samples-per-task', type=int, default=None,
+                       help='Number of samples per task (if not specified, uses all data)')
     parser.add_argument('--device', type=str, default='cuda:0',
                        help='Device to use')
     
     args = parser.parse_args()
     
-    # 验证参数
-    if len(args.dataset_paths) != len(args.task_names):
-        print("❌ Error: Number of dataset paths must match number of task names!")
-        return
+    # ⭐ 硬编码的数据集路径配置
+    # 每个任务可以有多个数据集，会自动合并
+    TASK_DATASETS = {
+        "narrower": [
+            "/home/lab/humanoid_groot/lerobot_data/v3_0_dataset/1215_5w_groot_4311_4322_4611_4633_narrower",
+            "/home/lab/humanoid_groot/lerobot_data/v3_0_dataset/1221_5w_random_height_4322_4611_narrower",
+            "/home/lab/humanoid_groot/lerobot_data/v3_0_dataset/1223_5w_dense_stacking_narrower",
+            "/home/lab/humanoid_groot/lerobot_data/v3_0_dataset/1225_5w_unpack_mix_color_narrower",
+        ],
+        "wider": [
+            "/home/lab/humanoid_groot/lerobot_data/v3_0_dataset/1215_5w_groot_4311_4322_4611_4633_wider",
+            "/home/lab/humanoid_groot/lerobot_data/v3_0_dataset/1221_5w_random_height_4322_4611_wider",
+            "/home/lab/humanoid_groot/lerobot_data/v3_0_dataset/1223_5w_dense_stacking_wider",
+            "/home/lab/humanoid_groot/lerobot_data/v3_0_dataset/1225_5w_unpack_mix_color_wider",
+        ],
+    }
+    
+    # 默认模型路径（如果未提供）
+    DEFAULT_MODEL_PATH = "/home/lab/humanoid_groot/outputs/0122_merged_groot_mergevla/pretrained_model"
+    
+    # 使用提供的模型路径或默认路径
+    model_path = args.model_path or DEFAULT_MODEL_PATH
     
     # 设置输出路径
     if args.output_path is None:
-        args.output_path = os.path.join(args.model_path, "router_network.pt")
+        args.output_path = os.path.join(model_path, "router_network.pt")
+    
+    print("=" * 80)
+    print("📋 Configuration:")
+    print(f"   Model path: {model_path}")
+    print(f"   Output path: {args.output_path}")
+    print(f"   Tasks: {list(TASK_DATASETS.keys())}")
+    for task_name, paths in TASK_DATASETS.items():
+        print(f"      {task_name}: {len(paths)} dataset(s)")
+    print("=" * 80)
     
     # 训练
     train_router_network(
-        model_path=args.model_path,
-        dataset_paths=args.dataset_paths,
-        task_names=args.task_names,
+        model_path=model_path,
+        task_datasets=TASK_DATASETS,
         output_path=args.output_path,
         epochs=args.epochs,
         batch_size=args.batch_size,

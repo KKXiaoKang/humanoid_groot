@@ -233,14 +233,27 @@ python eval/eval_multi_model.py --rtc.enabled=true --rtc.execution_horizon=10 --
 ```
 ##### 训练 router_network 分类器
 ```bash
+# ⭐ 数据集路径已硬编码到代码中，无需手动指定
+# 支持每个任务多个数据集，会自动合并：
+# - narrower: 4个数据集
+# - wider: 4个数据集
+
+# 使用所有数据训练（推荐，数据更充分）：
 python scripts/train_router_network.py \
     --model-path /home/lab/humanoid_groot/outputs/0122_merged_groot_mergevla/pretrained_model \
-    --dataset-paths \
-        /home/lab/humanoid_groot/lerobot_data/v3_0_dataset/1221_5w_random_height_4322_4611_narrower \
-        /home/lab/humanoid_groot/lerobot_data/v3_0_dataset/1221_5w_random_height_4322_4611_wider \
-    --task-names narrower wider \
+    --epochs 10 \
+    --batch-size 8
+
+# 或者限制每个任务的样本数量（快速测试用）：
+python scripts/train_router_network.py \
+    --model-path /home/lab/humanoid_groot/outputs/0122_merged_groot_mergevla/pretrained_model \
     --epochs 10 \
     --samples-per-task 500 \
+    --batch-size 8
+
+# 使用默认模型路径（如果模型路径固定）：
+python scripts/train_router_network.py \
+    --epochs 10 \
     --batch-size 8
 ```
 ##### 训练集上的验证
