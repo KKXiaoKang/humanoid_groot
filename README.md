@@ -23,6 +23,7 @@ cd /home/lab/kuavo-ros-control-rewACT/src/kuavo_humanoid_sdk && ./install.sh
 pip3 install websockets 
 pip3 install deprecated
 ```
+## 验证脚本看文末
 ## 模型架构分析
 * ![model_pipeline](./docs/IMG/image_pipeline.png)
 ### backbone原始定义 - vision encoder
@@ -182,27 +183,6 @@ python scripts/eval_depalletize_camera_model_reload_limit_vel.py \
     --task-description "Depalletize the box" --skip-chunk-ratio 0.5 --model-action-dt 0.1 --sync-mode --max-joint-velocity 1.0 --skip-chunk-from-end
 ```
 
-### real time async Eval (need to test)
-* 异步推理客户端
-```bash
-python scripts/eval_depalletize_async.py \
-    --server_address=127.0.0.1:8080 \
-    --ckpt_path=/home/lab/lerobot_groot/outputs/train/12_01_groot_full_tune_multi_head_use_learn_weight/checkpoints/016000/pretrained_model \
-    --action_chunk_size=16 \
-    --lerobot_dataset_path=/home/lab/lerobot_groot/lerobot_data/v3_0_dataset/1128_groot_train_data_with_task_filtered \
-    --task_description="Depalletize the green box" \
-    --fps=30 \
-    --chunk_size_threshold=0.8 --rotate-head-camera
-```
-* 异步推理服务端
-```bash
-python -m lerobot.async_inference.policy_server \
-    --host=127.0.0.1 \
-    --port=8080 \
-    --fps=30 \
-    --inference_latency=0.050
-```
-
 ### Sim仿真验证
 * 实验结果标明，Groot对于图像更为依赖，不依赖state，与预期相符
 * 实时Sim推理
@@ -217,4 +197,67 @@ python scripts/visualize_task_tsne_3d.py \
     --dataset-path /home/lab/lerobot_groot/lerobot_data/v3_0_dataset/1215_5w_groot_4311_4322_4611_4633 \
     --ckpt-path /home/lab/lerobot_groot/outputs/train/12_23_groot_random_mix_4_box_mix_dense_a100_one_gpu/checkpoints/080000/pretrained_model \
     --output ./t-SNE/tsne_3d_visualization.png
+```
+
+### 2026/1/22 - 最新验证脚本
+#### 非权重融合
+* 具体查看 [GROOT_N1_DETAILED_ARCHITECTURE 架构说明](./docs/GROOT_N1_DETAILED_ARCHITECTURE.md)
+* 训练集上的验证
+```bash
+python scripts/eval_on_dataset_lowpass.py \
+    --ckpt-path //media/ubuntu/New/manipulation/humanoid_groot/outputs/narrow/checkpoints/020000/pretrained_model  \
+    --dataset-root /home/ubuntu/humanoid_groot/lerobot_data/v3_0_dataset/1221_5w_random_height_4322_4611 \
+    --episode 2 \
+    --action-chunk-size 16 \
+    --infer-per-frame 16 --task-description "Depalletize the box"
+```
+* 同步推理模式（带动作逐帧采样加速）
+```bash
+python scripts/eval_depalletize_camera_model_reload_limit_vel_select.py --eval --ckpt-path /home/lab/humanoid_groot/outputs/train/0109_h100x4_groot_cross_attention_mix_vision_token_64_image_enhancement_learnable_weights_arm_coordination/checkpoints/012000/pretrained_model --model-type groot --action_chunk_size 16 --task-description "Depalletize the box" --model-action-dt 0.1 --sync-mode --max-joint-velocity 1.0 --chunk-start 1 --chunk-end 7 --constant-velocity --action-stride 2
+```
+* RTC推理模式
+```bash
+# 多模型推理
+python eval/eval_multi_model.py --rtc.enabled=true --rtc.execution_horizon=10 --task="Depalletize the box" --duration=30
+
+# 单模型推理
+ python eval/eval.py --policy.path=/home/lab/humanoid_groot/outputs/train/0112_h100x4_groot_cross_attention_narrower_very_conservative/checkpoints/020000/pretrained_model --policy.device=cuda --rtc.enabled=true --rtc.execution_horizon=10 --task="Depalletize the box" --duration=30
+```
+
+#### 权重融合
+* 具体查看 [权重融合架构说明](./docs/MERGEVLA_EXPLANATION.md)
+##### 训练LoRA adapt 层
+```bash
+./merge_groot_mergevla.sh --multi-gpu --gpus 6,7 --wandb \
+    --wandb-project groot-mergevla \ 
+```
+##### 训练 router_network 分类器
+```bash
+python scripts/train_router_network.py \
+    --model-path /home/lab/humanoid_groot/outputs/0122_merged_groot_mergevla/pretrained_model \
+    --dataset-paths \
+        /home/lab/humanoid_groot/lerobot_data/v3_0_dataset/1221_5w_random_height_4322_4611_narrower \
+        /home/lab/humanoid_groot/lerobot_data/v3_0_dataset/1221_5w_random_height_4322_4611_wider \
+    --task-names narrower wider \
+    --epochs 10 \
+    --samples-per-task 500 \
+    --batch-size 8
+```
+##### 训练集上的验证
+```bash
+python scripts/eval_merged_groot_on_dataset.py \
+    --model-path /home/lab/humanoid_groot/outputs/0122_merged_groot_mergevla/pretrained_model \
+    --dataset-root /home/lab/humanoid_groot/lerobot_data/v3_0_dataset/unpack_4322_short_dense \
+    --episode 43 --visualize --action-chunk-size 16 --infer-per-frame 16 \
+    --router-network 
+```
+##### 实时RTC推理验证
+```bash
+python eval/eval_merged_groot.py \
+    --model_path ./outputs/0122_merged_groot_mergevla/pretrained_model \
+    --rtc.enabled=true \
+    --rtc.execution_horizon=10 \
+    --task="Depalletize the box" \
+    --duration=30 \
+    --use_router_network=true 
 ```
