@@ -440,16 +440,26 @@ class GR00TN15(PreTrainedModel):
         print(f"Tune action head DiT: {tune_diffusion_model}")
 
         # get the current model path being downloaded
-        try:
-            # NOTE(YL) This downloads the model to the local cache and returns the local path to the model
-            # saved in ~/.cache/huggingface/hub/
-            local_model_path = snapshot_download(pretrained_model_name_or_path, repo_type="model")
-            # HFValidationError, RepositoryNotFoundError
-        except (HFValidationError, RepositoryNotFoundError):
-            print(
-                f"Model not found or avail in the huggingface hub. Loading from local path: {pretrained_model_name_or_path}"
-            )
-            local_model_path = pretrained_model_name_or_path
+        # ⚠️ 重要：优先使用用户传入的路径（可能是本地 checkpoint）
+        from pathlib import Path as PathLib
+        
+        # 首先检查传入的路径是否是本地路径
+        input_path = PathLib(pretrained_model_name_or_path)
+        if input_path.exists() and (input_path / "config.json").exists():
+            # 用户传入的是本地 checkpoint 路径，直接使用
+            print(f"✅ Using local checkpoint path: {pretrained_model_name_or_path}")
+            local_model_path = str(input_path.resolve())
+        else:
+            # 不是本地路径，尝试从 HuggingFace 下载或使用默认路径
+            try:
+                # NOTE(YL) This downloads the model to the local cache and returns the local path to the model
+                # saved in ~/.cache/huggingface/hub/
+                local_model_path = snapshot_download(pretrained_model_name_or_path, repo_type="model")
+            except (HFValidationError, RepositoryNotFoundError):
+                print(
+                    f"Model not found or avail in the huggingface hub. Loading from local path: {pretrained_model_name_or_path}"
+                )
+                local_model_path = pretrained_model_name_or_path
 
         # Load config directly from config.json file
         import json

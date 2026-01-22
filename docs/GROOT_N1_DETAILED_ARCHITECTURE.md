@@ -684,3 +684,199 @@ FlowmatchingActionHead
         └─ Layer2: Linear(1024→2)
 ```
 
+---
+
+## ⭐ MergeVLA + MoE 扩展架构
+
+当使用 MergeVLA 方法融合多个 GROOT 模型时，采用 **MoE (Mixture-of-Experts)** 架构：
+
+### MoE 架构完整数据流
+
+```mermaid
+graph TB
+    subgraph Input["输入层"]
+        IMG["图像 Image<br/>B x T x V x C x H x W"]
+        TXT["文本 Text<br/>Task Description"]
+        STATE["机器人状态 State<br/>B x 64"]
+    end
+
+    subgraph MergedBackbone["融合的 EagleBackbone<br/>🔀 0.5×narrower + 0.5×wider"]
+        VisionLLM["Eagle-2 VLM<br/>SigLip + Qwen3-1.5B<br/>融合权重"]
+        BackboneFeat["backbone_features<br/>B x T x 2048"]
+    end
+
+    subgraph SparseLoRAAdapter["Sparse LoRA Adapter + Smart Routing<br/>🆕 训练得到"]
+        subgraph SmartRoute["⭐ Smart Routing"]
+            RouteScore["计算路由分数<br/>score[t] = ||x @ A[t]_norm||"]
+            TaskSelect["task_id = argmax(scores)"]
+        end
+        
+        subgraph LoRA["LoRA 变换"]
+            LoRA_A["lora_A (2, 2048, 32)"]
+            LoRA_B["lora_B (2, 32, 2048)"]
+            TaskMask["task_masks (2, 2048)"]
+            ResScale["residual_scale ≤ 0.1"]
+        end
+        
+        AdaptFeat["adapted_features<br/>B x T x 2048"]
+    end
+
+    subgraph MoEActionHead["⭐ MoE Action Head"]
+        subgraph Expert0["Expert 0: Narrower<br/>📦 完整 action_head"]
+            E0_VLSA["vl_self_attention"]
+            E0_DiT["DiT (16层)"]
+            E0_Dec["Decoders"]
+            E0_Out["action_pred_0"]
+        end
+        
+        subgraph Expert1["Expert 1: Wider<br/>📦 完整 action_head"]
+            E1_VLSA["vl_self_attention"]
+            E1_DiT["DiT (16层)"]
+            E1_Dec["Decoders"]
+            E1_Out["action_pred_1"]
+        end
+        
+        subgraph Router["Expert Router"]
+            RouteLogic["根据 task_id 选择专家<br/>task_id=0 → Expert 0<br/>task_id=1 → Expert 1"]
+        end
+        
+        MoEOut["最终动作输出<br/>B x T x 16"]
+    end
+
+    IMG --> VisionLLM
+    TXT --> VisionLLM
+    VisionLLM --> BackboneFeat
+    
+    BackboneFeat --> RouteScore
+    BackboneFeat --> LoRA_A
+    RouteScore --> TaskSelect
+    LoRA_A --> AdaptFeat
+    LoRA_B --> AdaptFeat
+    TaskMask --> AdaptFeat
+    ResScale --> AdaptFeat
+    
+    AdaptFeat --> E0_VLSA
+    AdaptFeat --> E1_VLSA
+    STATE --> Expert0
+    STATE --> Expert1
+    
+    E0_VLSA --> E0_DiT
+    E0_DiT --> E0_Dec
+    E0_Dec --> E0_Out
+    
+    E1_VLSA --> E1_DiT
+    E1_DiT --> E1_Dec
+    E1_Dec --> E1_Out
+    
+    TaskSelect --> RouteLogic
+    E0_Out --> RouteLogic
+    E1_Out --> RouteLogic
+    RouteLogic --> MoEOut
+
+    classDef merged fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    classDef adapter fill:#e1f5fe,stroke:#0277bd,stroke-width:2px
+    classDef expert0 fill:#fff3e0,stroke:#e65100,stroke-width:2px
+    classDef expert1 fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px
+    classDef router fill:#ffebee,stroke:#c62828,stroke-width:2px
+    
+    class VisionLLM,BackboneFeat merged
+    class RouteScore,TaskSelect,LoRA_A,LoRA_B,TaskMask,ResScale,AdaptFeat adapter
+    class E0_VLSA,E0_DiT,E0_Dec,E0_Out expert0
+    class E1_VLSA,E1_DiT,E1_Dec,E1_Out expert1
+    class RouteLogic,MoEOut router
+```
+
+### MoE 模块层级结构
+
+```
+MergedModelWithMoE
+├─ backbone (融合)
+│   └─ EagleBackbone (0.5×narrower + 0.5×wider)
+│       ├─ eagle_model (Eagle-2 VLM)
+│       │   ├─ vision_model (SigLip) 🔀
+│       │   ├─ mlp1 🔀
+│       │   └─ language_model (Qwen3-1.5B) 🔀
+│       └─ eagle_linear 🔀
+│
+├─ distribution_adapter (训练得到)
+│   └─ SparseLoRAAdapter
+│       ├─ lora_A: Parameter(2, 2048, 32) 🆕
+│       ├─ lora_B: Parameter(2, 32, 2048) 🆕
+│       ├─ task_masks: Parameter(2, 2048) 🆕
+│       ├─ residual_scale: Parameter(1) ≤0.1 🆕
+│       └─ compute_task_routing_scores() ⭐ Smart Routing
+│
+└─ moe_action_head (⭐ MoE)
+    └─ MoEActionHead
+        ├─ expert_heads: ModuleList
+        │   ├─ [0] FlowmatchingActionHead (narrower) 📦
+        │   │   ├─ vlln
+        │   │   ├─ vl_self_attention
+        │   │   ├─ state_encoder
+        │   │   ├─ action_encoder
+        │   │   ├─ future_tokens
+        │   │   ├─ model (DiT 16层)
+        │   │   ├─ shared_arm_decoder
+        │   │   └─ action_claw_decoder
+        │   │
+        │   └─ [1] FlowmatchingActionHead (wider) 📦
+        │       ├─ vlln
+        │       ├─ vl_self_attention
+        │       ├─ state_encoder
+        │       ├─ action_encoder
+        │       ├─ future_tokens
+        │       ├─ model (DiT 16层)
+        │       ├─ shared_arm_decoder
+        │       └─ action_claw_decoder
+        │
+        ├─ expert_names: ['narrower', 'wider']
+        ├─ routing_temperature: 0.1
+        ├─ use_soft_routing: False (硬路由)
+        └─ get_action(task_id) → 选择对应专家
+```
+
+### MoE 关键维度变化
+
+| 位置 | 模块 | 输入维度 | 输出维度 | 权重来源 |
+|------|------|---------|---------|----------|
+| **融合 Backbone** |
+| Eagle-2 VLM | SigLip+LLM | B×T×V×C×H×W | B×T×2048 | 🔀 融合 |
+| **Sparse LoRA Adapter** |
+| Smart Routing | backbone_feat | B×T×2048 | task_id | 🆕 训练 |
+| LoRA 变换 | backbone_feat | B×T×2048 | B×T×2048 | 🆕 训练 |
+| **MoE Action Head** |
+| Expert 0 (narrower) | adapted_feat | B×T×2048 | B×T×16 | 📦 narrower |
+| Expert 1 (wider) | adapted_feat | B×T×2048 | B×T×16 | 📦 wider |
+| Router | task_id | - | 选择专家 | - |
+
+### MoE 参数量统计
+
+| 组件 | 参数量 | 说明 |
+|------|--------|------|
+| 融合 Backbone | ~3B | 0.5×narrower + 0.5×wider |
+| Sparse LoRA Adapter | ~266K | 路由 + 特征适配 |
+| Expert 0 (narrower) | ~750M | 完整 action_head |
+| Expert 1 (wider) | ~750M | 完整 action_head |
+| **总计** | **~4.5B** | |
+
+### MoE 模式的优势
+
+1. **保留完整的任务能力**：每个任务都有独立的 DiT + Decoder，不会丢失 wider 任务的动作能力
+2. **Smart Routing**：自动识别任务类型，选择对应专家
+3. **可扩展性**：可以添加更多专家支持更多任务
+4. **residual_scale 限制**：防止 Flow Matching 崩溃
+
+### 推理时的路由选择
+
+```python
+# 方式 1: Smart Routing (自动识别)
+action = model.get_action(inputs, use_smart_routing=True)
+
+# 方式 2: 固定路由
+action = model.get_action(inputs, task_type="narrower")  # 使用 Expert 0
+action = model.get_action(inputs, task_type="wider")     # 使用 Expert 1
+
+# 方式 3: swap_task_mapping (如果学习到的映射是反的)
+action = model.get_action(inputs, task_type="wider", swap_task_mapping=True)
+# wider + swap → 实际使用 Expert 0 (因为学习时映射反了)
+```
