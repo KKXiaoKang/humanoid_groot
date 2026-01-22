@@ -37,12 +37,13 @@ from tqdm import tqdm
 # 添加项目路径
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.policies.groot import GrootPolicy
 from lerobot.policies.groot.weight_merge_groot import (
     RouterNetwork,
     BACKBONE_FEATURE_KEY,
 )
+from lerobot.policies.factory import make_pre_post_processors
 
 
 class RouterDataset(Dataset):
@@ -76,45 +77,100 @@ def extract_backbone_features(
     policy: GrootPolicy,
     batch: dict,
     device: torch.device,
+    preprocessor=None,
 ) -> torch.Tensor:
     """
     从 policy 中提取 backbone features
+    
+    Args:
+        policy: GrootPolicy 实例
+        batch: 批次数据
+        device: 设备
+        preprocessor: 预处理器（如果为 None，将使用 policy 的 preprocessor）
     """
-    # 准备输入
-    inputs = {}
+    # 获取 batch size（从任意 tensor 中获取）
+    batch_size = None
+    for key, value in batch.items():
+        if isinstance(value, torch.Tensor) and value.dim() > 0:
+            batch_size = value.shape[0]
+            break
     
-    # 处理图像
-    for key in batch:
-        if key.startswith("observation.images."):
-            # (B, C, H, W) -> 需要的格式
-            img = batch[key].to(device)
-            if img.dim() == 4:
-                inputs[key] = img
+    if batch_size is None:
+        raise ValueError("Cannot determine batch size from batch")
     
-    # 处理状态
-    if "observation.state" in batch:
-        inputs["observation.state"] = batch["observation.state"].to(device)
-    
-    # 处理语言/任务描述
-    if "annotation.human.action.task_description" in batch:
-        inputs["annotation.human.action.task_description"] = batch["annotation.human.action.task_description"]
-    elif "task" in batch:
-        inputs["annotation.human.action.task_description"] = batch["task"]
-    else:
-        # 使用默认的任务描述
-        inputs["annotation.human.action.task_description"] = ["pick up the object"] * batch["observation.state"].shape[0]
+    # 使用 preprocessor 准备输入（确保所有必需字段都被正确设置）
+    if preprocessor is None:
+        # 尝试从 policy 获取 preprocessor
+        if hasattr(policy, 'preprocessor') and policy.preprocessor is not None:
+            preprocessor = policy.preprocessor
+        else:
+            raise ValueError("preprocessor is required but not available")
     
     # 通过 backbone 提取特征
     with torch.no_grad():
         try:
-            backbone_inputs, _ = policy._groot_model.prepare_input(inputs)
-            backbone_outputs = policy._groot_model.backbone(backbone_inputs)
-            features = backbone_outputs[BACKBONE_FEATURE_KEY]  # (B, seq_len, hidden_dim)
+            # 使用 preprocessor 处理输入
+            # preprocessor 会正确处理图像、状态、任务描述等，并设置 image_sizes
+            processed_obs = preprocessor(batch)
+            
+            # 检查 processed_obs 的类型
+            # preprocessor 可能返回字典或 BatchFeature
+            if hasattr(processed_obs, 'data'):
+                processed_dict = processed_obs.data
+            else:
+                processed_dict = processed_obs
+            
+            # 提取 backbone 需要的输入
+            # 根据 GROOT 的实现，backbone 需要 eagle_* 字段和 state/state_mask
+            groot_inputs = {
+                k: v
+                for k, v in processed_dict.items()
+                if (k in {"state", "state_mask", "embodiment_id"} or k.startswith("eagle_"))
+                and not (k.startswith("next.") or k == "info")
+            }
+            
+            # 检查是否有必需的字段
+            if not any(k.startswith("eagle_") for k in groot_inputs.keys()):
+                raise ValueError(f"No eagle_* fields found in processed_obs. Available keys: {list(processed_dict.keys())[:10]}")
+            
+            # 使用 BatchFeature 包装（GROOT backbone 期望这个格式）
+            try:
+                from transformers import BatchFeature
+            except ImportError:
+                from transformers.feature_extraction_utils import BatchFeature
+            vl_input = BatchFeature(data=groot_inputs)
+            
+            # 调用 backbone
+            backbone_outputs = policy._groot_model.backbone(vl_input)
+            
+            # 检查是否有 BACKBONE_FEATURE_KEY
+            # backbone_outputs 可能是 BatchFeature，需要访问 .data 属性
+            if hasattr(backbone_outputs, 'data'):
+                backbone_data = backbone_outputs.data
+            elif hasattr(backbone_outputs, 'get'):
+                # 如果已经是字典，直接使用
+                backbone_data = backbone_outputs
+            else:
+                # 尝试转换为字典
+                backbone_data = dict(backbone_outputs) if hasattr(backbone_outputs, '__iter__') else {}
+            
+            if BACKBONE_FEATURE_KEY not in backbone_data:
+                available_keys = list(backbone_data.keys())[:20]  # 只显示前20个键
+                raise KeyError(f"{BACKBONE_FEATURE_KEY} not found in backbone_outputs. Available keys: {available_keys}")
+            
+            features = backbone_data[BACKBONE_FEATURE_KEY]  # (B, seq_len, hidden_dim)
+            
+            # 确保特征是正确的形状
+            if features.dim() == 2:
+                # 如果是 (B, hidden_dim)，添加序列维度
+                features = features.unsqueeze(1)  # (B, 1, hidden_dim)
+            
         except Exception as e:
-            print(f"Error extracting features: {e}")
+            import traceback
+            print(f"❌ Error extracting features: {e}")
+            print(f"   Traceback: {traceback.format_exc()}")
             # 返回随机特征作为 fallback
-            B = batch["observation.state"].shape[0]
-            features = torch.randn(B, 100, 2048, device=device)
+            features = torch.randn(batch_size, 100, 2048, device=device)
     
     return features
 
@@ -170,6 +226,15 @@ def train_router_network(
     policy.eval()
     policy.to(device)
     
+    # 创建 preprocessor（用于正确准备输入）
+    print("\n🔧 Creating preprocessor...")
+    preprocessor, _ = make_pre_post_processors(
+        policy_cfg=policy.config,
+        pretrained_path=model_path,
+        preprocessor_overrides={"device_processor": {"device": device}},
+    )
+    print(f"   ✅ Preprocessor created")
+    
     # 获取 hidden_dim
     try:
         config = policy.config
@@ -193,7 +258,7 @@ def train_router_network(
             lerobot_ds = LeRobotDataset(
                 repo_id=dataset_path,
                 root=dataset_path if os.path.isdir(dataset_path) else None,
-                local_files_only=True,
+                # local_files_only=True,
             )
             
             # 如果数据集太大，随机采样
@@ -233,23 +298,43 @@ def train_router_network(
     # 创建 DataLoader
     def collate_fn(batch):
         """自定义 collate 函数"""
+        if not batch:
+            raise ValueError("Empty batch!")
+        
         result = {}
         
-        # 获取所有键
+        # 获取所有键（从第一个样本）
         keys = batch[0].keys()
         
         for key in keys:
             values = [item[key] for item in batch]
             
             if key == 'task_label':
-                result[key] = torch.tensor(values)
+                # 确保是整数类型
+                if isinstance(values[0], torch.Tensor):
+                    result[key] = torch.stack(values).long()
+                else:
+                    result[key] = torch.tensor(values, dtype=torch.long)
             elif key == 'task_name':
                 result[key] = values
             elif isinstance(values[0], torch.Tensor):
                 try:
+                    # 尝试 stack
                     result[key] = torch.stack(values)
-                except:
-                    result[key] = values
+                except RuntimeError as e:
+                    # 如果形状不匹配，尝试 pad
+                    try:
+                        # 对于不同长度的序列，使用 pad_sequence
+                        if values[0].dim() > 1:
+                            from torch.nn.utils.rnn import pad_sequence
+                            result[key] = pad_sequence(values, batch_first=True)
+                        else:
+                            result[key] = values
+                    except:
+                        result[key] = values
+            elif isinstance(values[0], (list, tuple)):
+                # 列表或元组，保持原样
+                result[key] = values
             else:
                 result[key] = values
         
@@ -299,33 +384,58 @@ def train_router_network(
         train_total = 0
         
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} [Train]")
-        for batch in pbar:
-            # 提取 backbone features
-            with torch.no_grad():
-                features = extract_backbone_features(policy, batch, device)
-            
-            # 获取标签
-            labels = batch['task_label'].to(device)
-            
-            # 前向传播
-            logits = router(features, return_logits=True)
-            loss = criterion(logits, labels)
-            
-            # 反向传播
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            
-            # 统计
-            train_loss += loss.item()
-            _, predicted = logits.max(1)
-            train_correct += predicted.eq(labels).sum().item()
-            train_total += labels.size(0)
-            
-            pbar.set_postfix({
-                'loss': f'{loss.item():.4f}',
-                'acc': f'{100. * train_correct / train_total:.1f}%'
-            })
+        for batch_idx, batch in enumerate(pbar):
+            try:
+                # 提取 backbone features
+                with torch.no_grad():
+                    features = extract_backbone_features(policy, batch, device, preprocessor=preprocessor)
+                    features = features.float() 
+
+                # 检查特征形状
+                if features is None or features.numel() == 0:
+                    print(f"⚠️  Warning: Empty features at batch {batch_idx}, skipping...")
+                    continue
+                
+                # 获取标签
+                if 'task_label' not in batch:
+                    print(f"⚠️  Warning: Missing task_label at batch {batch_idx}, skipping...")
+                    continue
+                
+                labels = batch['task_label'].to(device)
+                
+                # 检查标签和特征的 batch size 是否匹配
+                if features.shape[0] != labels.shape[0]:
+                    print(f"⚠️  Warning: Batch size mismatch (features: {features.shape[0]}, labels: {labels.shape[0]}), skipping...")
+                    continue
+                
+                # 前向传播
+                logits = router(features, return_logits=True)
+                loss = criterion(logits, labels)
+                
+                # 反向传播
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                
+                # 统计
+                train_loss += loss.item()
+                _, predicted = logits.max(1)
+                train_correct += predicted.eq(labels).sum().item()
+                train_total += labels.size(0)
+                
+                pbar.set_postfix({
+                    'loss': f'{loss.item():.4f}',
+                    'acc': f'{100. * train_correct / train_total:.1f}%'
+                })
+            except Exception as e:
+                import traceback
+                print(f"\n❌ Error in training batch {batch_idx}:")
+                print(f"   Error: {e}")
+                print(f"   Traceback:\n{traceback.format_exc()}")
+                print(f"   Batch keys: {list(batch.keys())}")
+                if 'task_label' in batch:
+                    print(f"   Task label shape: {batch['task_label'].shape if isinstance(batch['task_label'], torch.Tensor) else type(batch['task_label'])}")
+                raise  # 重新抛出异常以便调试
         
         train_acc = 100. * train_correct / train_total
         avg_train_loss = train_loss / len(train_loader)
@@ -337,17 +447,32 @@ def train_router_network(
         val_total = 0
         
         with torch.no_grad():
-            for batch in tqdm(val_loader, desc=f"Epoch {epoch+1}/{epochs} [Val]"):
-                features = extract_backbone_features(policy, batch, device)
-                labels = batch['task_label'].to(device)
-                
-                logits = router(features, return_logits=True)
-                loss = criterion(logits, labels)
-                
-                val_loss += loss.item()
-                _, predicted = logits.max(1)
-                val_correct += predicted.eq(labels).sum().item()
-                val_total += labels.size(0)
+            for batch_idx, batch in enumerate(tqdm(val_loader, desc=f"Epoch {epoch+1}/{epochs} [Val]")):
+                try:
+                    features = extract_backbone_features(policy, batch, device, preprocessor=preprocessor)
+                    features = features.float() 
+
+                    if features is None or features.numel() == 0:
+                        continue
+                    
+                    if 'task_label' not in batch:
+                        continue
+                    
+                    labels = batch['task_label'].to(device)
+                    
+                    if features.shape[0] != labels.shape[0]:
+                        continue
+                    
+                    logits = router(features, return_logits=True)
+                    loss = criterion(logits, labels)
+                    
+                    val_loss += loss.item()
+                    _, predicted = logits.max(1)
+                    val_correct += predicted.eq(labels).sum().item()
+                    val_total += labels.size(0)
+                except Exception as e:
+                    print(f"⚠️  Warning: Error in validation batch {batch_idx}: {e}")
+                    continue
         
         val_acc = 100. * val_correct / val_total
         avg_val_loss = val_loss / len(val_loader)
