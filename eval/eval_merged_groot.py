@@ -120,8 +120,12 @@ class MergeVLAConfig:
     # 值太大(如90)会导致频繁推理，chunk间不连续导致抖动
     # 值太小可能导致队列耗尽，动作断档
     # 推荐：设置为 execution_horizon * 5 左右（如 10 * 5 = 50）
+    """
+        90 / RTC 非权重融合
+        30 / RTC 权重融合
+    """
     action_queue_size_to_get_new_actions: int = field(
-        default=50,  # 从90改为50，减少推理频率
+        default=30,  # 从90改为50，减少推理频率
         metadata={"help": "触发新推理的动作队列阈值（推荐: execution_horizon * 5）"}
     )
     
