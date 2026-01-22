@@ -232,16 +232,60 @@ python eval/eval_multi_model.py --rtc.enabled=true --rtc.execution_horizon=10 --
     --wandb-project groot-mergevla \ 
 ```
 ##### 训练 router_network 分类器
+
+**方式 1：使用 Shell 脚本（推荐）** ⭐
 ```bash
+# ⭐ 数据集路径已硬编码到代码中，无需手动指定
+# 支持每个任务多个数据集，会自动合并：
+# - narrower: 4个数据集
+# - wider: 4个数据集
+
+# 使用默认配置（GPU 0，所有数据）：
+./train_router_network.sh
+
+# 指定 GPU：
+./train_router_network.sh --gpu 4
+./train_router_network.sh -g 0,1  # 使用 GPU 0 和 1（会使用第一个）
+
+# 自定义训练参数：
+./train_router_network.sh \
+    --gpu 6 \
+    --epochs 30 \
+    --batch-size 16 \
+    --learning-rate 2e-3
+
+# 限制样本数量（快速测试）：
+./train_router_network.sh \
+    --gpu 0 \
+    --samples-per-task 500 \
+    --epochs 10
+
+# 查看所有选项：
+./train_router_network.sh --help
+```
+
+**方式 2：直接使用 Python 脚本**
+```bash
+# 使用所有数据训练（推荐，数据更充分）：
 python scripts/train_router_network.py \
     --model-path /home/lab/humanoid_groot/outputs/0122_merged_groot_mergevla/pretrained_model \
-    --dataset-paths \
-        /home/lab/humanoid_groot/lerobot_data/v3_0_dataset/1221_5w_random_height_4322_4611_narrower \
-        /home/lab/humanoid_groot/lerobot_data/v3_0_dataset/1221_5w_random_height_4322_4611_wider \
-    --task-names narrower wider \
+    --epochs 10 \
+    --batch-size 8 \
+    --device cuda:0
+
+# 或者限制每个任务的样本数量（快速测试用）：
+python scripts/train_router_network.py \
+    --model-path /home/lab/humanoid_groot/outputs/0122_merged_groot_mergevla/pretrained_model \
     --epochs 10 \
     --samples-per-task 500 \
-    --batch-size 8
+    --batch-size 8 \
+    --device cuda:4
+
+# 使用默认模型路径（如果模型路径固定）：
+python scripts/train_router_network.py \
+    --epochs 10 \
+    --batch-size 8 \
+    --device cuda:0
 ```
 ##### 训练集上的验证
 ```bash

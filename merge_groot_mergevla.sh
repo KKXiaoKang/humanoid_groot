@@ -194,7 +194,7 @@ TRAIN_ARGS=(
     # adapter 会学习：
     #   - narrower 任务：50/50 特征 → narrower 特征
     #   - wider 任务：50/50 特征 → wider 特征
-    --adapter_epochs 10      # 50 个 epoch
+    --adapter_epochs 30      # 50 个 epoch
     --adapter_lr 5e-4        # 略微降低学习率，提高稳定性
     # --bypass_adapter  # ⚠️ 不要跳过 adapter！这是修正特征分布的关键
     --batch_size 32
@@ -202,7 +202,7 @@ TRAIN_ARGS=(
     --use_default_datasets
     --use_moe
     --episode-based
-    --num-episodes 32
+    --num-episodes 40
     --use_sparse_merge
     --sparse_merge_lambda 1.0
     --warmup_ratio 0.1
