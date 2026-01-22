@@ -16,7 +16,7 @@ set -e
 # ============================================================
 # 默认配置（在参数解析之前定义）
 # ============================================================
-DEFAULT_MODEL_PATH="/home/lab/humanoid_groot/outputs/0122_merged_groot_mergevla/pretrained_model"
+DEFAULT_MODEL_PATH="/home/kangkk/humanoid_groot_base/outputs/0122_merged_groot_mergevla/pretrained_model"
 
 # ============================================================
 # 参数解析
@@ -109,12 +109,12 @@ done
 if [ -n "$GPU_IDS" ]; then
     # 检查是否包含逗号（多个 GPU）
     if [[ "$GPU_IDS" == *","* ]]; then
-        # 多个 GPU：使用 CUDA_VISIBLE_DEVICES（但只使用第一个）
+        # 多个 GPU：使用 CUDA_VISIBLE_DEVICES 设置可见的 GPU
         export CUDA_VISIBLE_DEVICES="$GPU_IDS"
-        DEVICE="cuda:0"  # 在可见的 GPU 中，使用第一个
+        DEVICE="cuda:0"  # 在可见的 GPU 中，使用第一个作为主设备
         NUM_GPUS=$(echo "$GPU_IDS" | tr ',' '\n' | wc -l)
-        GPU_INFO="GPU: $GPU_IDS (CUDA_VISIBLE_DEVICES, 使用第一个 GPU: cuda:0)"
-        echo "⚠️  注意: Router Network 训练只使用单卡，将使用第一个 GPU"
+        GPU_INFO="GPU: $GPU_IDS (CUDA_VISIBLE_DEVICES, 将使用 $NUM_GPUS 张 GPU 进行多卡训练)"
+        echo "✅ 多卡训练模式: 将使用 $NUM_GPUS 张 GPU"
     else
         # 单个 GPU：使用 CUDA_VISIBLE_DEVICES 来限制只使用这个 GPU
         export CUDA_VISIBLE_DEVICES="$GPU_IDS"
@@ -122,10 +122,18 @@ if [ -n "$GPU_IDS" ]; then
         GPU_INFO="GPU: $GPU_IDS (CUDA_VISIBLE_DEVICES, device=cuda:0)"
     fi
 else
-    # 默认使用 cuda:0，但不设置 CUDA_VISIBLE_DEVICES（使用系统默认）
+    # 默认：检测所有可用 GPU，自动启用多卡训练
+    # 不设置 CUDA_VISIBLE_DEVICES，让脚本自动检测所有 GPU
     unset CUDA_VISIBLE_DEVICES
     DEVICE="cuda:0"
-    GPU_INFO="GPU: $DEVICE (默认，未限制 CUDA_VISIBLE_DEVICES)"
+    # 检测 GPU 数量
+    NUM_GPUS=$(python3 -c "import torch; print(torch.cuda.device_count())" 2>/dev/null || nvidia-smi --list-gpus | wc -l)
+    if [ "$NUM_GPUS" -gt 1 ]; then
+        GPU_INFO="GPU: 自动检测到 $NUM_GPUS 张 GPU，将启用多卡训练"
+        echo "✅ 自动检测到 $NUM_GPUS 张 GPU，将启用多卡训练模式"
+    else
+        GPU_INFO="GPU: $DEVICE (单卡模式)"
+    fi
 fi
 
 # ============================================================
