@@ -104,13 +104,13 @@ class ModelBundle:
 
 # 硬编码的双模型路径
 MODEL_NARROW_PATH = \
-    "/home/lab/humanoid_groot/outputs/train/0112_h100x4_groot_cross_attention_narrower_very_conservative/checkpoints/020000/pretrained_model"
+    "/home/lab/humanoid_groot/outputs/0112_h100x4_groot_cross_attention_narrower_very_conservative/checkpoints/020000/pretrained_model"
 # MODEL_WIDE_PATH = \
 #     "/home/lab/humanoid_groot/outputs/train/0112_h100x4_groot_cross_attention_wider/checkpoints/020000/pretrained_model"
 # MODEL_NARROW_PATH = \
 #     "/home/lab/humanoid_groot/outputs/train/0113_h100x4_groot_cross_attention_narrower_very_conservative_mix_dense/checkpoints/012000/pretrained_model"
 MODEL_WIDE_PATH = \
-    "/home/lab/humanoid_groot/outputs/train/0113_h100x4_groot_cross_attention_wider_very_conservative_mix_dense/checkpoints/014000/pretrained_model"
+    "/home/lab/humanoid_groot/outputs/0113_h100x4_groot_cross_attention_wider_very_conservative_mix_dense/checkpoints/014000/pretrained_model"
 
 @dataclass
 class RTCDemoConfig:

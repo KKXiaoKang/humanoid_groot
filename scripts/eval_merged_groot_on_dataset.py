@@ -614,16 +614,89 @@ def wrap_policy_with_moe(
         # 通过适配层
         backbone_features = backbone_outputs[BACKBONE_FEATURE_KEY]
         
+        # ⭐ 关键修复：如果使用 Router Network，先预测专家，然后使用对应的 task_id 调用 adapter
+        # 
+        # 📚 为什么适配层需要区分任务类型？
+        # 
+        # 架构流程：Backbone(融合) → Adapter(任务特定调整) → MoE Head(选择DiT) → Action
+        # 
+        # 1. **Backbone 是融合的**：
+        #    - 两个任务的 backbone 权重被融合（例如：0.5 * narrower + 0.5 * wider）
+        #    - 输出是"混合"的特征分布，不匹配任何一个任务的原始分布
+        # 
+        # 2. **每个任务的 DiT 是在各自任务上训练的**：
+        #    - narrower 的 DiT 训练时看到的是 narrower 任务的 backbone 输出分布
+        #    - wider 的 DiT 训练时看到的是 wider 任务的 backbone 输出分布
+        #    - 它们期望看到各自任务的输入特征分布
+        # 
+        # 3. **适配层的作用**：
+        #    - 将融合后的 backbone 输出"转换"成每个任务 DiT 期望的分布
+        #    - 使用 Sparse LoRA，每个任务有不同的参数子空间（task_masks）
+        #    - task_id=0 → 激活 narrower 任务的 LoRA 参数子集
+        #    - task_id=1 → 激活 wider 任务的 LoRA 参数子集
+        # 
+        # 4. **为什么不能只用 MoE Head 选择？**
+        #    - 即使 MoE Head 选择了正确的 DiT（例如 wider），但如果 Adapter 没有使用
+        #      正确的任务参数（task_id=1），那么输入到 DiT 的特征分布可能不匹配
+        #    - 这会导致 DiT 性能下降，因为它在训练时从未见过这种分布
+        # 
+        # 5. **正确的流程**：
+        #    - Router Network 预测 → 选择专家（例如 wider，对应 task_id=1）
+        #    - Adapter 使用 task_id=1 的参数 → 将 backbone 输出转换成 wider DiT 期望的分布
+        #    - MoE Head 使用 wider 的 DiT → 在正确的输入分布上推理
+        # 
+        # 总结：Adapter 和 MoE Head 必须使用相同的 task_id，确保特征分布匹配！
+        #
+        current_task_id = fixed_task_id
+        predicted_expert_name = None  # ⭐ 保存预测的专家名称，用于 postprocessor 选择
+        
+        if fixed_task_id is None and actual_use_router and hasattr(moe_head, 'router_network') and moe_head.router_network is not None:
+            # 🔒 初始化锁机制状态
+            if not hasattr(get_action_with_moe, '_router_locked'):
+                get_action_with_moe._router_locked = False
+                get_action_with_moe._locked_task_id = None
+                get_action_with_moe._locked_expert_name = None
+                get_action_with_moe._last_routing_decision = None
+            
+            # 🔒 如果已锁定，直接使用锁定的专家
+            if get_action_with_moe._router_locked:
+                current_task_id = get_action_with_moe._locked_task_id
+                predicted_expert_name = get_action_with_moe._locked_expert_name
+                get_action_with_moe._last_routing_decision = predicted_expert_name
+            else:
+                # 🧠 Router Network 模式：第一帧预测专家并锁定
+                expert_idx, confidence = moe_head.router_network.predict_expert(
+                    backbone_features,
+                    temperature=moe_head.routing_temperature
+                )
+                # 专家索引就是 task_id（expert 0 = task_id 0, expert 1 = task_id 1）
+                predicted_task_id = expert_idx[0].item() if isinstance(expert_idx, torch.Tensor) else expert_idx
+                current_task_id = torch.tensor([predicted_task_id], device=backbone_features.device)
+                predicted_expert_name = moe_head.expert_names[predicted_task_id]  # ⭐ 保存专家名称
+                
+                # 🔒 锁定专家选择（第一帧后不再重新预测）
+                get_action_with_moe._router_locked = True
+                get_action_with_moe._locked_task_id = current_task_id.clone()
+                get_action_with_moe._locked_expert_name = predicted_expert_name
+                get_action_with_moe._last_routing_decision = predicted_expert_name
+                
+                # 打印锁定信息
+                conf_value = confidence[0].item() if isinstance(confidence, torch.Tensor) else confidence
+                print(f"\n   🔒 Router Network 锁定专家: {predicted_expert_name} (confidence={conf_value:.4f}, task_id={predicted_task_id})")
+                print(f"      后续所有帧将使用此专家，保持一致性")
+                print(f"      → 使用 task_id={predicted_task_id} 调用 adapter（确保特征分布匹配 DiT 期望）")
+                print(f"      → 将使用 {predicted_expert_name} 专家的 postprocessor")
+        
         # 计算路由权重（如果使用 SVD 智能路由且不使用其他模式且没有固定 task_id）
         routing_weights = None
-        if fixed_task_id is None and actual_use_smart:
+        if fixed_task_id is None and actual_use_smart and not actual_use_router:
             routing_weights = adapter.adapter.compute_task_routing_scores(backbone_features)
         
-        # 应用适配
+        # 应用适配（使用 Router Network 预测的 task_id）
         adapted_features = adapter(
             backbone_features, 
-            task_id=fixed_task_id,
-            use_smart_routing=actual_use_smart
+            task_id=current_task_id,  # ⭐ 使用 Router Network 预测的 task_id
+            use_smart_routing=actual_use_smart and not actual_use_router  # 如果使用 Router Network，不使用 smart routing
         )
         backbone_outputs[BACKBONE_FEATURE_KEY] = adapted_features
         
@@ -632,7 +705,7 @@ def wrap_policy_with_moe(
         return moe_head.get_action(
             backbone_outputs, 
             action_inputs, 
-            task_id=fixed_task_id,
+            task_id=fixed_task_id,  # 保持原逻辑，让 moe_head 内部也使用 router network
             routing_weights=routing_weights,
             use_action_head_voting=actual_use_voting,
             use_router_network=actual_use_router,  # 🧠 Router Network
@@ -799,9 +872,13 @@ def eval_on_dataset(
         from lerobot.processor import PolicyProcessorPipeline
         from lerobot.processor.converters import policy_action_to_transition, transition_to_policy_action
         
-        # ⭐ 智能路由模式（task_type=None + use_smart_routing=True）
-        if use_smart_routing and task_type is None:
-            print(f"   ⭐ 智能路由模式: 加载所有专家的 postprocessor")
+        # ⭐ 智能路由模式（task_type=None + (use_smart_routing=True 或 use_router_network=True)）
+        # 包括两种模式：
+        # 1. use_smart_routing=True: MergeVLA SVD-based 路由
+        # 2. use_router_network=True: Router Network 路由
+        if (use_smart_routing or use_router_network) and task_type is None:
+            routing_mode_name = "Router Network" if use_router_network else "智能路由"
+            print(f"   ⭐ {routing_mode_name}模式: 加载所有专家的 postprocessor")
             expert_names = ["narrower", "wider"]
             
             for expert_name in expert_names:
@@ -1149,6 +1226,15 @@ def eval_single_episode(
         expert_postprocessors: 专家 postprocessor 字典（用于智能选择）
         use_smart_postprocessor: 是否启用智能 postprocessor 选择
     """
+    # 🔒 重置 Router Network 锁机制（每个 episode 开始时重新检测专家）
+    if hasattr(policy._groot_model, 'get_action'):
+        get_action_func = policy._groot_model.get_action
+        if hasattr(get_action_func, '_router_locked'):
+            get_action_func._router_locked = False
+            get_action_func._locked_task_id = None
+            get_action_func._locked_expert_name = None
+            get_action_func._last_routing_decision = None
+    
     infer_per_frame = max(1, infer_per_frame)
     last_inferred_chunk: np.ndarray | None = None
     last_inference_step: int = -1
@@ -1159,7 +1245,16 @@ def eval_single_episode(
         if not use_smart_postprocessor or expert_postprocessors is None:
             return postprocessor
         
-        # 从 adapter 获取最后一次路由决策
+        # 优先级1: 从 get_action_with_moe 获取最后一次路由决策（Router Network 模式）
+        # 这是最可靠的方法，因为 Router Network 的决策是在 get_action_with_moe 中保存的
+        if hasattr(policy._groot_model, 'get_action'):
+            get_action_func = policy._groot_model.get_action
+            if hasattr(get_action_func, '_last_routing_decision'):
+                expert_name = get_action_func._last_routing_decision
+                if expert_name and expert_name in expert_postprocessors:
+                    return expert_postprocessors[expert_name]
+        
+        # 优先级2: 从 adapter 获取最后一次路由决策（Smart Routing 模式）
         if adapter is not None and hasattr(adapter, 'get_last_task_decision'):
             task_decision = adapter.get_last_task_decision()
             if task_decision and task_decision in expert_postprocessors:

@@ -96,7 +96,7 @@ class MergeVLAConfig:
     # ⭐ 任务路由控制
     task_type: Optional[str] = field(
         default=None, 
-        metadata={"help": "任务类型: narrower 或 wider。不指定则使用 smart_routing 或平均"}
+        metadata={"help": "任务类型: narrower 或 wider。不指定则使用 smart_routing、router_network 或平均"}
     )
     smart_routing: bool = field(
         default=False, 
@@ -105,6 +105,14 @@ class MergeVLAConfig:
     swap_task_mapping: bool = field(
         default=False, 
         metadata={"help": "交换任务映射 (narrower↔wider)，当 Smart Routing 结果相反时使用"}
+    )
+    use_router_network: bool = field(
+        default=False,
+        metadata={"help": "🧠 启用 Router Network 模式。使用训练好的神经网络预测专家。⭐⭐ 最佳选项！"}
+    )
+    router_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Router Network 权重路径（默认: model_path/router_network.pt）"}
     )
     
     # 动作队列配置
@@ -143,13 +151,22 @@ class ModelWrapper:
     def reset(self):
         self.policy.reset()
         self.policy.init_rtc_processor()
+        
+        # 🔒 重置 Router Network 锁机制（新 episode 开始时重新检测专家）
+        if hasattr(self.policy._groot_model, 'get_action'):
+            get_action_func = self.policy._groot_model.get_action
+            if hasattr(get_action_func, '_router_locked'):
+                get_action_func._router_locked = False
+                get_action_func._locked_task_id = None
+                get_action_func._locked_expert_name = None
+                get_action_func._last_routing_decision = None
     
     def get_postprocessor_for_task(self, task_decision: str = None):
         """
         根据任务决策获取对应的 postprocessor
         
         Args:
-            task_decision: "narrower" 或 "wider"，如果为 None 则使用默认 postprocessor
+            task_decision: "narrower" 或 "wider"，如果为 None 则尝试从路由决策获取
         
         Returns:
             对应任务的 postprocessor
@@ -158,7 +175,16 @@ class ModelWrapper:
             return self.postprocessor
         
         if task_decision is None:
-            # 尝试从 adapter 获取最后一次路由决策
+            # 优先级1: 从 get_action_with_moe 获取最后一次路由决策（Router Network 模式）
+            # 这是最可靠的方法，因为 Router Network 的决策是在 get_action_with_moe 中保存的
+            if hasattr(self.policy._groot_model, 'get_action'):
+                get_action_func = self.policy._groot_model.get_action
+                if hasattr(get_action_func, '_last_routing_decision'):
+                    expert_name = get_action_func._last_routing_decision
+                    if expert_name and expert_name in self.expert_postprocessors:
+                        return self.expert_postprocessors[expert_name]
+            
+            # 优先级2: 从 adapter 获取最后一次路由决策（Smart Routing 模式）
             if self.adapter is not None and hasattr(self.adapter, 'get_last_task_decision'):
                 task_decision = self.adapter.get_last_task_decision()
         
@@ -378,9 +404,16 @@ def wrap_policy_with_moe(
     task_type: str = None,
     use_smart_routing: bool = False,
     swap_task_mapping: bool = False,
+    use_router_network: bool = False,  # 🧠 Router Network 模式
 ):
     """
     ⭐ 包装 GrootPolicy，使其使用 MoE 动作头
+    
+    路由优先级：
+    1. task_type（固定路由）
+    2. use_router_network（🧠 Router Network，最智能！）
+    3. use_smart_routing（SVD-based routing）
+    4. 默认第一个专家
     
     Args:
         policy: GrootPolicy 实例
@@ -389,6 +422,7 @@ def wrap_policy_with_moe(
         task_type: 任务类型 ("narrower", "wider", None)
         use_smart_routing: 是否使用智能任务路由
         swap_task_mapping: 是否交换任务映射
+        use_router_network: 🧠 Router Network 模式
     """
     # ⭐ 设置 action heads 用于 MergeVLA SVD-based 路由
     # 这是论文 Section 3.3 的关键：需要访问值投影矩阵进行 SVD 分解
@@ -397,21 +431,31 @@ def wrap_policy_with_moe(
             adapter.adapter.set_action_heads(list(moe_head.expert_heads))
             logger.info(f"   ⭐ SVD-based routing: 已连接 {len(moe_head.expert_heads)} 个专家的 action heads")
     
-    # 设置 task_id
+    # 设置 task_id 和路由模式
+    # ⚠️ 优先级：task_type > router_network > smart_routing > 默认
+    actual_use_router = use_router_network and task_type is None
+    actual_use_smart = use_smart_routing and task_type is None and not use_router_network
+    
     if task_type == "narrower":
         actual_task_id = 1 if swap_task_mapping else 0
         fixed_task_id = torch.tensor([actual_task_id], device=next(adapter.parameters()).device)
-        logger.info(f"   ⚠️ MoE 路由: task_type=narrower → task_id={actual_task_id}")
+        logger.info(f"   🎯 MoE 路由: task_type=narrower → task_id={actual_task_id} → 使用 {moe_head.expert_names[actual_task_id]} 专家")
+        if use_router_network:
+            logger.info(f"      ⚠️ 忽略 --router-network（已指定 task_type）")
     elif task_type == "wider":
         actual_task_id = 0 if swap_task_mapping else 1
         fixed_task_id = torch.tensor([actual_task_id], device=next(adapter.parameters()).device)
-        logger.info(f"   ⚠️ MoE 路由: task_type=wider → task_id={actual_task_id}")
+        logger.info(f"   🎯 MoE 路由: task_type=wider → task_id={actual_task_id} → 使用 {moe_head.expert_names[actual_task_id]} 专家")
+        if use_router_network:
+            logger.info(f"      ⚠️ 忽略 --router-network（已指定 task_type）")
     else:
         fixed_task_id = None
-        if use_smart_routing:
-            logger.info(f"   ⭐ MoE 智能任务路由 (根据输入选择专家)")
+        if actual_use_router:
+            logger.info(f"   🧠 MoE Router Network (使用训练好的网络预测专家)")
+        elif actual_use_smart:
+            logger.info(f"   ⭐ MoE 智能任务路由 (根据输入特征自动选择专家)")
         else:
-            logger.warning(f"   ⚠️ MoE: 未指定任务类型，使用默认专家 (narrower)")
+            logger.warning(f"   ⚠️ MoE: 未指定任务类型，使用默认专家 ({moe_head.expert_names[0]})")
             fixed_task_id = torch.tensor([0], device=next(adapter.parameters()).device)
     
     def get_action_with_moe(inputs: dict, **kwargs):
@@ -421,16 +465,56 @@ def wrap_policy_with_moe(
         # 通过适配层
         backbone_features = backbone_outputs[BACKBONE_FEATURE_KEY]
         
-        # 计算路由权重（如果使用智能路由）
+        # ⭐ 关键修复：如果使用 Router Network，先预测专家，然后使用对应的 task_id 调用 adapter
+        # 🔒 锁机制：第一帧检测并锁定专家，后续帧复用该决策（保持一致性，减少计算开销）
+        current_task_id = fixed_task_id
+        predicted_expert_name = None  # ⭐ 保存预测的专家名称，用于 postprocessor 选择
+        
+        if fixed_task_id is None and actual_use_router and hasattr(moe_head, 'router_network') and moe_head.router_network is not None:
+            # 🔒 初始化锁机制状态
+            if not hasattr(get_action_with_moe, '_router_locked'):
+                get_action_with_moe._router_locked = False
+                get_action_with_moe._locked_task_id = None
+                get_action_with_moe._locked_expert_name = None
+                get_action_with_moe._last_routing_decision = None
+            
+            # 🔒 如果已锁定，直接使用锁定的专家
+            if get_action_with_moe._router_locked:
+                current_task_id = get_action_with_moe._locked_task_id
+                predicted_expert_name = get_action_with_moe._locked_expert_name
+                get_action_with_moe._last_routing_decision = predicted_expert_name
+            else:
+                # 🧠 Router Network 模式：第一帧预测专家并锁定
+                expert_idx, confidence = moe_head.router_network.predict_expert(
+                    backbone_features,
+                    temperature=moe_head.routing_temperature
+                )
+                # 专家索引就是 task_id（expert 0 = task_id 0, expert 1 = task_id 1）
+                predicted_task_id = expert_idx[0].item() if isinstance(expert_idx, torch.Tensor) else expert_idx
+                current_task_id = torch.tensor([predicted_task_id], device=backbone_features.device)
+                predicted_expert_name = moe_head.expert_names[predicted_task_id]  # ⭐ 保存专家名称
+                
+                # 🔒 锁定专家选择（第一帧后不再重新预测）
+                get_action_with_moe._router_locked = True
+                get_action_with_moe._locked_task_id = current_task_id.clone()
+                get_action_with_moe._locked_expert_name = predicted_expert_name
+                get_action_with_moe._last_routing_decision = predicted_expert_name
+                
+                # 打印锁定信息
+                conf_value = confidence[0].item() if isinstance(confidence, torch.Tensor) else confidence
+                logger.info(f"   🔒 Router Network 锁定专家: {predicted_expert_name} (confidence={conf_value:.4f}, task_id={predicted_task_id})")
+                logger.info(f"      后续所有帧将使用此专家，保持一致性")
+        
+        # 计算路由权重（如果使用 SVD 智能路由且不使用其他模式且没有固定 task_id）
         routing_weights = None
-        if fixed_task_id is None and use_smart_routing:
+        if fixed_task_id is None and actual_use_smart and not actual_use_router:
             routing_weights = adapter.adapter.compute_task_routing_scores(backbone_features)
         
-        # 应用适配
+        # 应用适配（使用 Router Network 预测的 task_id）
         adapted_features = adapter(
             backbone_features, 
-            task_id=fixed_task_id,
-            use_smart_routing=use_smart_routing
+            task_id=current_task_id,  # ⭐ 使用 Router Network 预测的 task_id
+            use_smart_routing=actual_use_smart and not actual_use_router  # 如果使用 Router Network，不使用 smart routing
         )
         backbone_outputs[BACKBONE_FEATURE_KEY] = adapted_features
         
@@ -439,14 +523,25 @@ def wrap_policy_with_moe(
         return moe_head.get_action(
             backbone_outputs, 
             action_inputs, 
-            task_id=fixed_task_id,
+            task_id=fixed_task_id,  # 保持原逻辑，让 moe_head 内部也使用 router network
             routing_weights=routing_weights,
+            use_router_network=actual_use_router,  # 🧠 Router Network
             rtc_enabled=rtc_enabled,
             **kwargs
         )
     
     policy._groot_model.get_action = get_action_with_moe
-    logger.info(f"   ✅ Policy 已包装 MoE 动作头")
+    
+    # 路由模式打印（基于实际使用的模式）
+    if fixed_task_id is not None:
+        routing_mode = "固定专家"
+    elif actual_use_router:
+        routing_mode = "Router Network"
+    elif actual_use_smart:
+        routing_mode = "智能任务路由"
+    else:
+        routing_mode = "默认专家"
+    logger.info(f"   ✅ Policy 已包装 MoE 动作头 (路由模式: {routing_mode})")
 
 
 def load_mergevla_model(cfg: MergeVLAConfig) -> ModelWrapper:
@@ -488,6 +583,45 @@ def load_mergevla_model(cfg: MergeVLAConfig) -> ModelWrapper:
             # MoE 模式：加载多个专家头
             logger.info(f"🔧 加载 MoE Expert Heads...")
             moe_head = load_moe_expert_heads(policy, cfg.model_path, merge_config, cfg.device)
+            
+            # 🧠 如果启用 Router Network，加载训练好的 Router
+            if cfg.use_router_network:
+                router_file = cfg.router_path or os.path.join(cfg.model_path, "router_network.pt")
+                if os.path.exists(router_file):
+                    logger.info(f"🧠 Loading Router Network from {router_file}...")
+                    try:
+                        from lerobot.policies.groot.weight_merge_groot import RouterNetwork
+                        router_checkpoint = torch.load(router_file, map_location=cfg.device)
+                        router_config = router_checkpoint.get('config', {})
+                        
+                        router_network = RouterNetwork(
+                            hidden_dim=router_config.get('hidden_dim', 2048),
+                            num_experts=router_config.get('num_experts', len(moe_head.expert_heads)),
+                            intermediate_dim=router_config.get('intermediate_dim', 256),
+                        )
+                        router_network.load_state_dict(router_checkpoint['state_dict'])
+                        router_network.to(cfg.device)
+                        router_network.eval()
+                        
+                        # 将 Router Network 绑定到 moe_head
+                        moe_head.router_network = router_network
+                        
+                        best_acc = router_checkpoint.get('best_val_acc', 'N/A')
+                        logger.info(f"   ✅ Router Network loaded!")
+                        logger.info(f"   📊 Best validation accuracy: {best_acc}%")
+                        logger.info(f"   Task names: {router_config.get('task_names', 'N/A')}")
+                    except Exception as e:
+                        logger.error(f"   ❌ Error loading Router Network: {e}")
+                        logger.warning(f"   ⚠️ Falling back to Smart Routing...")
+                        cfg.use_router_network = False
+                        cfg.smart_routing = True
+                else:
+                    logger.error(f"❌ Router Network file not found: {router_file}")
+                    logger.warning(f"   💡 Train it first: python scripts/train_router_network.py ...")
+                    logger.warning(f"   ⚠️ Falling back to Smart Routing...")
+                    cfg.use_router_network = False
+                    cfg.smart_routing = True
+            
             wrap_policy_with_moe(
                 policy, 
                 adapter,
@@ -495,6 +629,7 @@ def load_mergevla_model(cfg: MergeVLAConfig) -> ModelWrapper:
                 task_type=cfg.task_type,
                 use_smart_routing=cfg.smart_routing,
                 swap_task_mapping=cfg.swap_task_mapping,
+                use_router_network=cfg.use_router_network,  # 🧠 Router Network
             )
         else:
             # 原有模式：单个 action_head
@@ -523,9 +658,13 @@ def load_mergevla_model(cfg: MergeVLAConfig) -> ModelWrapper:
         from lerobot.processor import PolicyProcessorPipeline
         from lerobot.processor.converters import policy_action_to_transition, transition_to_policy_action
         
-        # ⭐ 智能路由模式：加载所有专家的 postprocessor
-        if cfg.smart_routing and cfg.task_type is None:
-            logger.info(f"   ⭐ 智能路由模式: 加载所有专家的 postprocessor")
+        # ⭐ 智能路由模式（task_type=None + (use_smart_routing=True 或 use_router_network=True)）
+        # 包括两种模式：
+        # 1. use_smart_routing=True: MergeVLA SVD-based 路由
+        # 2. use_router_network=True: Router Network 路由
+        if (cfg.smart_routing or cfg.use_router_network) and cfg.task_type is None:
+            routing_mode_name = "Router Network" if cfg.use_router_network else "智能路由"
+            logger.info(f"   ⭐ {routing_mode_name}模式: 加载所有专家的 postprocessor")
             expert_postprocessors = {}
             expert_names = ["narrower", "wider"]
             
@@ -803,13 +942,20 @@ def main(cfg: MergeVLAConfig):
     if cfg.task_type:
         swap_info = " (映射已交换)" if cfg.swap_task_mapping else ""
         print(f"   🎯 任务路由: 固定 task_type={cfg.task_type}{swap_info}")
+    elif cfg.use_router_network:
+        print(f"   🧠 任务路由: Router Network (智能神经网络路由)")
+        print(f"   ⭐⭐ 最佳选项：使用训练好的网络预测专家")
+        router_path = cfg.router_path or os.path.join(cfg.model_path, "router_network.pt")
+        print(f"   📁 Router path: {router_path}")
+        if model.use_smart_postprocessor:
+            print(f"   🔥 智能 postprocessor: 根据路由决策自动选择")
     elif cfg.smart_routing:
         print(f"   ⭐ 任务路由: MergeVLA 智能路由")
         if model.use_smart_postprocessor:
             print(f"   🔥 智能 postprocessor: 根据路由决策自动选择")
     else:
         print(f"   ⚠️ 任务路由: 简单平均（可能导致动作混乱！）")
-        print(f"   💡 建议: 使用 --smart_routing=true 自动推断任务")
+        print(f"   💡 建议: 使用 --use_router_network=true 或 --smart_routing=true 自动推断任务")
     print(f"{'='*60}")
     print(f"   推理频率: {cfg.fps} Hz")
     print(f"   推理周期: {cfg.duration} 秒")
