@@ -1,6 +1,6 @@
 import numpy as np
 from scipy.spatial.transform import Rotation as R
-from kuavo_ik.torso_ik_from_kuavo_ros_control import ArmIk
+# from kuavo_ik.torso_ik_from_kuavo_ros_control import ArmIk
 import os, sys
 cur_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -253,96 +253,96 @@ class IKAnalytical:
         return np.asarray(thetas)[:7]
 
 
-class IKNumerical:
-    def __init__(self, urdf_file=os.path.join(cur_dir, 'drake_urdf/urdf/biped_v3_arm.urdf'), if_two_stgs=False):
-        self.arm_ik = ArmIk(
-            model_file=urdf_file,
-            end_frames_name=["base_link", "zarm_l7_link", "zarm_l1_link"],
-            meshcat=None,
-            constraint_tol=1e-3,
-            solver_tol=1.0e-4,
-            iterations_limit=10000,
-            eef_z_bias=0.0,
-        )
+# class IKNumerical:
+#     def __init__(self, urdf_file=os.path.join(cur_dir, 'drake_urdf/urdf/biped_v3_arm.urdf'), if_two_stgs=False):
+#         self.arm_ik = ArmIk(
+#             model_file=urdf_file,
+#             end_frames_name=["base_link", "zarm_l7_link", "zarm_l1_link"],
+#             meshcat=None,
+#             constraint_tol=1e-3,
+#             solver_tol=1.0e-4,
+#             iterations_limit=10000,
+#             eef_z_bias=0.0,
+#         )
 
-        torso_yaw_deg = 0.0
-        torso_height = 0.0
-        self.arm_ik.init_state(torso_yaw_deg, torso_height)
-        q0 = self.arm_ik.q0()
-        self.arm_ik.start_recording()
-        l_pose = self.arm_ik.left_hand_pose(q0)
-        self.arm_ik.set_use_two_stage_ik(if_two_stgs)
-        print(
-            f"left_hand_pose: {l_pose[0]}, {l_pose[1]}"
-        )
+#         torso_yaw_deg = 0.0
+#         torso_height = 0.0
+#         self.arm_ik.init_state(torso_yaw_deg, torso_height)
+#         q0 = self.arm_ik.q0()
+#         self.arm_ik.start_recording()
+#         l_pose = self.arm_ik.left_hand_pose(q0)
+#         self.arm_ik.set_use_two_stage_ik(if_two_stgs)
+#         print(
+#             f"left_hand_pose: {l_pose[0]}, {l_pose[1]}"
+#         )
 
-    def compute(self,
-                eef_pos,
-                eef_quat_xyzw,
-                eef_frame,
-                ref_q=None,
-                limit=True
-                ):
-        l_hand_RPY = R.from_quat(eef_quat_xyzw).as_euler('xyz')  # 外部系旋转
-        assert eef_frame in ['zarm_l7_link', 'zarm_r7_link'], \
-            f"IKAnalytical only supports 'zarm_l7_link', 'zarm_r7_link' frame, got {eef_frame}"
+#     def compute(self,
+#                 eef_pos,
+#                 eef_quat_xyzw,
+#                 eef_frame,
+#                 ref_q=None,
+#                 limit=True
+#                 ):
+#         l_hand_RPY = R.from_quat(eef_quat_xyzw).as_euler('xyz')  # 外部系旋转
+#         assert eef_frame in ['zarm_l7_link', 'zarm_r7_link'], \
+#             f"IKAnalytical only supports 'zarm_l7_link', 'zarm_r7_link' frame, got {eef_frame}"
 
-        if eef_frame in ['zarm_r7_link']:
-            side = 'right'
-        else:
-            side = 'left'
+#         if eef_frame in ['zarm_r7_link']:
+#             side = 'right'
+#         else:
+#             side = 'left'
 
-        if side == 'right':
-            # 把右手的eef_target_in_base转成左手的
-            euler_mirrored_ = [-l_hand_RPY[0], l_hand_RPY[1], -l_hand_RPY[2]]
-            l_hand_RPY = euler_mirrored_
-            eef_pos = [eef_pos[0], -eef_pos[1], eef_pos[2]]
+#         if side == 'right':
+#             # 把右手的eef_target_in_base转成左手的
+#             euler_mirrored_ = [-l_hand_RPY[0], l_hand_RPY[1], -l_hand_RPY[2]]
+#             l_hand_RPY = euler_mirrored_
+#             eef_pos = [eef_pos[0], -eef_pos[1], eef_pos[2]]
 
-        l_elbow_pos = None
-        r_elbow_pos = None
-        r_hand_RPY = None
-        r_hand_pose = None  # [x, y, z]
-        q0 = self.arm_ik.q0()
+#         l_elbow_pos = None
+#         r_elbow_pos = None
+#         r_hand_RPY = None
+#         r_hand_pose = None  # [x, y, z]
+#         q0 = self.arm_ik.q0()
 
-        print(f' >>>>>>>>>>>>>>>>>>>>>>>>. arm q0 {q0} <<<<<<<<<<<<<<<<<<<<<')
+#         print(f' >>>>>>>>>>>>>>>>>>>>>>>>. arm q0 {q0} <<<<<<<<<<<<<<<<<<<<<')
 
-        q0_heuristic = [-0.60276536, 0.61077987, -1.10754203, -1.28068895, 1.12118157, 0.56953695,
-                        0.34970026, 0.0, 0.0, 0.0, 0.0, 0.0,
-                        0.0, 0.0
-                        ]
-        if ref_q is not None:
-            q0 = q0_heuristic
-            for i in range(len(ref_q)):
-                if ref_q[i] is not None:
-                    q0[i] = ref_q[i]
-        q_now = self.arm_ik.computeIK(
-            q0,
-            l_hand_pose=eef_pos,
-            r_hand_pose=r_hand_pose,
-            l_hand_RPY=l_hand_RPY,
-            r_hand_RPY=r_hand_RPY,
-            l_elbow_pos=l_elbow_pos,
-            r_elbow_pos=r_elbow_pos,
-        )
-        if limit:
-            for i, joint_name in enumerate(
-                    ['joint_1', 'joint_2', 'joint_3', 'joint_4', 'joint_5', 'joint_6', 'joint_7']):
-                lower, upper = joint_limits[joint_name]
-                q_now[i] = clip_to_pi(q_now[i])
-                q_now[i] = np.clip(q_now[i], lower, upper)
+#         q0_heuristic = [-0.60276536, 0.61077987, -1.10754203, -1.28068895, 1.12118157, 0.56953695,
+#                         0.34970026, 0.0, 0.0, 0.0, 0.0, 0.0,
+#                         0.0, 0.0
+#                         ]
+#         if ref_q is not None:
+#             q0 = q0_heuristic
+#             for i in range(len(ref_q)):
+#                 if ref_q[i] is not None:
+#                     q0[i] = ref_q[i]
+#         q_now = self.arm_ik.computeIK(
+#             q0,
+#             l_hand_pose=eef_pos,
+#             r_hand_pose=r_hand_pose,
+#             l_hand_RPY=l_hand_RPY,
+#             r_hand_RPY=r_hand_RPY,
+#             l_elbow_pos=l_elbow_pos,
+#             r_elbow_pos=r_elbow_pos,
+#         )
+#         if limit:
+#             for i, joint_name in enumerate(
+#                     ['joint_1', 'joint_2', 'joint_3', 'joint_4', 'joint_5', 'joint_6', 'joint_7']):
+#                 lower, upper = joint_limits[joint_name]
+#                 q_now[i] = clip_to_pi(q_now[i])
+#                 q_now[i] = np.clip(q_now[i], lower, upper)
 
-        if side == 'right':
-            # 把左手的thetas转成右手的. # 0, 3, 6 正向，其余反向
-            thetas_converted = [
-                q_now[0],
-                -q_now[1],
-                -q_now[2],
-                q_now[3],
-                -q_now[4],
-                -q_now[5],
-                q_now[6],
-            ]
-            q_now = thetas_converted
-            # return np.asarray(thetas_converted)
+#         if side == 'right':
+#             # 把左手的thetas转成右手的. # 0, 3, 6 正向，其余反向
+#             thetas_converted = [
+#                 q_now[0],
+#                 -q_now[1],
+#                 -q_now[2],
+#                 q_now[3],
+#                 -q_now[4],
+#                 -q_now[5],
+#                 q_now[6],
+#             ]
+#             q_now = thetas_converted
+#             # return np.asarray(thetas_converted)
 
-        return np.asarray(q_now)[:7]
+#         return np.asarray(q_now)[:7]
