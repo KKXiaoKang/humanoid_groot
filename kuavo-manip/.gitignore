@@ -1,0 +1,12 @@
+.idea
+__pycache__/
+**__pycache__/
+**.pyc
+lerobot_data
+raw_data
+.vscode
+log/
+logs/
+build/
+dist/
+*.egg-info/
