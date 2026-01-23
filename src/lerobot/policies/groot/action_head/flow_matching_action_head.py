@@ -409,6 +409,10 @@ class FlowmatchingActionHead(nn.Module):
             actual_action_dim = config.action_dim
         
         self.actual_action_dim = actual_action_dim  # Actual action dimension from data
+        
+        # Print actual_action_dim for verification
+        if config.action_space_type in ["Delta eef", "Absolute eef", "Absolute joint"]:
+            print(f"✅ actual_action_dim={self.actual_action_dim}D (based on action_space_type='{config.action_space_type}')")
 
         self.state_encoder = CategorySpecificMLP(
             num_categories=config.max_num_embodiments,
@@ -489,7 +493,14 @@ class FlowmatchingActionHead(nn.Module):
                 print(f"📊 Multi-head action: left_arm({config.action_left_arm_dim}D, indices 0-{config.action_left_arm_dim-1}) + "
                       f"right_arm({config.action_right_arm_dim}D, indices {config.action_left_arm_dim}-{config.action_left_arm_dim + config.action_right_arm_dim-1}) + "
                       f"claw({config.action_claw_dim}D, indices {config.action_arm_dim}-{config.action_arm_dim + config.action_claw_dim-1}) = {total_dim}D")
-                print(f"   action_arm_dim={config.action_arm_dim} (left+right), actual_action_dim={config.action_dim}")
+                # Note: actual_action_dim will be set after this print, so we calculate it here for display
+                if config.action_space_type in ["Delta eef", "Absolute eef"]:
+                    expected_actual_dim = 20
+                elif config.action_space_type == "Absolute joint":
+                    expected_actual_dim = 16
+                else:
+                    expected_actual_dim = total_dim
+                print(f"   action_arm_dim={config.action_arm_dim} (left+right), actual_action_dim={expected_actual_dim} (from action_space_type={config.action_space_type})")
             else:
                 print(f"📊 Multi-head action: arm({config.action_arm_dim}D) + claw({config.action_claw_dim}D) = {config.action_arm_dim + config.action_claw_dim}D")
         else:
