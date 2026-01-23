@@ -22,6 +22,15 @@ pip3 install scipy
 cd /home/lab/kuavo-ros-control-rewACT/src/kuavo_humanoid_sdk && ./install.sh
 pip3 install websockets 
 pip3 install deprecated
+
+# eef action space
+conda install pinocchio
+pip install PyQt5
+pip install PySide2
+(lerobot_groot_base) lab@lab [~/humanoid_groot/eval/IK_eef_eval] git:(KangKK/dev/delta_eef_pose_action) ✗ ➜  conda list | grep pinocchio [15:00:04]
+libpinocchio              3.9.0                h54b0c19_0    conda-forge
+pinocchio                 3.9.0                hff52083_0    conda-forge
+pinocchio-python          3.9.0           py310h1e2979e_0    conda-forge
 ```
 ## 验证脚本看文末
 ## 模型架构分析
@@ -305,3 +314,15 @@ python eval/eval_merged_groot.py \
     --duration=30 \
     --use_router_network=true 
 ```
+
+## eef action sapce
+```bash
+ python verify_ik_fk_consistency.py \
+    --dataset-path /home/lab/humanoid_groot/lerobot_data/v3_0_dataset/0122_4322_eef_test \
+    --episode-idx 0 \
+    --urdf-path /home/lab/kuavo-manip/lerobot_datasets/utils/biped_s60_only_arm.urdf \
+    --model-type 60 \
+    --robot-version 5_wheel \
+    --output-dir ./ik_fk_verification_results --interactive
+```
+* ![对比结果](./eval/IK_eef_eval/ik_fk_verification_results/3d_trajectory.png)
