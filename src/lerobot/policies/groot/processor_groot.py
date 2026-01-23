@@ -296,7 +296,7 @@ class GrootPackInputsStep(ProcessorStep):
             if (key == "action" and 
                 self.action_space_type in ["Delta eef", "Absolute eef"] and 
                 self.action_component_indices is not None):
-                return self._min_max_norm_partial(x, key)
+                return _min_max_norm_partial(x, key)
             
             # Standard normalization: apply to entire tensor
             stats_k = self.stats[key]
