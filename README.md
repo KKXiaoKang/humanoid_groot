@@ -316,6 +316,7 @@ python eval/eval_merged_groot.py \
 ```
 
 ## eef action sapce
+* 该工具用于验证Pinocchio FK 和 my-self IK 一致性验证脚本
 ```bash
  python verify_ik_fk_consistency.py \
     --dataset-path /home/lab/humanoid_groot/lerobot_data/v3_0_dataset/0122_4322_eef_test \
@@ -325,4 +326,5 @@ python eval/eval_merged_groot.py \
     --robot-version 5_wheel \
     --output-dir ./ik_fk_verification_results --interactive
 ```
-* ![对比结果](./eval/IK_eef_eval/ik_fk_verification_results/3d_trajectory.png)
+* 拆垛左拆例子
+    * ![对比结果](./eval/IK_eef_eval/ik_fk_verification_results/3d_trajectory_demo.jpg)
