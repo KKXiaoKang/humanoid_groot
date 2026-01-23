@@ -247,17 +247,39 @@ class GR00TN15(PreTrainedModel):
         # Use FlowmatchingActionHeadConfig default (True) if not specified in config
         use_multi_action_heads = action_head_cfg_dict.get("use_multi_action_heads", True)
         
+        # Get action_space_type from config (default to "Absolute joint" for backward compatibility)
+        # This will be passed to FlowmatchingActionHeadConfig, which will auto-configure dimensions
+        action_space_type = action_head_cfg_dict.get("action_space_type", "Absolute joint")
+        action_head_cfg_dict["action_space_type"] = action_space_type
+        
         # Save pretrained action_dim for compatibility (pretrained model uses 32D)
         pretrained_action_dim = action_head_cfg_dict.get("action_dim", 32)
         
         if use_multi_action_heads:
             split_arm_heads = action_head_cfg_dict.get("split_arm_heads", False)
             if split_arm_heads:
-                # Split arm into left and right
-                action_left_arm_dim = action_head_cfg_dict.get("action_left_arm_dim", 7)
-                action_right_arm_dim = action_head_cfg_dict.get("action_right_arm_dim", 7)
-                action_claw_dim = action_head_cfg_dict.get("action_claw_dim", 2)
+                # Auto-configure dimensions based on action_space_type if not explicitly set
+                if "action_left_arm_dim" not in action_head_cfg_dict:
+                    if action_space_type in ["Delta eef", "Absolute eef"]:
+                        action_head_cfg_dict["action_left_arm_dim"] = 9
+                    else:
+                        action_head_cfg_dict["action_left_arm_dim"] = 7
+                
+                if "action_right_arm_dim" not in action_head_cfg_dict:
+                    if action_space_type in ["Delta eef", "Absolute eef"]:
+                        action_head_cfg_dict["action_right_arm_dim"] = 9
+                    else:
+                        action_head_cfg_dict["action_right_arm_dim"] = 7
+                
+                if "action_claw_dim" not in action_head_cfg_dict:
+                    action_head_cfg_dict["action_claw_dim"] = 2
+                
+                # Get the configured dimensions
+                action_left_arm_dim = action_head_cfg_dict["action_left_arm_dim"]
+                action_right_arm_dim = action_head_cfg_dict["action_right_arm_dim"]
+                action_claw_dim = action_head_cfg_dict["action_claw_dim"]
                 actual_action_dim = action_left_arm_dim + action_right_arm_dim + action_claw_dim
+                
                 # Set action_arm_dim for compatibility (left + right)
                 action_head_cfg_dict["action_arm_dim"] = action_left_arm_dim + action_right_arm_dim
                 # Ensure split_arm_heads is set in the dict
@@ -472,6 +494,12 @@ class GR00TN15(PreTrainedModel):
         
         with open(config_path, "r") as f:
             config_dict = json.load(f)
+        
+        # Override action_space_type from kwargs if provided (for GrootConfig compatibility)
+        action_space_type = kwargs.pop("action_space_type", None)
+        if action_space_type and "action_head_cfg" in config_dict:
+            if "action_space_type" not in config_dict["action_head_cfg"]:
+                config_dict["action_head_cfg"]["action_space_type"] = action_space_type
         
         # Create GR00TN15Config from the loaded dict
         config = GR00TN15Config(**config_dict)

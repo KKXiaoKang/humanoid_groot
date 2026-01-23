@@ -90,7 +90,9 @@ def make_groot_pre_post_processors(
     Returns:
         Tuple of (preprocessor, postprocessor) pipelines
     """
-
+    # Get action space type from config (default to "Absolute joint" for backward compatibility)
+    action_space_type = getattr(config, 'action_space_type', "Absolute joint")
+    
     # Get horizon/dimension parameters from config
     # These should match the config used for the pretrained model
     # Default values match most GR00T configs (state_horizon=1, action_horizon=16)
@@ -117,6 +119,31 @@ def make_groot_pre_post_processors(
         FeatureType.ACTION: NormalizationMode.MIN_MAX,
         FeatureType.STATE: NormalizationMode.MIN_MAX,
     }
+    
+    # Setup partial normalization for eef action spaces
+    action_component_indices = None
+    
+    if action_space_type in ["Delta eef", "Absolute eef"]:
+        # For absolute eef pose (20D):
+        # - 3维左手 eef position (x, y, z) -> indices 0-2
+        # - 6维左手 eef 6D 旋转表示 [R11, R21, R31, R12, R22, R32] -> indices 3-8
+        # - 3维右手 eef position (x, y, z) -> indices 9-11
+        # - 6维右手 eef 6D 旋转表示 [R11, R21, R31, R12, R22, R32] -> indices 12-17
+        # - 1维左夹爪开合程度 -> indices 18
+        # - 1维右夹爪开合程度 -> indices 19
+        action_component_indices = {
+            "left_eef_pos": (0, 3),
+            "left_eef_rot6d": (3, 9),
+            "right_eef_pos": (9, 12),
+            "right_eef_rot6d": (12, 18),
+            "left_gripper": (18, 19),
+            "right_gripper": (19, 20),
+        }
+        print(f"✅ Partial normalization enabled for action space: {action_space_type}")
+        print(f"   Components: {list(action_component_indices.keys())}")
+        print(f"   6D rotation components (left_eef_rot6d, right_eef_rot6d) will use IDENTITY normalization")
+    else:
+        print(f"📊 Using standard normalization for action space: {action_space_type}")
 
     # Determine env action dimension from config (simple, object-like PolicyFeature)
     try:
@@ -141,6 +168,8 @@ def make_groot_pre_post_processors(
             embodiment_tag=config.embodiment_tag,
             normalize_min_max=True,
             stats=padded_stats,
+            action_space_type=action_space_type,
+            action_component_indices=action_component_indices,
         ),
         # 4. Eagle encode (creates eagle_content)
         GrootEagleEncodeStep(
@@ -160,6 +189,8 @@ def make_groot_pre_post_processors(
             env_action_dim=env_action_dim,
             stats=padded_stats,
             normalize_min_max=True,
+            action_space_type=action_space_type,
+            action_component_indices=action_component_indices,
         ),
         # Finally, move to CPU for env interaction
         DeviceProcessorStep(device="cpu"),
@@ -231,6 +262,9 @@ class GrootPackInputsStep(ProcessorStep):
     # Min-max normalization (SO100-like) applied BEFORE padding
     normalize_min_max: bool = True
     stats: dict[str, dict[str, Any]] | None = None
+    # For partial normalization of action (e.g., 6D rotation representation)
+    action_space_type: str | None = None  # "Delta eef", "Absolute eef", "Absolute joint", etc.
+    action_component_indices: dict[str, tuple[int, int]] | None = None  # e.g., {"left_eef_pos": (0, 3), ...}
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         obs = transition.get(TransitionKey.OBSERVATION, {}) or {}
@@ -257,6 +291,14 @@ class GrootPackInputsStep(ProcessorStep):
                 return x
             if self.stats is None or key not in self.stats:
                 return x
+            
+            # Check if partial normalization is enabled for action
+            if (key == "action" and 
+                self.action_space_type in ["Delta eef", "Absolute eef"] and 
+                self.action_component_indices is not None):
+                return self._min_max_norm_partial(x, key)
+            
+            # Standard normalization: apply to entire tensor
             stats_k = self.stats[key]
             last_dim = x.shape[-1]
             min_v = _align_vec(stats_k.get("min", torch.zeros(last_dim)), last_dim, default=0.0)
@@ -266,6 +308,56 @@ class GrootPackInputsStep(ProcessorStep):
             safe_denom = torch.where(mask, denom, torch.ones_like(denom))
             mapped = 2 * (x - min_v) / safe_denom - 1
             return torch.where(mask, mapped, torch.zeros_like(mapped))
+        
+        def _min_max_norm_partial(x: torch.Tensor, key: str) -> torch.Tensor:
+            """Apply partial min-max normalization for action with component indices."""
+            if self.action_component_indices is None:
+                # Fallback to standard normalization
+                stats_k = self.stats[key]
+                last_dim = x.shape[-1]
+                min_v = _align_vec(stats_k.get("min", torch.zeros(last_dim)), last_dim, default=0.0)
+                max_v = _align_vec(stats_k.get("max", torch.ones(last_dim)), last_dim, default=1.0)
+                denom = max_v - min_v
+                mask = denom != 0
+                safe_denom = torch.where(mask, denom, torch.ones_like(denom))
+                mapped = 2 * (x - min_v) / safe_denom - 1
+                return torch.where(mask, mapped, torch.zeros_like(mapped))
+            
+            stats_k = self.stats[key]
+            result = x.clone()
+            
+            # Define which components should use IDENTITY (no normalization)
+            rot6d_components = ["left_eef_rot6d", "right_eef_rot6d"]
+            
+            # Get full stats
+            last_dim = x.shape[-1]
+            min_v_full = _align_vec(stats_k.get("min", torch.zeros(last_dim)), last_dim, default=0.0)
+            max_v_full = _align_vec(stats_k.get("max", torch.ones(last_dim)), last_dim, default=1.0)
+            
+            # Process each component
+            for component_name, (start_idx, end_idx) in self.action_component_indices.items():
+                if end_idx > last_dim:
+                    continue  # Skip if indices exceed tensor dimension
+                
+                component = x[..., start_idx:end_idx]
+                
+                # Check if this component should use IDENTITY normalization
+                if component_name in rot6d_components:
+                    # 6D rotation: use IDENTITY (no normalization)
+                    normalized_component = component
+                else:
+                    # Position or gripper: apply min-max normalization
+                    min_v = min_v_full[start_idx:end_idx]
+                    max_v = max_v_full[start_idx:end_idx]
+                    denom = max_v - min_v
+                    mask = denom != 0
+                    safe_denom = torch.where(mask, denom, torch.ones_like(denom))
+                    mapped = 2 * (component - min_v) / safe_denom - 1
+                    normalized_component = torch.where(mask, mapped, torch.zeros_like(mapped))
+                
+                result[..., start_idx:end_idx] = normalized_component
+            
+            return result
 
         # 1) Video (B, T=1, V, H, W, C) uint8
         img_keys = sorted([k for k in obs if k.startswith("observation.images.")])
@@ -572,6 +664,9 @@ class GrootActionUnpackUnnormalizeStep(ProcessorStep):
     # Apply inverse of min-max normalization if it was used in preprocessor
     normalize_min_max: bool = True
     stats: dict[str, dict[str, Any]] | None = None
+    # For partial normalization of action (e.g., 6D rotation representation)
+    action_space_type: str | None = None  # "Delta eef", "Absolute eef", "Absolute joint", etc.
+    action_component_indices: dict[str, tuple[int, int]] | None = None  # e.g., {"left_eef_pos": (0, 3), ...}
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         # Expect model outputs to be in TransitionKey.ACTION as (B, T, D_model)
@@ -590,25 +685,101 @@ class GrootActionUnpackUnnormalizeStep(ProcessorStep):
         # forward: y = 2 * (x - min) / denom - 1, with y=0 when denom==0
         # inverse: x = (y+1)/2 * denom + min, and when denom==0 -> x = min
         if self.normalize_min_max and self.stats is not None:
+            # Check if partial normalization is enabled for action
+            if (self.action_space_type in ["Delta eef", "Absolute eef"] and 
+                self.action_component_indices is not None):
+                action = self._min_max_unnorm_partial(action)
+            else:
+                # Standard unnormalization: apply to entire tensor
+                stats_k = self.stats.get("action", {})
+                d = action.shape[-1]
+                min_v = torch.as_tensor(
+                    stats_k.get("min", torch.zeros(d)), dtype=action.dtype, device=action.device
+                )
+                max_v = torch.as_tensor(
+                    stats_k.get("max", torch.ones(d)), dtype=action.dtype, device=action.device
+                )
+                if min_v.numel() != d:
+                    min_v = torch.nn.functional.pad(min_v.flatten()[:d], (0, max(0, d - min_v.numel())))
+                    min_v = min_v.to(action.device, dtype=action.dtype)
+                if max_v.numel() != d:
+                    max_v = torch.nn.functional.pad(max_v.flatten()[:d], (0, max(0, d - max_v.numel())))
+                    max_v = max_v.to(action.device, dtype=action.dtype)
+                denom = max_v - min_v
+                mask = denom != 0
+                safe_denom = torch.where(mask, denom, torch.ones_like(denom))
+                inv = (action + 1.0) * 0.5 * safe_denom + min_v
+                action = torch.where(mask, inv, min_v)
+    
+    def _min_max_unnorm_partial(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply partial inverse min-max normalization for action with component indices."""
+        if self.action_component_indices is None:
+            # Fallback to standard unnormalization
             stats_k = self.stats.get("action", {})
-            d = action.shape[-1]
+            d = x.shape[-1]
             min_v = torch.as_tensor(
-                stats_k.get("min", torch.zeros(d)), dtype=action.dtype, device=action.device
+                stats_k.get("min", torch.zeros(d)), dtype=x.dtype, device=x.device
             )
             max_v = torch.as_tensor(
-                stats_k.get("max", torch.ones(d)), dtype=action.dtype, device=action.device
+                stats_k.get("max", torch.ones(d)), dtype=x.dtype, device=x.device
             )
             if min_v.numel() != d:
                 min_v = torch.nn.functional.pad(min_v.flatten()[:d], (0, max(0, d - min_v.numel())))
-                min_v = min_v.to(action.device, dtype=action.dtype)
+                min_v = min_v.to(x.device, dtype=x.dtype)
             if max_v.numel() != d:
                 max_v = torch.nn.functional.pad(max_v.flatten()[:d], (0, max(0, d - max_v.numel())))
-                max_v = max_v.to(action.device, dtype=action.dtype)
+                max_v = max_v.to(x.device, dtype=x.dtype)
             denom = max_v - min_v
             mask = denom != 0
             safe_denom = torch.where(mask, denom, torch.ones_like(denom))
-            inv = (action + 1.0) * 0.5 * safe_denom + min_v
-            action = torch.where(mask, inv, min_v)
+            inv = (x + 1.0) * 0.5 * safe_denom + min_v
+            return torch.where(mask, inv, min_v)
+        
+        stats_k = self.stats.get("action", {})
+        result = x.clone()
+        
+        # Define which components should use IDENTITY (no normalization)
+        rot6d_components = ["left_eef_rot6d", "right_eef_rot6d"]
+        
+        # Get full stats
+        d = x.shape[-1]
+        min_v_full = torch.as_tensor(
+            stats_k.get("min", torch.zeros(d)), dtype=x.dtype, device=x.device
+        )
+        max_v_full = torch.as_tensor(
+            stats_k.get("max", torch.ones(d)), dtype=x.dtype, device=x.device
+        )
+        if min_v_full.numel() != d:
+            min_v_full = torch.nn.functional.pad(min_v_full.flatten()[:d], (0, max(0, d - min_v_full.numel())))
+            min_v_full = min_v_full.to(x.device, dtype=x.dtype)
+        if max_v_full.numel() != d:
+            max_v_full = torch.nn.functional.pad(max_v_full.flatten()[:d], (0, max(0, d - max_v_full.numel())))
+            max_v_full = max_v_full.to(x.device, dtype=x.dtype)
+        
+        # Process each component
+        for component_name, (start_idx, end_idx) in self.action_component_indices.items():
+            if end_idx > d:
+                continue  # Skip if indices exceed tensor dimension
+            
+            component = x[..., start_idx:end_idx]
+            
+            # Check if this component should use IDENTITY normalization
+            if component_name in rot6d_components:
+                # 6D rotation: use IDENTITY (no unnormalization)
+                unnormalized_component = component
+            else:
+                # Position or gripper: apply inverse min-max normalization
+                min_v = min_v_full[start_idx:end_idx]
+                max_v = max_v_full[start_idx:end_idx]
+                denom = max_v - min_v
+                mask = denom != 0
+                safe_denom = torch.where(mask, denom, torch.ones_like(denom))
+                inv = (component + 1.0) * 0.5 * safe_denom + min_v
+                unnormalized_component = torch.where(mask, inv, min_v)
+            
+            result[..., start_idx:end_idx] = unnormalized_component
+        
+        return result
 
         transition[TransitionKey.ACTION] = action
         return transition

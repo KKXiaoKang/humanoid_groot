@@ -93,6 +93,9 @@ class _NormalizationMixin:
     dtype: torch.dtype | None = None
     eps: float = 1e-8
     normalize_observation_keys: set[str] | None = None
+    # For partial normalization of action (e.g., 6D rotation representation)
+    action_space_type: str | None = None  # "Delta eef", "Absolute eef", "Absolute joint", etc.
+    action_component_indices: dict[str, tuple[int, int]] | None = None  # e.g., {"left_eef_pos": (0, 3), "left_eef_rot6d": (3, 9), ...}
 
     _tensor_stats: dict[str, dict[str, Tensor]] = field(default_factory=dict, init=False, repr=False)
     _stats_explicitly_provided: bool = field(default=False, init=False, repr=False)
@@ -265,6 +268,9 @@ class _NormalizationMixin:
         """
         Applies (un)normalization to an action tensor.
 
+        Supports partial normalization for action spaces like absolute eef pose,
+        where different components (position, rotation, gripper) need different normalization.
+
         Args:
             action: The action tensor to process.
             inverse: If `True`, applies unnormalization; otherwise, applies normalization.
@@ -272,8 +278,149 @@ class _NormalizationMixin:
         Returns:
             The transformed action tensor.
         """
-        processed_action = self._apply_transform(action, ACTION, FeatureType.ACTION, inverse=inverse)
-        return processed_action
+        # Check if partial normalization is enabled
+        if (self.action_space_type in ["Delta eef", "Absolute eef"] and 
+            self.action_component_indices is not None):
+            return self._normalize_action_partial(action, inverse=inverse)
+        else:
+            # Standard normalization: apply to entire action tensor
+            processed_action = self._apply_transform(action, ACTION, FeatureType.ACTION, inverse=inverse)
+            return processed_action
+    
+    def _normalize_action_partial(self, action: Tensor, inverse: bool) -> Tensor:
+        """
+        Applies partial normalization to action tensor based on component indices.
+        
+        For absolute eef pose (20D):
+        - Position (0-2, 9-11): Use MEAN_STD or MIN_MAX
+        - 6D Rotation (3-8, 12-17): Use IDENTITY (no normalization)
+        - Gripper (18-19): Use MEAN_STD or MIN_MAX
+        
+        Args:
+            action: The action tensor to process.
+            inverse: If `True`, applies unnormalization; otherwise, applies normalization.
+            
+        Returns:
+            The transformed action tensor with partial normalization applied.
+        """
+        if self.action_component_indices is None:
+            # Fallback to standard normalization
+            return self._apply_transform(action, ACTION, FeatureType.ACTION, inverse=inverse)
+        
+        # Get the base normalization mode for ACTION
+        base_norm_mode = self.norm_map.get(FeatureType.ACTION, NormalizationMode.IDENTITY)
+        
+        # Create output tensor with same shape as input
+        result = action.clone()
+        
+        # Define which components should use IDENTITY (no normalization)
+        # For absolute eef pose: 6D rotation components should not be normalized
+        rot6d_components = ["left_eef_rot6d", "right_eef_rot6d"]
+        
+        # Get stats for action if available
+        action_stats = self._tensor_stats.get(ACTION) if ACTION in self._tensor_stats else None
+        
+        # Process each component
+        for component_name, (start_idx, end_idx) in self.action_component_indices.items():
+            component = action[..., start_idx:end_idx]
+            
+            # Check if this component should use IDENTITY normalization
+            if component_name in rot6d_components:
+                # 6D rotation: use IDENTITY (no normalization)
+                normalized_component = component  # No transformation
+            else:
+                # Position or gripper: use base normalization mode
+                if action_stats is not None and base_norm_mode != NormalizationMode.IDENTITY:
+                    # Extract stats for this component
+                    component_stats = {}
+                    for stat_name, stat_tensor in action_stats.items():
+                        if stat_tensor.shape[-1] >= end_idx:
+                            component_stats[stat_name] = stat_tensor[..., start_idx:end_idx]
+                        else:
+                            # Stats don't match dimension, skip normalization for this component
+                            normalized_component = component
+                            break
+                    else:
+                        # Apply normalization using component-specific stats
+                        normalized_component = self._apply_transform_component(
+                            component, component_stats, base_norm_mode, inverse=inverse
+                        )
+                        # Assign and continue to next component
+                        result[..., start_idx:end_idx] = normalized_component
+                        continue
+                else:
+                    # No stats available or IDENTITY mode, skip normalization
+                    normalized_component = component
+            
+            # Assign normalized component back to result
+            result[..., start_idx:end_idx] = normalized_component
+        
+        return result
+    
+    def _apply_transform_component(
+        self, tensor: Tensor, stats: dict[str, Tensor], norm_mode: NormalizationMode, *, inverse: bool = False
+    ) -> Tensor:
+        """
+        Apply normalization to a component tensor with given stats and mode.
+        
+        This is a helper method for partial normalization that works on component-level stats.
+        """
+        if norm_mode == NormalizationMode.IDENTITY or not stats:
+            return tensor
+        
+        # Ensure stats are on the same device and dtype as the input tensor
+        stats = {k: v.to(device=tensor.device, dtype=tensor.dtype) for k, v in stats.items()}
+        
+        if norm_mode == NormalizationMode.MEAN_STD:
+            mean = stats.get("mean", None)
+            std = stats.get("std", None)
+            if mean is None or std is None:
+                return tensor
+            denom = std + self.eps
+            if inverse:
+                return tensor * std + mean
+            return (tensor - mean) / denom
+        
+        if norm_mode == NormalizationMode.MIN_MAX:
+            min_val = stats.get("min", None)
+            max_val = stats.get("max", None)
+            if min_val is None or max_val is None:
+                return tensor
+            denom = max_val - min_val
+            denom = torch.where(
+                denom == 0, torch.tensor(self.eps, device=tensor.device, dtype=tensor.dtype), denom
+            )
+            if inverse:
+                return (tensor + 1) / 2 * denom + min_val
+            return 2 * (tensor - min_val) / denom - 1
+        
+        if norm_mode == NormalizationMode.QUANTILES:
+            q01 = stats.get("q01", None)
+            q99 = stats.get("q99", None)
+            if q01 is None or q99 is None:
+                return tensor
+            denom = q99 - q01
+            denom = torch.where(
+                denom == 0, torch.tensor(self.eps, device=tensor.device, dtype=tensor.dtype), denom
+            )
+            if inverse:
+                return (tensor + 1.0) * denom / 2.0 + q01
+            return 2.0 * (tensor - q01) / denom - 1.0
+        
+        if norm_mode == NormalizationMode.QUANTILE10:
+            q10 = stats.get("q10", None)
+            q90 = stats.get("q90", None)
+            if q10 is None or q90 is None:
+                return tensor
+            denom = q90 - q10
+            denom = torch.where(
+                denom == 0, torch.tensor(self.eps, device=tensor.device, dtype=tensor.dtype), denom
+            )
+            if inverse:
+                return (tensor + 1.0) * denom / 2.0 + q10
+            return 2.0 * (tensor - q10) / denom - 1.0
+        
+        return tensor
 
     def _apply_transform(
         self, tensor: Tensor, key: str, feature_type: FeatureType, *, inverse: bool = False

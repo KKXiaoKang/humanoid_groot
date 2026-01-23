@@ -202,6 +202,7 @@ accelerate launch \
   --policy.use_bf16=true \
   --policy.max_state_dim=64 \
   --policy.max_action_dim=32 \
+  --policy.action_space_type="Absolute eef" \
   --policy.optimizer_lr=${SCALED_LR} \
   --policy.warmup_ratio=0.10 \
   --policy.chunk_size=32 \

@@ -120,6 +120,9 @@ class GrootConfig(PreTrainedConfig):
     
     # Real-Time Chunking (RTC) configuration
     rtc_config: RTCConfig | None = None
+    
+    # Action space type configuration (passed to action_head_cfg)
+    action_space_type: str = field(default="Absolute joint", metadata={"help": "Action space type: 'Absolute joint', 'Absolute eef', or 'Delta eef'. This will be passed to action_head_cfg."})
 
     def __post_init__(self):
         super().__post_init__()

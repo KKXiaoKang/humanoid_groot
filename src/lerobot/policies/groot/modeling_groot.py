@@ -45,7 +45,6 @@ from lerobot.policies.groot.groot_n1 import GR00TN15
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.rtc.modeling_rtc import RTCProcessor
 
-
 class ActionSelectKwargs(TypedDict, total=False):
     inference_delay: int | None
     prev_chunk_left_over: Tensor | None
@@ -96,6 +95,7 @@ class GrootPolicy(PreTrainedPolicy):
         # Handle Flash Attention compatibility issues
         self._handle_flash_attention_compatibility()
 
+        # Pass action_space_type to from_pretrained so it can be set before action_head is created
         model = GR00TN15.from_pretrained(
             pretrained_model_name_or_path=self.config.base_model_path,
             tune_llm=self.config.tune_llm,
@@ -103,6 +103,7 @@ class GrootPolicy(PreTrainedPolicy):
             tune_projector=self.config.tune_projector,
             tune_diffusion_model=self.config.tune_diffusion_model,
             rtc_processor=rtc_processor,
+            action_space_type=getattr(self.config, 'action_space_type', None),
         )
 
         model.compute_dtype = "bfloat16" if self.config.use_bf16 else model.compute_dtype

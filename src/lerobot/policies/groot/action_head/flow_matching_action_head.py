@@ -268,11 +268,47 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
     
     # Pretrained action dimension (for compatibility with pretrained models)
     pretrained_action_dim: int = field(default=None, metadata={"help": "Action dimension of pretrained model (for compatibility)"})
+    
+    # Action space type configuration
+    action_space_type: str = field(default="Absolute joint", metadata={"help": "Action space type: 'Absolute joint', 'Absolute eef', or 'Delta eef'"})
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         for key, value in kwargs.items():
             setattr(self, key, value)
+        
+        # Auto-configure dimensions based on action_space_type
+        # Note: This happens before validation, so we can set defaults based on action_space_type
+        if self.use_multi_action_heads and self.split_arm_heads:
+            # Check if dimensions were explicitly set in kwargs (not using defaults)
+            left_arm_explicit = 'action_left_arm_dim' in kwargs
+            right_arm_explicit = 'action_right_arm_dim' in kwargs
+            
+            if self.action_space_type in ["Delta eef", "Absolute eef"]:
+                # For eef action space (20D):
+                # - left_arm: 9D (3D pos + 6D rot)
+                # - right_arm: 9D (3D pos + 6D rot)
+                # - claw: 2D (left + right gripper)
+                if not left_arm_explicit:
+                    self.action_left_arm_dim = 9
+                if not right_arm_explicit:
+                    self.action_right_arm_dim = 9
+                # claw_dim is always 2 for both spaces
+                if 'action_claw_dim' not in kwargs:
+                    self.action_claw_dim = 2
+                print(f"🎯 Auto-configured for {self.action_space_type} action space:")
+                print(f"   left_arm={self.action_left_arm_dim}D, right_arm={self.action_right_arm_dim}D, claw={self.action_claw_dim}D")
+            else:
+                # For joint action space (default):
+                # - left_arm: 7D (joints)
+                # - right_arm: 7D (joints)
+                # - claw: 2D (left + right gripper)
+                if not left_arm_explicit:
+                    self.action_left_arm_dim = 7
+                if not right_arm_explicit:
+                    self.action_right_arm_dim = 7
+                if 'action_claw_dim' not in kwargs:
+                    self.action_claw_dim = 2
         
         # Validate multi-head configuration
         if self.use_multi_action_heads:
@@ -690,19 +726,21 @@ class FlowmatchingActionHead(nn.Module):
                 pred_actions = torch.cat([pred_left_arm, pred_right_arm, pred_claw], dim=-1)  # (B, T, action_dim)
                 
                 # Split ground truth velocity into corresponding parts
-                # velocity shape: (B, T, actual_action_dim=16)
-                # Structure: [left_arm(0-6, 7D), right_arm(7-13, 7D), claw(14-15, 2D)]
-                velocity_left_arm = velocity[:, :, :self.config.action_left_arm_dim]  # (B, T, 7) - indices 0-6
-                velocity_right_arm = velocity[:, :, self.config.action_left_arm_dim:self.config.action_left_arm_dim + self.config.action_right_arm_dim]  # (B, T, 7) - indices 7-13
-                velocity_claw = velocity[:, :, self.config.action_arm_dim:]  # (B, T, 2) - indices 14-15
+                # velocity shape: (B, T, actual_action_dim)
+                # Structure depends on action space:
+                #   - Joint space (16D): [left_arm(0-6, 7D), right_arm(7-13, 7D), claw(14-15, 2D)]
+                #   - EEF space (20D): [left_arm(0-8, 9D: 3D pos + 6D rot), right_arm(9-17, 9D: 3D pos + 6D rot), claw(18-19, 2D)]
+                velocity_left_arm = velocity[:, :, :self.config.action_left_arm_dim]  # (B, T, action_left_arm_dim)
+                velocity_right_arm = velocity[:, :, self.config.action_left_arm_dim:self.config.action_left_arm_dim + self.config.action_right_arm_dim]  # (B, T, action_right_arm_dim)
+                velocity_claw = velocity[:, :, self.config.action_arm_dim:]  # (B, T, action_claw_dim)
                 
                 # Compute loss for each head
                 # action_mask shape: (B, T, encoder_action_dim), extract only actual_action_dim
-                action_mask = action_input.action_mask[:, :, :self.actual_action_dim]  # (B, T, 16)
+                action_mask = action_input.action_mask[:, :, :self.actual_action_dim]  # (B, T, actual_action_dim)
                 # Split mask for left_arm, right_arm and claw (same structure as velocity)
-                action_mask_left_arm = action_mask[:, :, :self.config.action_left_arm_dim]  # (B, T, 7) - indices 0-6
-                action_mask_right_arm = action_mask[:, :, self.config.action_left_arm_dim:self.config.action_left_arm_dim + self.config.action_right_arm_dim]  # (B, T, 7) - indices 7-13
-                action_mask_claw = action_mask[:, :, self.config.action_arm_dim:]  # (B, T, 2) - indices 14-15
+                action_mask_left_arm = action_mask[:, :, :self.config.action_left_arm_dim]  # (B, T, action_left_arm_dim)
+                action_mask_right_arm = action_mask[:, :, self.config.action_left_arm_dim:self.config.action_left_arm_dim + self.config.action_right_arm_dim]  # (B, T, action_right_arm_dim)
+                action_mask_claw = action_mask[:, :, self.config.action_arm_dim:]  # (B, T, action_claw_dim)
                 
                 loss_left_arm = F.mse_loss(pred_left_arm, velocity_left_arm, reduction="none") * action_mask_left_arm
                 loss_right_arm = F.mse_loss(pred_right_arm, velocity_right_arm, reduction="none") * action_mask_right_arm
