@@ -279,43 +279,58 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
         
         # Auto-configure dimensions based on action_space_type
         # Note: This happens before validation, so we can set defaults based on action_space_type
-        if self.use_multi_action_heads and self.split_arm_heads:
-            # Check if dimensions were explicitly set in kwargs (not using defaults)
-            left_arm_explicit = 'action_left_arm_dim' in kwargs
-            right_arm_explicit = 'action_right_arm_dim' in kwargs
-            arm_dim_explicit = 'action_arm_dim' in kwargs
-            
-            if self.action_space_type in ["Delta eef", "Absolute eef"]:
-                # For eef action space (20D):
-                # - left_arm: 9D (3D pos + 6D rot)
-                # - right_arm: 9D (3D pos + 6D rot)
-                # - claw: 2D (left + right gripper)
-                if not left_arm_explicit:
-                    self.action_left_arm_dim = 9
-                if not right_arm_explicit:
-                    self.action_right_arm_dim = 9
-                # claw_dim is always 2 for both spaces
-                if 'action_claw_dim' not in kwargs:
-                    self.action_claw_dim = 2
-                # Update action_arm_dim to match left + right (important for validation)
-                if not arm_dim_explicit:
-                    self.action_arm_dim = self.action_left_arm_dim + self.action_right_arm_dim
+        # First, set arm dimensions based on action_space_type (regardless of multi-head configuration)
+        # This ensures dimensions are correct even if multi-head is enabled later
+        left_arm_explicit = 'action_left_arm_dim' in kwargs
+        right_arm_explicit = 'action_right_arm_dim' in kwargs
+        arm_dim_explicit = 'action_arm_dim' in kwargs
+        
+        if self.action_space_type in ["Delta eef", "Absolute eef"]:
+            # For eef action space (20D):
+            # - left_arm: 9D (3D pos + 6D rot)
+            # - right_arm: 9D (3D pos + 6D rot)
+            # - claw: 2D (left + right gripper)
+            if not left_arm_explicit:
+                self.action_left_arm_dim = 9
+            if not right_arm_explicit:
+                self.action_right_arm_dim = 9
+            # claw_dim is always 2 for both spaces
+            if 'action_claw_dim' not in kwargs:
+                self.action_claw_dim = 2
+            # Update action_arm_dim to match left + right (important for validation)
+            if not arm_dim_explicit:
+                self.action_arm_dim = self.action_left_arm_dim + self.action_right_arm_dim
+            print(f"🎯 Auto-configured for {self.action_space_type} action space:")
+            print(f"   left_arm={self.action_left_arm_dim}D, right_arm={self.action_right_arm_dim}D, claw={self.action_claw_dim}D")
+        elif self.action_space_type == "Absolute joint":
+            # For joint action space (default):
+            # - left_arm: 7D (joints)
+            # - right_arm: 7D (joints)
+            # - claw: 2D (left + right gripper)
+            if not left_arm_explicit:
+                self.action_left_arm_dim = 7
+            if not right_arm_explicit:
+                self.action_right_arm_dim = 7
+            if 'action_claw_dim' not in kwargs:
+                self.action_claw_dim = 2
+            # Update action_arm_dim to match left + right (important for validation)
+            if not arm_dim_explicit:
+                self.action_arm_dim = self.action_left_arm_dim + self.action_right_arm_dim
+            # Only print if using multi-head to avoid duplicate messages
+            if self.use_multi_action_heads and self.split_arm_heads:
                 print(f"🎯 Auto-configured for {self.action_space_type} action space:")
                 print(f"   left_arm={self.action_left_arm_dim}D, right_arm={self.action_right_arm_dim}D, claw={self.action_claw_dim}D")
-            else:
-                # For joint action space (default):
-                # - left_arm: 7D (joints)
-                # - right_arm: 7D (joints)
-                # - claw: 2D (left + right gripper)
-                if not left_arm_explicit:
-                    self.action_left_arm_dim = 7
-                if not right_arm_explicit:
-                    self.action_right_arm_dim = 7
-                if 'action_claw_dim' not in kwargs:
-                    self.action_claw_dim = 2
-                # Update action_arm_dim to match left + right (important for validation)
-                if not arm_dim_explicit:
-                    self.action_arm_dim = self.action_left_arm_dim + self.action_right_arm_dim
+        
+        # Auto-update action_dim based on action_space_type (even if not using multi-head)
+        # This ensures action_dim is correctly set regardless of multi-head configuration
+        if 'action_dim' not in kwargs:
+            if self.action_space_type in ["Delta eef", "Absolute eef"]:
+                # EEF action space: 20D (9+9+2)
+                self.action_dim = 20
+            elif self.action_space_type == "Absolute joint":
+                # Joint action space: 16D (7+7+2)
+                self.action_dim = 16
+            # If action_space_type is not set or is other value, keep config.action_dim (may be None)
         
         # Validate multi-head configuration
         if self.use_multi_action_heads:
@@ -332,15 +347,21 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
             else:
                 expected_action_dim = self.action_arm_dim + self.action_claw_dim
             
-            if self.action_dim is not None and self.action_dim != expected_action_dim:
-                # If pretrained_action_dim is set, allow mismatch (we'll pad/truncate)
-                if self.pretrained_action_dim is None:
+            # Auto-update action_dim to match expected_action_dim based on action_space_type
+            # This ensures actual_action_dim in FlowmatchingActionHead uses the correct dimension
+            if 'action_dim' not in kwargs or self.action_dim != expected_action_dim:
+                # Only update if not explicitly set or if it doesn't match
+                if 'action_dim' not in kwargs:
+                    # Not explicitly set, auto-update based on action_space_type
+                    self.action_dim = expected_action_dim
+                elif self.pretrained_action_dim is None:
+                    # Explicitly set but doesn't match, and no pretrained_action_dim -> error
                     raise ValueError(
                         f"When using multi-action heads, action_dim ({self.action_dim}) must equal "
                         f"{'left_arm + right_arm + claw' if self.split_arm_heads else 'arm + claw'} = {expected_action_dim}"
                     )
-                # If pretrained_action_dim is set, use it for action_encoder
-                if self.pretrained_action_dim != expected_action_dim:
+                # If pretrained_action_dim is set, allow mismatch (we'll pad/truncate)
+                if self.pretrained_action_dim is not None and self.pretrained_action_dim != expected_action_dim:
                     print(f"⚠️  Pretrained model uses {self.pretrained_action_dim}D, but data uses {expected_action_dim}D. "
                           f"Will pad/truncate actions for compatibility.")
 
@@ -367,7 +388,27 @@ class FlowmatchingActionHead(nn.Module):
         # Otherwise use action_dim
         encoder_action_dim = config.pretrained_action_dim if config.pretrained_action_dim is not None else config.action_dim
         self.encoder_action_dim = encoder_action_dim
-        self.actual_action_dim = config.action_dim  # Actual action dimension from data
+        
+        # Calculate actual_action_dim based on action_space_type
+        # This ensures it matches the actual data dimension (20D for eef, 16D for joint)
+        # Priority: action_space_type > multi-head configuration > config.action_dim
+        if config.action_space_type in ["Delta eef", "Absolute eef"]:
+            # EEF action space: 20D (9+9+2)
+            actual_action_dim = 20
+        elif config.action_space_type == "Absolute joint":
+            # Joint action space: 16D (7+7+2)
+            actual_action_dim = 16
+        elif config.use_multi_action_heads:
+            # Fallback to multi-head configuration if action_space_type is not set
+            if config.split_arm_heads:
+                actual_action_dim = config.action_left_arm_dim + config.action_right_arm_dim + config.action_claw_dim
+            else:
+                actual_action_dim = config.action_arm_dim + config.action_claw_dim
+        else:
+            # Final fallback: use config.action_dim
+            actual_action_dim = config.action_dim
+        
+        self.actual_action_dim = actual_action_dim  # Actual action dimension from data
 
         self.state_encoder = CategorySpecificMLP(
             num_categories=config.max_num_embodiments,
@@ -666,6 +707,10 @@ class FlowmatchingActionHead(nn.Module):
         
         # For velocity, extract only the actual action dimensions (first actual_action_dim)
         # This matches the original data dimension before padding
+        # actual_action_dim is correctly configured based on action_space_type:
+        #   - Joint space: 16D (7+7+2)
+        #   - EEF space: 20D (9+9+2)
+        # We directly use actual_action_dim without inferring from action_mask to ensure correctness
         velocity = actions[:, :, :self.actual_action_dim] - noise[:, :, :self.actual_action_dim]
 
         # Convert (continuous) t -> discrete if needed
