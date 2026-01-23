@@ -283,6 +283,7 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
             # Check if dimensions were explicitly set in kwargs (not using defaults)
             left_arm_explicit = 'action_left_arm_dim' in kwargs
             right_arm_explicit = 'action_right_arm_dim' in kwargs
+            arm_dim_explicit = 'action_arm_dim' in kwargs
             
             if self.action_space_type in ["Delta eef", "Absolute eef"]:
                 # For eef action space (20D):
@@ -296,6 +297,9 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
                 # claw_dim is always 2 for both spaces
                 if 'action_claw_dim' not in kwargs:
                     self.action_claw_dim = 2
+                # Update action_arm_dim to match left + right (important for validation)
+                if not arm_dim_explicit:
+                    self.action_arm_dim = self.action_left_arm_dim + self.action_right_arm_dim
                 print(f"🎯 Auto-configured for {self.action_space_type} action space:")
                 print(f"   left_arm={self.action_left_arm_dim}D, right_arm={self.action_right_arm_dim}D, claw={self.action_claw_dim}D")
             else:
@@ -309,6 +313,9 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
                     self.action_right_arm_dim = 7
                 if 'action_claw_dim' not in kwargs:
                     self.action_claw_dim = 2
+                # Update action_arm_dim to match left + right (important for validation)
+                if not arm_dim_explicit:
+                    self.action_arm_dim = self.action_left_arm_dim + self.action_right_arm_dim
         
         # Validate multi-head configuration
         if self.use_multi_action_heads:
