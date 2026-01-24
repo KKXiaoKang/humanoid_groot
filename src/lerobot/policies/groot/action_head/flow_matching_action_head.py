@@ -78,31 +78,64 @@ class SharedBottomArmDecoder(nn.Module):
     
     真正的价值在于启用交叉注意力（use_cross_attention=True），
     让左右手特征能够相互关注，这是"合成一个MLP"无法实现的。
+    
+    重要：对于EEF space（9D = 3D pos + 6D rot），只对position部分做cross-attention，
+    避免破坏6D旋转的几何约束（正交性、归一化）。
     """
     def __init__(self, num_categories, input_dim, hidden_dim, left_output_dim, right_output_dim, use_cross_attention=False):
         super().__init__()
         self.num_categories = num_categories
         self.use_cross_attention = use_cross_attention
+        self.left_output_dim = left_output_dim
+        self.right_output_dim = right_output_dim
+        
+        # 检查是否是EEF space（9D = 3D pos + 6D rot）
+        self.is_eef_space = (left_output_dim == 9 and right_output_dim == 9)
+        if self.is_eef_space:
+            self.pos_dim = 3
+            self.rot_dim = 6
+        else:
+            self.pos_dim = None
+            self.rot_dim = None
         
         # 共享的底层特征提取层
         # 注意：如果只是共享底层，确实和"合成一个MLP然后split"类似
         # 但输出层分离允许分别控制损失权重和学习不同的映射
         self.shared_layer = CategorySpecificLinear(num_categories, input_dim, hidden_dim)
         
-        # 左右手各自的输出层
-        # 这是和"合成一个MLP"的主要区别：输出层分离
-        self.left_output_layer = CategorySpecificLinear(num_categories, hidden_dim, left_output_dim)
-        self.right_output_layer = CategorySpecificLinear(num_categories, hidden_dim, right_output_dim)
+        if self.is_eef_space and use_cross_attention:
+            # 对于EEF space，分离position和rotation的输出层
+            # Position部分：可以做cross-attention（协调左右手位置）
+            self.left_pos_output_layer = CategorySpecificLinear(num_categories, hidden_dim, self.pos_dim)
+            self.right_pos_output_layer = CategorySpecificLinear(num_categories, hidden_dim, self.pos_dim)
+            # Rotation部分：独立处理，不做cross-attention（保持几何约束）
+            self.left_rot_output_layer = CategorySpecificLinear(num_categories, hidden_dim, self.rot_dim)
+            self.right_rot_output_layer = CategorySpecificLinear(num_categories, hidden_dim, self.rot_dim)
+            self.left_output_layer = None
+            self.right_output_layer = None
+        else:
+            # 非EEF space或未启用cross-attention：使用原始输出层
+            self.left_output_layer = CategorySpecificLinear(num_categories, hidden_dim, left_output_dim)
+            self.right_output_layer = CategorySpecificLinear(num_categories, hidden_dim, right_output_dim)
+            self.left_pos_output_layer = None
+            self.right_pos_output_layer = None
+            self.left_rot_output_layer = None
+            self.right_rot_output_layer = None
         
         # 交叉注意力机制：这是真正的价值所在
         # 让左右手特征能够相互关注，这是"合成一个MLP"无法实现的
         if use_cross_attention:
             # 简单的交叉注意力：左右手特征相互关注
+            # 注意：对于EEF space，只对position部分做cross-attention
             self.cross_attn_left = nn.MultiheadAttention(hidden_dim, num_heads=4, batch_first=True)
             self.cross_attn_right = nn.MultiheadAttention(hidden_dim, num_heads=4, batch_first=True)
             self.layer_norm_left = nn.LayerNorm(hidden_dim)
             self.layer_norm_right = nn.LayerNorm(hidden_dim)
-            print(f"   ✅ Cross-attention enabled: left↔right arm features can attend to each other")
+            if self.is_eef_space:
+                print(f"   ✅ Cross-attention enabled (EEF space): position only, rotation independent")
+                print(f"      This preserves 6D rotation geometric constraints (orthonormality)")
+            else:
+                print(f"   ✅ Cross-attention enabled: left↔right arm features can attend to each other")
         else:
             print(f"   ⚠️  Cross-attention disabled: This is similar to 'single MLP then split'")
             print(f"      Main difference: separate output layers allow different loss weights")
@@ -111,36 +144,63 @@ class SharedBottomArmDecoder(nn.Module):
         """
         x: (B, T, input_dim)
         cat_ids: (B,)
-        returns: (left_features, right_features) 或 (left_output, right_output)
+        returns: (left_output, right_output)
         """
         # 共享底层特征提取
         shared_features = F.relu(self.shared_layer(x, cat_ids))  # (B, T, hidden_dim)
         
         if self.use_cross_attention:
-            # 交叉注意力：左右手特征相互关注
-            # 这是真正的价值：让左右手能够感知对方的状态
-            # 这是"合成一个MLP然后split"无法实现的
-            # 使用对称的交叉注意力，确保信息交换的一致性
-            left_features = self.layer_norm_left(shared_features)
-            right_features = self.layer_norm_right(shared_features)
-            
-            # 对称的交叉注意力：同时计算，避免信息不对称
-            # 左手的query关注右手的key/value（使用原始right_features）
-            left_attended, _ = self.cross_attn_left(
-                left_features, right_features, right_features
-            )
-            # 右手的query关注左手的key/value（使用原始left_features）
-            right_attended, _ = self.cross_attn_right(
-                right_features, left_features, left_features
-            )
-            
-            # 残差连接：保持原始特征，只添加注意力信息
-            left_features = left_features + left_attended
-            right_features = right_features + right_attended
-            
-            # 输出层
-            left_output = self.left_output_layer(left_features, cat_ids)
-            right_output = self.right_output_layer(right_features, cat_ids)
+            if self.is_eef_space:
+                # EEF space: 分离position和rotation处理
+                # 1. Position部分：做cross-attention（协调左右手位置）
+                left_features = self.layer_norm_left(shared_features)
+                right_features = self.layer_norm_right(shared_features)
+                
+                # 对称的交叉注意力：只对position特征做cross-attention
+                left_attended, _ = self.cross_attn_left(
+                    left_features, right_features, right_features
+                )
+                right_attended, _ = self.cross_attn_right(
+                    right_features, left_features, left_features
+                )
+                
+                # 残差连接：保持原始特征，只添加注意力信息
+                left_pos_features = left_features + left_attended
+                right_pos_features = right_features + right_attended
+                
+                # 2. Rotation部分：独立处理，不做cross-attention（保持几何约束）
+                left_rot_features = shared_features  # 使用原始特征，不做cross-attention
+                right_rot_features = shared_features
+                
+                # 3. 分别输出position和rotation
+                left_pos = self.left_pos_output_layer(left_pos_features, cat_ids)  # (B, T, 3)
+                right_pos = self.right_pos_output_layer(right_pos_features, cat_ids)  # (B, T, 3)
+                left_rot = self.left_rot_output_layer(left_rot_features, cat_ids)  # (B, T, 6)
+                right_rot = self.right_rot_output_layer(right_rot_features, cat_ids)  # (B, T, 6)
+                
+                # 4. 合并为9D输出 [pos(3D) + rot(6D)]
+                left_output = torch.cat([left_pos, left_rot], dim=-1)  # (B, T, 9)
+                right_output = torch.cat([right_pos, right_rot], dim=-1)  # (B, T, 9)
+            else:
+                # 非EEF space: 对整个输出做cross-attention（原始行为）
+                left_features = self.layer_norm_left(shared_features)
+                right_features = self.layer_norm_right(shared_features)
+                
+                # 对称的交叉注意力：同时计算，避免信息不对称
+                left_attended, _ = self.cross_attn_left(
+                    left_features, right_features, right_features
+                )
+                right_attended, _ = self.cross_attn_right(
+                    right_features, left_features, left_features
+                )
+                
+                # 残差连接：保持原始特征，只添加注意力信息
+                left_features = left_features + left_attended
+                right_features = right_features + right_attended
+                
+                # 输出层
+                left_output = self.left_output_layer(left_features, cat_ids)
+                right_output = self.right_output_layer(right_features, cat_ids)
         else:
             # 不使用交叉注意力，直接输出
             # 注意：这种情况下，确实和"合成一个MLP然后split"类似
