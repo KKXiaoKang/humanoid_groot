@@ -74,11 +74,13 @@ except ImportError:
 # ROS 和机器人 SDK（仅在需要时导入，用于 MuJoCo 可视化）
 try:
     import rospy
-    from kuavo_humanoid_sdk.kuavo_strategy_pytree.common.robot_sdk import RobotSDK
-    from kuavo_humanoid_sdk.msg.kuavo_msgs.srv import (changeArmCtrlMode, changeArmCtrlModeRequest)
+    from sensor_msgs.msg import JointState
+    # from kuavo_humanoid_sdk.kuavo_strategy_pytree.common.robot_sdk import RobotSDK
+    # from kuavo_humanoid_sdk.msg.kuavo_msgs.srv import (changeArmCtrlMode, changeArmCtrlModeRequest)
     ROS_AVAILABLE = True
 except ImportError:
     ROS_AVAILABLE = False
+    JointState = None
     print("⚠️  Warning: ROS dependencies not available. MuJoCo visualization with robot control will be disabled.")
 
 def direct_to_wbc(control_mode):
@@ -229,6 +231,41 @@ def convert_eef_action_to_joint_action(eef_action: np.ndarray, model_type: str =
     return joint_action
 
 
+def publish_arm_joints_to_ros(arm_joints: np.ndarray, publisher: rospy.Publisher):
+    """
+    发布手臂关节角到ROS话题 /kuavo_arm_traj
+    
+    Args:
+        arm_joints: 手臂关节角度 (14维) [left_arm(7D) + right_arm(7D)]，单位：弧度
+        publisher: ROS Publisher对象，用于发布JointState消息
+    """
+    if not ROS_AVAILABLE:
+        print("⚠️  Warning: ROS not available, cannot publish arm joints")
+        return
+    
+    if publisher is None:
+        print("⚠️  Warning: Publisher is None, cannot publish arm joints")
+        return
+    
+    # 创建JointState消息
+    msg = JointState()
+    msg.header.stamp = rospy.Time.now()
+    msg.name = [
+        "zarm_l1_joint", "zarm_l2_joint", "zarm_l3_joint", "zarm_l4_joint", 
+        "zarm_l5_joint", "zarm_l6_joint", "zarm_l7_joint",
+        # 左手七个关节
+        "zarm_r1_joint", "zarm_r2_joint", "zarm_r3_joint", "zarm_r4_joint", 
+        "zarm_r5_joint", "zarm_r6_joint", "zarm_r7_joint",
+        # 右手七个关节
+    ]
+    
+    # 将弧度转换为角度（ROS消息需要角度）
+    msg.position = np.rad2deg(arm_joints.tolist())
+    
+    # 发布消息
+    publisher.publish(msg)
+
+
 def resample_action_chunk(action_chunk: np.ndarray,
                           source_dt: float = MODEL_ACTION_DT,
                           target_dt: float = TARGET_CONTROL_DT) -> np.ndarray:
@@ -339,7 +376,9 @@ def eval_on_dataset(ckpt_path,
                     state_zero=False,
                     cam_head_zero=False,
                     infer_per_frame: int = 1,
-                    task_description: str | None = None):
+                    task_description: str | None = None,
+                    publish_arm_commands: bool = False,
+                    ik_model_type: str = '60'):
     """
     在数据集上评估模型
     
@@ -354,6 +393,8 @@ def eval_on_dataset(ckpt_path,
         state_zero: 是否将状态输入置零（用于验证模型对状态的依赖性）
         infer_per_frame: 每隔多少个frame重新推理一次（>=1）。
         task_description: 任务描述字符串（language instruction），如果提供则覆盖数据集中的task，否则使用数据集原本的task。
+        publish_arm_commands: 是否将模型输出的EEF动作转换为关节角并发布到ROS话题 /kuavo_arm_traj
+        ik_model_type: IK求解使用的机器人型号 ('45', '46', '60')
     """
     # ----------- 一些参数 ----------------
     mse_per_action_dim = OrderedDict() # 记录每个动作维度的MSE
@@ -460,6 +501,34 @@ def eval_on_dataset(ckpt_path,
     policy.reset()
     print("✅ Model loaded and ready")
     
+    # 初始化ROS publisher（如果启用发布手臂命令功能）
+    arm_joint_publisher = None
+    if publish_arm_commands:
+        if not ROS_AVAILABLE:
+            print("⚠️  Warning: ROS not available. Cannot publish arm commands. Disabling publish_arm_commands.")
+            publish_arm_commands = False
+        else:
+            try:
+                # 初始化ROS节点（如果尚未初始化）
+                try:
+                    rospy.init_node('eval_on_dataset_arm_publisher', anonymous=True)
+                except rospy.exceptions.ROSException:
+                    # ROS节点已经初始化，继续执行
+                    pass
+                
+                # 创建publisher
+                arm_joint_publisher = rospy.Publisher('/kuavo_arm_traj', JointState, queue_size=10)
+                # 等待publisher连接（给一些时间让subscriber连接）
+                rospy.sleep(0.5)
+                print(f"✅ ROS arm joint publisher initialized: /kuavo_arm_traj")
+                print(f"   IK model type: {ik_model_type}")
+                print(f"   ⚠️  Note: This feature only works with 20D EEF action space")
+            except Exception as e:
+                print(f"⚠️  Warning: Failed to initialize ROS publisher: {e}")
+                print(f"   Disabling publish_arm_commands.")
+                publish_arm_commands = False
+                arm_joint_publisher = None
+    
     previous_resampled_action = None
     last_inferred_chunk: np.ndarray | None = None
     last_resampled_chunk: np.ndarray | None = None
@@ -541,6 +610,17 @@ def eval_on_dataset(ckpt_path,
         print(f"✅ Detected EEF action space (20D):")
         print(f"   - Arm dimensions: {arm_dims} (left_arm 0-8 + right_arm 9-17)")
         print(f"   - Claw dimensions: {claw_dims}")
+        
+        # 检查publish_arm_commands是否启用
+        if publish_arm_commands:
+            print(f"   ✅ publish_arm_commands enabled: Will convert EEF to joint space and publish to ROS")
+    elif publish_arm_commands:
+        # 如果启用了publish_arm_commands但action_dim不是20，给出警告
+        print(f"⚠️  Warning: publish_arm_commands is enabled but action_dim={action_dim} (not 20D EEF space)")
+        print(f"   publish_arm_commands only works with 20D EEF action space. Disabling publish_arm_commands.")
+        publish_arm_commands = False
+        if arm_joint_publisher is not None:
+            arm_joint_publisher = None
     elif action_dim == 16:
         # Joint action space (16D)
         arm_dims = slice(0, 14)  # arm joints (14)
@@ -568,71 +648,71 @@ def eval_on_dataset(ckpt_path,
         drop_last=False,
     )
     
-    # 初始化环境（如果需要在mujoco中可视化）
-    if visualize_in_mujoco:
-        # 首先初始化机器人控制（参考 eval_depalletize_camera.py）
-        if ROS_AVAILABLE:
-            print(f"\n🤖 Initializing robot control...")
-            try:
-                # 初始化 ROS 节点（如果尚未初始化）
-                try:
-                    rospy.init_node('eval_on_dataset_robot_control', anonymous=True)
-                except rospy.exceptions.ROSException:
-                    # ROS 节点已经初始化，继续执行
-                    pass
+    # # 初始化环境（如果需要在mujoco中可视化）
+    # if visualize_in_mujoco:
+    #     # 首先初始化机器人控制（参考 eval_depalletize_camera.py）
+    #     if ROS_AVAILABLE:
+    #         print(f"\n🤖 Initializing robot control...")
+    #         try:
+    #             # 初始化 ROS 节点（如果尚未初始化）
+    #             try:
+    #                 rospy.init_node('eval_on_dataset_robot_control', anonymous=True)
+    #             except rospy.exceptions.ROSException:
+    #                 # ROS 节点已经初始化，继续执行
+    #                 pass
                 
-                # 初始化机器人 SDK 并设置头部和控制模式
-                robot_sdk = RobotSDK()
-                robot_sdk.control.control_head(0, np.deg2rad(10))
-                robot_sdk.control.set_external_control_arm_mode()  # 切换手臂到外部控制模式
-                print(f"✅ Robot SDK initialized")
-                print(f"   - 机器人头部俯仰调节角度: 10 成功")
-                print(f"   - 切换手臂到外部控制模式成功")
+    #             # 初始化机器人 SDK 并设置头部和控制模式
+    #             robot_sdk = RobotSDK()
+    #             robot_sdk.control.control_head(0, np.deg2rad(10))
+    #             robot_sdk.control.set_external_control_arm_mode()  # 切换手臂到外部控制模式
+    #             print(f"✅ Robot SDK initialized")
+    #             print(f"   - 机器人头部俯仰调节角度: 10 成功")
+    #             print(f"   - 切换手臂到外部控制模式成功")
                 
-                # 切换到 WBC 轨迹控制模式
-                direct_to_wbc(1)
-                input(f"direct_to_wbc 结束, 按回车继续 ==== 切换手臂到wbc轨迹控制模式成功 ==== \n")
-                time.sleep(1.0)
-            except Exception as e:
-                print(f"⚠️  Warning: Failed to initialize robot control: {e}")
-                print(f"   Continuing with MuJoCo environment initialization...")
-        else:
-            print(f"⚠️  Warning: ROS not available, skipping robot control initialization")
+    #             # 切换到 WBC 轨迹控制模式
+    #             direct_to_wbc(1)
+    #             input(f"direct_to_wbc 结束, 按回车继续 ==== 切换手臂到wbc轨迹控制模式成功 ==== \n")
+    #             time.sleep(1.0)
+    #         except Exception as e:
+    #             print(f"⚠️  Warning: Failed to initialize robot control: {e}")
+    #             print(f"   Continuing with MuJoCo environment initialization...")
+    #     else:
+    #         print(f"⚠️  Warning: ROS not available, skipping robot control initialization")
         
-        print(f"\n🤖 Initializing MuJoCo environment...")
-        # 根据action维度判断使用哪个环境
-        # 16维动作 = depalletize任务（joint space），使用kuavo_depalletize_env
-        # 20维动作 = depalletize任务（eef space），使用kuavo_depalletize_env（需要IK转换）
-        # 其他维度 = com控制任务，使用kuavo_com_env
-        if action_dim == 16:
-            from robot_envs.kuavo_depalletize_env import GrabBoxMpcEnv
-            mujoco_env = GrabBoxMpcEnv()
-            print(f"✅ MuJoCo environment initialized (depalletize task - joint space)")
-            print(f"   - Action dimension: 16 (14 arm joints + 2 claw positions)")
-        elif action_dim == 20:
-            from robot_envs.kuavo_depalletize_env import GrabBoxMpcEnv
-            mujoco_env = GrabBoxMpcEnv()
-            print(f"✅ MuJoCo environment initialized (depalletize task - eef space)")
-            print(f"   - Action dimension: 20 (left_eef 9D + right_eef 9D + claw 2D)")
-            print(f"   ⚠️  Note: EEF actions will need IK conversion to joint space for execution")
-            # Import IK for eef->joint conversion
-            try:
-                from kuavo_ik.ik_library import IKAnalytical
-                IK_AVAILABLE = True
-            except ImportError:
-                print(f"   ⚠️  Warning: IKAnalytical not available. Cannot convert EEF to joint space.")
-                IK_AVAILABLE = False
-        else:
-            try:
-                from robot_envs.kuavo_com_env import GrabBoxMpcEnv
-                # GrootPolicy uses absolute actions by default
-                mujoco_env = GrabBoxMpcEnv(use_action_history_reference=False)
-                print(f"✅ MuJoCo environment initialized (com control task)")
-                print(f"   - use_action_history_reference: False (absolute actions)")
-            except ImportError:
-                print("⚠️  Warning: robot_envs.kuavo_com_env not available. MuJoCo visualization disabled.")
-                visualize_in_mujoco = False
-                mujoco_env = None
+    print(f"\n🤖 Initializing MuJoCo environment...")
+    # 根据action维度判断使用哪个环境
+    # 16维动作 = depalletize任务（joint space），使用kuavo_depalletize_env
+    # 20维动作 = depalletize任务（eef space），使用kuavo_depalletize_env（需要IK转换）
+    # 其他维度 = com控制任务，使用kuavo_com_env
+    if action_dim == 16:
+        from robot_envs.kuavo_depalletize_env import GrabBoxMpcEnv
+        mujoco_env = GrabBoxMpcEnv()
+        print(f"✅ MuJoCo environment initialized (depalletize task - joint space)")
+        print(f"   - Action dimension: 16 (14 arm joints + 2 claw positions)")
+    elif action_dim == 20:
+        from robot_envs.kuavo_depalletize_env import GrabBoxMpcEnv
+        mujoco_env = GrabBoxMpcEnv()
+        print(f"✅ MuJoCo environment initialized (depalletize task - eef space)")
+        print(f"   - Action dimension: 20 (left_eef 9D + right_eef 9D + claw 2D)")
+        print(f"   ⚠️  Note: EEF actions will need IK conversion to joint space for execution")
+        # Import IK for eef->joint conversion
+        try:
+            from kuavo_ik.ik_library import IKAnalytical
+            IK_AVAILABLE = True
+        except ImportError:
+            print(f"   ⚠️  Warning: IKAnalytical not available. Cannot convert EEF to joint space.")
+            IK_AVAILABLE = False
+    else:
+        try:
+            from robot_envs.kuavo_com_env import GrabBoxMpcEnv
+            # GrootPolicy uses absolute actions by default
+            mujoco_env = GrabBoxMpcEnv(use_action_history_reference=False)
+            print(f"✅ MuJoCo environment initialized (com control task)")
+            print(f"   - use_action_history_reference: False (absolute actions)")
+        except ImportError:
+            print("⚠️  Warning: robot_envs.kuavo_com_env not available. MuJoCo visualization disabled.")
+            visualize_in_mujoco = False
+            mujoco_env = None
     
     # ========= 可视化数据集里的groundtruth (如果启用RerunVisualizer) =========
     if vizer is not None:
@@ -922,6 +1002,19 @@ def eval_on_dataset(ckpt_path,
             previous_resampled_action = lowpass_chunk[-1].copy()
     
         inference_time = time.time() - tic
+        
+        # 如果启用发布手臂命令功能，且是20D EEF space，进行IK转换并发布
+        if publish_arm_commands and action_dim == 20 and arm_joint_publisher is not None:
+            try:
+                # 将EEF action转换为joint action
+                joint_action = convert_eef_action_to_joint_action(pred_action_single, model_type=ik_model_type)
+                # 提取手臂关节角（前14维）
+                arm_joints = joint_action[:14]  # (14,) - left_arm(7D) + right_arm(7D)
+                # 发布到ROS
+                publish_arm_joints_to_ros(arm_joints, arm_joint_publisher)
+            except Exception as e:
+                if data_step % 10 == 0:  # 每10帧打印一次错误，避免刷屏
+                    print(f"⚠️  Warning: Failed to publish arm joints at frame {data_step}: {e}")
         
         # 保存预测和真实值
         predictions.append(pred_action_single)
@@ -1293,6 +1386,11 @@ if __name__ == "__main__":
                        help='Run policy inference every N frames (default: 1 = every frame)')
     parser.add_argument('--task-description', type=str, default=None,
                        help='Task description (language instruction) to override the task from dataset. If not provided, will use the task from dataset.')
+    parser.add_argument('--publish-arm-commands', action='store_true',
+                       help='Publish arm joint commands to ROS topic /kuavo_arm_traj. Requires 20D EEF action space and ROS available.')
+    parser.add_argument('--ik-model-type', type=str, default='60',
+                       choices=['45', '46', '60'],
+                       help='Robot model type for IK solving (default: 60). Used when --publish-arm-commands is enabled.')
 
     args = parser.parse_args()
     
@@ -1312,6 +1410,9 @@ if __name__ == "__main__":
         print(f"Task Description (overridden): '{args.task_description}'")
     else:
         print(f"Task Description: Will use task from dataset")
+    print(f"Publish Arm Commands: {args.publish_arm_commands}")
+    if args.publish_arm_commands:
+        print(f"IK Model Type: {args.ik_model_type}")
     print("="*80)
     
     eval_on_dataset(
@@ -1325,5 +1426,7 @@ if __name__ == "__main__":
         state_zero=args.state_zero,
         cam_head_zero=args.cam_head_zero,
         infer_per_frame=args.infer_per_frame,
-        task_description=args.task_description
+        task_description=args.task_description,
+        publish_arm_commands=args.publish_arm_commands,
+        ik_model_type=args.ik_model_type
     )
