@@ -213,9 +213,34 @@ def make_pre_post_processors(
             # Need to override both stats AND normalize_min_max since saved config might be empty
             preprocessor_overrides = {}
             postprocessor_overrides = {}
+            
+            # Get action space type from config (for partial normalization)
+            action_space_type = getattr(policy_cfg, 'action_space_type', "Absolute joint")
+            
+            # Setup partial normalization for eef action spaces
+            action_component_indices = None
+            if action_space_type in ["Delta eef", "Absolute eef"]:
+                # For absolute eef pose (20D):
+                # - 3维左手 eef position (x, y, z) -> indices 0-2
+                # - 6维左手 eef 6D 旋转表示 [R11, R21, R31, R12, R22, R32] -> indices 3-8
+                # - 3维右手 eef position (x, y, z) -> indices 9-11
+                # - 6维右手 eef 6D 旋转表示 [R11, R21, R31, R12, R22, R32] -> indices 12-17
+                # - 1维左夹爪开合程度 -> indices 18
+                # - 1维右夹爪开合程度 -> indices 19
+                action_component_indices = {
+                    "left_eef_pos": (0, 3),
+                    "left_eef_rot6d": (3, 9),
+                    "right_eef_pos": (9, 12),
+                    "right_eef_rot6d": (12, 18),
+                    "left_gripper": (18, 19),
+                    "right_gripper": (19, 20),
+                }
+            
             preprocessor_overrides["groot_pack_inputs_v3"] = {
                 "stats": kwargs.get("dataset_stats"),
                 "normalize_min_max": True,
+                "action_space_type": action_space_type,
+                "action_component_indices": action_component_indices,
             }
 
             # Also ensure postprocessing slices to env action dim and unnormalizes with dataset stats
@@ -224,6 +249,8 @@ def make_pre_post_processors(
                 "stats": kwargs.get("dataset_stats"),
                 "normalize_min_max": True,
                 "env_action_dim": env_action_dim,
+                "action_space_type": action_space_type,
+                "action_component_indices": action_component_indices,
             }
             kwargs["preprocessor_overrides"] = preprocessor_overrides
             kwargs["postprocessor_overrides"] = postprocessor_overrides

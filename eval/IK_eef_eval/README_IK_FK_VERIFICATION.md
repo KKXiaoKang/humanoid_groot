@@ -17,13 +17,13 @@
 ## 使用方法
 
 ```bash
-python eval/IK_eef_eval/verify_ik_fk_consistency.py \
+ python verify_ik_fk_consistency.py \
     --dataset-path /home/lab/humanoid_groot/lerobot_data/v3_0_dataset/0122_4322_eef_test \
     --episode-idx 0 \
     --urdf-path /home/lab/kuavo-manip/lerobot_datasets/utils/biped_s60_only_arm.urdf \
     --model-type 60 \
     --robot-version 5_wheel \
-    --output-dir ./ik_fk_verification_results
+    --output-dir ./ik_fk_verification_results --interactive
 ```
 
 ## 参数说明

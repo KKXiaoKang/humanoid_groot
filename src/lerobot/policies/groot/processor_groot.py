@@ -710,6 +710,10 @@ class GrootActionUnpackUnnormalizeStep(ProcessorStep):
                 safe_denom = torch.where(mask, denom, torch.ones_like(denom))
                 inv = (action + 1.0) * 0.5 * safe_denom + min_v
                 action = torch.where(mask, inv, min_v)
+        
+        # Update transition with processed action and return
+        transition[TransitionKey.ACTION] = action
+        return transition
     
     def _min_max_unnorm_partial(self, x: torch.Tensor) -> torch.Tensor:
         """Apply partial inverse min-max normalization for action with component indices."""
