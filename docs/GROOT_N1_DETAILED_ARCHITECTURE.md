@@ -1,5 +1,29 @@
 # GROOT N1.5 详细架构图
 
+## Action Space 支持
+
+GROOT N1.5 支持三种 action space 类型：
+
+1. **Absolute joint** (默认): 16D = left_arm(7D) + right_arm(7D) + claw(2D)
+   - 左右手各7个关节角度
+   - 爪子开合程度
+
+2. **Absolute eef**: 20D = left_eef(9D) + right_eef(9D) + claw(2D)
+   - left_eef: 3D position (x, y, z) + 6D rotation (R11, R21, R31, R12, R22, R32)
+   - right_eef: 3D position (x, y, z) + 6D rotation (R11, R21, R31, R12, R22, R32)
+   - 爪子开合程度
+
+3. **Delta eef**: 20D = left_eef(9D) + right_eef(9D) + claw(2D)
+   - 与 Absolute eef 相同的维度结构
+   - 但表示的是相对于当前状态的增量（delta）
+
+**关键特性**：
+- **部分归一化**：对于 EEF space，6D rotation 使用 IDENTITY 归一化（不归一化），保持几何约束
+- **分离处理**：在 SharedBottomArmDecoder 中，EEF space 的 position 和 rotation 分离处理
+  - Position: 可以做 cross-attention（协调左右手位置）
+  - Rotation: 独立处理，不做 cross-attention（保持几何约束）
+- **维度自动配置**：根据 `action_space_type` 自动设置 `action_dim`、`action_left_arm_dim`、`action_right_arm_dim` 等
+
 ## 完整数据流和模块结构
 ```mermaid
 graph TB
@@ -7,7 +31,7 @@ graph TB
         IMG["图像 Image<br/>B x T x V x C x H x W"]
         TXT["文本 Text<br/>Task Description"]
         STATE["机器人状态 State<br/>B x 64"]
-        ACTION["动作序列 Actions<br/>B x T x 16"]
+        ACTION["动作序列 Actions<br/>B x T x 16/20<br/>16D: Joint space<br/>20D: EEF space"]
     end
 
     subgraph EagleBackbone["EagleBackbone"]
@@ -74,19 +98,30 @@ graph TB
                     ResidualR["残差连接<br/>right + right_attended"]
                 end
                 
-                LeftOut["Left Output Layer<br/>CategorySpecificLinear<br/>1024 to 7<br/>左手动作 (0-6)"]
-                RightOut["Right Output Layer<br/>CategorySpecificLinear<br/>1024 to 7<br/>右手动作 (7-13)"]
+                subgraph EEFOutput["EEF Space输出层<br/>(当action_space_type=EEF时)"]
+                    LeftPosOut["Left Pos Output<br/>CategorySpecificLinear<br/>1024 to 3<br/>左手位置 (0-2)"]
+                    LeftRotOut["Left Rot Output<br/>CategorySpecificLinear<br/>1024 to 6<br/>左手6D旋转 (3-8)<br/>独立处理，不做cross-attn"]
+                    RightPosOut["Right Pos Output<br/>CategorySpecificLinear<br/>1024 to 3<br/>右手位置 (9-11)"]
+                    RightRotOut["Right Rot Output<br/>CategorySpecificLinear<br/>1024 to 6<br/>右手6D旋转 (12-17)<br/>独立处理，不做cross-attn"]
+                    ConcatL["合并 left_pos + left_rot<br/>B x T x 9"]
+                    ConcatR["合并 right_pos + right_rot<br/>B x T x 9"]
+                end
+                
+                subgraph JointOutput["Joint Space输出层<br/>(当action_space_type=Joint时)"]
+                    LeftOut["Left Output Layer<br/>CategorySpecificLinear<br/>1024 to 7<br/>左手动作 (0-6)"]
+                    RightOut["Right Output Layer<br/>CategorySpecificLinear<br/>1024 to 7<br/>右手动作 (7-13)"]
+                end
             end
             
-            ClawDec["Action Claw Decoder<br/>CategorySpecificMLP<br/>1024 to 1024 to 2<br/>爪子动作 (14-15)"]
+            ClawDec["Action Claw Decoder<br/>CategorySpecificMLP<br/>1024 to 1024 to 2<br/>爪子动作<br/>Joint: (14-15)<br/>EEF: (18-19)"]
         end
     end
 
     subgraph Output["输出 Output"]
-        LeftArmOut["左手动作<br/>B x T x 7<br/>indices 0-6"]
-        RightArmOut["右手动作<br/>B x T x 7<br/>indices 7-13"]
-        ClawOut["爪子动作<br/>B x T x 2<br/>indices 14-15"]
-        ACTIONS["最终动作预测<br/>B x T x 16<br/>concat([left, right, claw])"]
+        LeftArmOut["左手动作<br/>Joint: B x T x 7 (indices 0-6)<br/>EEF: B x T x 9 (indices 0-8)<br/>  └─ pos(3D) + rot6d(6D)"]
+        RightArmOut["右手动作<br/>Joint: B x T x 7 (indices 7-13)<br/>EEF: B x T x 9 (indices 9-17)<br/>  └─ pos(3D) + rot6d(6D)"]
+        ClawOut["爪子动作<br/>Joint: B x T x 2 (indices 14-15)<br/>EEF: B x T x 2 (indices 18-19)"]
+        ACTIONS["最终动作预测<br/>Joint: B x T x 16<br/>EEF: B x T x 20<br/>concat([left, right, claw])"]
     end
 
     IMG --> SigLip
@@ -123,6 +158,7 @@ graph TB
     DiT16 --> DiTOut
     
     DiTOut --> SharedLayer
+    
     SharedLayer --> LayerNormL
     SharedLayer --> LayerNormR
     LayerNormL -->|query| CrossAttnL
@@ -133,12 +169,25 @@ graph TB
     CrossAttnL --> ResidualL
     LayerNormR --> ResidualR
     CrossAttnR --> ResidualR
-    ResidualL --> LeftOut
-    ResidualR --> RightOut
+    
+    ResidualL -->|EEF space| LeftPosOut
+    ResidualR -->|EEF space| RightPosOut
+    SharedLayer -->|EEF space, rotation独立| LeftRotOut
+    SharedLayer -->|EEF space, rotation独立| RightRotOut
+    LeftPosOut --> ConcatL
+    LeftRotOut --> ConcatL
+    RightPosOut --> ConcatR
+    RightRotOut --> ConcatR
+    
+    ResidualL -->|Joint space| LeftOut
+    ResidualR -->|Joint space| RightOut
+    
     DiTOut --> ClawDec
     
-    LeftOut --> LeftArmOut
-    RightOut --> RightArmOut
+    ConcatL -->|EEF space| LeftArmOut
+    ConcatR -->|EEF space| RightArmOut
+    LeftOut -->|Joint space| LeftArmOut
+    RightOut -->|Joint space| RightArmOut
     ClawDec --> ClawOut
     LeftArmOut --> ACTIONS
     RightArmOut --> ACTIONS
@@ -170,7 +219,7 @@ graph TB
 | vlln | LayerNorm | B×T×2048 | B×T×2048 | 归一化 |
 | vl_self_attention | SelfAttn×4 | B×T×2048 | B×T×2048 | 自注意力处理 |
 | State Encoder | CategoryMLP | B×64 | B×1×1536 | 状态编码 |
-| Action Encoder | MultiEmbMLP | B×T×32 | B×T×1536 | 动作编码 |
+| Action Encoder | MultiEmbMLP | B×T×32 | B×T×1536 | 动作编码<br/>**注意：encoder_action_dim=32（兼容预训练模型）** |
 | Future Tokens | Embedding | - | B×32×1536 | 未来token |
 | DiT Input | Concat | - | B×(1+32+T)×1536 | 拼接 |
 | DiT Cross-Attn | Attention | encoder: B×T×2048<br/>query: B×S×1536<br/>to_k/to_v: 2048→1536 | B×S×1536 | 交叉注意力 |
@@ -178,10 +227,15 @@ graph TB
 | DiT Output | proj_out_2 | B×S×1536 | B×S×1024 | 输出投影(inner_dim→output_dim) |
 | Model Output Actions | Slice | B×S×1024 | B×T×1024 | 只取action部分 |
 | Shared Layer | CategoryLinear | B×T×1024 | B×T×1024 | 共享底层特征提取 |
-| Cross-Attention | MultiheadAttn | left: B×T×1024<br/>right: B×T×1024 | left: B×T×1024<br/>right: B×T×1024 | 左右手特征相互关注 |
+| Cross-Attention | MultiheadAttn | left: B×T×1024<br/>right: B×T×1024 | left: B×T×1024<br/>right: B×T×1024 | 左右手特征相互关注<br/>**EEF space: 仅对position部分** |
+| **EEF Space Decoders** |
+| Left/Right Pos Output | CategoryLinear | B×T×1024 | B×T×3 | 左右手位置解码（做cross-attn） |
+| Left/Right Rot Output | CategoryLinear | B×T×1024 | B×T×6 | 左右手6D旋转解码（独立，不做cross-attn） |
+| Concat Pos+Rot | Concat | pos: B×T×3<br/>rot: B×T×6 | B×T×9 | 合并为9D EEF输出 |
+| **Joint Space Decoders** |
 | Left/Right Output | CategoryLinear | B×T×1024 | B×T×7 | 左右手动作解码 |
 | Claw Decoder | CategoryMLP | B×T×1024 | B×T×2 | 爪子动作解码 |
-| Final Output | Concat | left: B×T×7<br/>right: B×T×7<br/>claw: B×T×2 | B×T×16 | 拼接最终动作 |
+| Final Output | Concat | Joint: left(7) + right(7) + claw(2)<br/>EEF: left(9) + right(9) + claw(2) | Joint: B×T×16<br/>EEF: B×T×20 | 拼接最终动作<br/>**actual_action_dim: 16D (Joint) 或 20D (EEF)** |
 
 ## 微调参数控制
 
@@ -201,7 +255,10 @@ graph TB
 - ✅ `shared_arm_decoder` (SharedBottomArmDecoder，包含共享层、交叉注意力、输出层)
   - ✅ `shared_layer` (共享底层特征提取)
   - ✅ `cross_attn_left` / `cross_attn_right` (交叉注意力，如果启用)
-  - ✅ `left_output_layer` / `right_output_layer` (左右手输出层)
+  - ✅ **Joint Space**: `left_output_layer` / `right_output_layer` (左右手输出层，1024→7)
+  - ✅ **EEF Space**: 
+    - `left_pos_output_layer` / `right_pos_output_layer` (位置输出层，1024→3，做cross-attn)
+    - `left_rot_output_layer` / `right_rot_output_layer` (旋转输出层，1024→6，独立处理)
 - ✅ `action_claw_decoder` (CategorySpecificMLP)
 
 ### tune_diffusion_model (Action Head)
@@ -273,51 +330,6 @@ DiT Block:
 
 当启用 `split_arm_heads=True` 和 `use_shared_arm_features=True` 时，使用 `SharedBottomArmDecoder`：
 
-```108:149:src/lerobot/policies/groot/action_head/flow_matching_action_head.py
-    def forward(self, x, cat_ids):
-        """
-        x: (B, T, input_dim)
-        cat_ids: (B,)
-        returns: (left_features, right_features) 或 (left_output, right_output)
-        """
-        # 共享底层特征提取
-        shared_features = F.relu(self.shared_layer(x, cat_ids))  # (B, T, hidden_dim)
-        
-        if self.use_cross_attention:
-            # 交叉注意力：左右手特征相互关注
-            # 这是真正的价值：让左右手能够感知对方的状态
-            # 这是"合成一个MLP然后split"无法实现的
-            # 使用对称的交叉注意力，确保信息交换的一致性
-            left_features = self.layer_norm_left(shared_features)
-            right_features = self.layer_norm_right(shared_features)
-            
-            # 对称的交叉注意力：同时计算，避免信息不对称
-            # 左手的query关注右手的key/value（使用原始right_features）
-            left_attended, _ = self.cross_attn_left(
-                left_features, right_features, right_features
-            )
-            # 右手的query关注左手的key/value（使用原始left_features）
-            right_attended, _ = self.cross_attn_right(
-                right_features, left_features, left_features
-            )
-            
-            # 残差连接：保持原始特征，只添加注意力信息
-            left_features = left_features + left_attended
-            right_features = right_features + right_attended
-            
-            # 输出层
-            left_output = self.left_output_layer(left_features, cat_ids)
-            right_output = self.right_output_layer(right_features, cat_ids)
-        else:
-            # 不使用交叉注意力，直接输出
-            # 注意：这种情况下，确实和"合成一个MLP然后split"类似
-            # 主要区别是输出层分离，可以分别控制损失权重
-            left_output = self.left_output_layer(shared_features, cat_ids)
-            right_output = self.right_output_layer(shared_features, cat_ids)
-        
-        return left_output, right_output
-```
-
 **关键机制**：
 
 1. **共享底层特征提取**：
@@ -326,6 +338,8 @@ DiT Block:
    - 这确保了左右手特征来自同一个底层表示
 
 2. **对称交叉注意力**（如果 `use_cross_attention_arms=True`）：
+
+   **对于 Joint Space (7D)**：
    ```
    Left Cross-Attention:
      Query: left_features (B×T×1024)
@@ -340,15 +354,42 @@ DiT Block:
    - 使用 `MultiheadAttention`，默认 4 个头
    - 通过 LayerNorm 归一化后再进行注意力计算
    - 使用残差连接保持原始特征
+   - 输出：`left_output_layer`: 1024 → 7, `right_output_layer`: 1024 → 7
+
+   **对于 EEF Space (9D = 3D pos + 6D rot)**：
+   ```
+   ⚠️ 重要：只对position部分做cross-attention，rotation独立处理
+   
+   Position部分（做cross-attention）：
+     1. LayerNorm归一化
+     2. Left Cross-Attention:
+        Query: left_features (B×T×1024)
+        Key/Value: right_features (B×T×1024)
+        → 左手位置特征关注右手位置特征
+     3. 残差连接: left_pos_features = left_features + left_attended
+     4. Output: left_pos_output_layer: 1024 → 3, right_pos_output_layer: 1024 → 3
+   
+   Rotation部分（独立处理，不做cross-attention）：
+     → 直接使用shared_features，不做任何交叉注意力或LayerNorm
+     → 保持6D旋转的几何约束（正交性、归一化）
+     → Output: left_rot_output_layer: 1024 → 6, right_rot_output_layer: 1024 → 6
+   
+   最终合并：
+     left_output = concat([left_pos(3D), left_rot(6D)])  # B×T×9
+     right_output = concat([right_pos(3D), right_rot(6D)])  # B×T×9
+   ```
 
 3. **分离输出层**：
-   - `left_output_layer`: 1024 → 7 (左手动作，indices 0-6)
-   - `right_output_layer`: 1024 → 7 (右手动作，indices 7-13)
+   - **Joint Space**: `left_output_layer`: 1024 → 7, `right_output_layer`: 1024 → 7
+   - **EEF Space**: 
+     - Position: `left_pos_output_layer`: 1024 → 3, `right_pos_output_layer`: 1024 → 3
+     - Rotation: `left_rot_output_layer`: 1024 → 6, `right_rot_output_layer`: 1024 → 6
    - 允许分别控制左右手的损失权重
 
 **优势**：
 - ✅ **协调性**：交叉注意力让左右手能够感知对方的状态，提升双手协调
 - ✅ **独立性**：分离的输出层允许左右手学习不同的映射
+- ✅ **几何约束保护**：EEF space中，6D旋转独立处理，避免破坏旋转矩阵的几何约束（正交性、归一化）
 - ✅ **灵活性**：可以通过 `use_cross_attention_arms` 控制是否启用交叉注意力
 - ✅ **可训练性**：所有组件由 `tune_projector` 控制，可以灵活微调
 
@@ -609,15 +650,29 @@ State-Action序列 (B×(1+32+T)×1536)
 融合后的动作特征 (B×T×1024)
   ↓ SharedBottomArmDecoder
   ├─ 共享底层特征提取 (B×T×1024)
-  ├─ 交叉注意力 (可选)
-  │   ├─ 左手关注右手特征
-  │   └─ 右手关注左手特征
-  ├─ 左手输出层 → 左手动作 (B×T×7)
-  └─ 右手输出层 → 右手动作 (B×T×7)
-  ↓ Claw Decoder
+  ├─ 交叉注意力 (可选，use_cross_attention_arms)
+  │   ├─ Joint Space: 对整个输出做cross-attention
+  │   │   ├─ 左手关注右手特征
+  │   │   └─ 右手关注左手特征
+  │   └─ EEF Space: 只对position部分做cross-attention
+  │       ├─ Position: 左手关注右手位置特征
+  │       └─ Rotation: 独立处理，不做cross-attention
+  ├─ 输出层
+  │   ├─ Joint Space:
+  │   │   ├─ 左手输出层 → 左手动作 (B×T×7)
+  │   │   └─ 右手输出层 → 右手动作 (B×T×7)
+  │   └─ EEF Space:
+  │       ├─ 左手位置输出层 → 左手位置 (B×T×3)
+  │       ├─ 左手旋转输出层 → 左手6D旋转 (B×T×6)
+  │       ├─ 右手位置输出层 → 右手位置 (B×T×3)
+  │       └─ 右手旋转输出层 → 右手6D旋转 (B×T×6)
+  │       └─ 合并: left(3+6) + right(3+6) = left(9) + right(9)
+  └─ Claw Decoder
 爪子动作 (B×T×2)
   ↓ Concat
-预测动作 (B×T×16)
+预测动作 (B×T×16 或 B×T×20)
+  Joint: left(7) + right(7) + claw(2) = 16D
+  EEF: left(9) + right(9) + claw(2) = 20D
 ```
 
 ## 模块层级结构
@@ -674,11 +729,18 @@ FlowmatchingActionHead
     │   │   └─ query: right_features, key/value: left_features
     │   ├─ layer_norm_left: LayerNorm(1024)
     │   ├─ layer_norm_right: LayerNorm(1024)
-    │   ├─ left_output_layer: CategorySpecificLinear(1024→7)
-    │   └─ right_output_layer: CategorySpecificLinear(1024→7)
+    │   ├─ **Joint Space** (action_space_type='Absolute joint'):
+    │   │   ├─ left_output_layer: CategorySpecificLinear(1024→7)
+    │   │   └─ right_output_layer: CategorySpecificLinear(1024→7)
+    │   └─ **EEF Space** (action_space_type='Absolute eef' 或 'Delta eef'):
+    │       ├─ left_pos_output_layer: CategorySpecificLinear(1024→3) [做cross-attn]
+    │       ├─ left_rot_output_layer: CategorySpecificLinear(1024→6) [独立处理]
+    │       ├─ right_pos_output_layer: CategorySpecificLinear(1024→3) [做cross-attn]
+    │       └─ right_rot_output_layer: CategorySpecificLinear(1024→6) [独立处理]
+    │       └─ 合并: concat([pos(3), rot(6)]) → 9D
     ├─ action_arm_decoder: CategorySpecificMLP (如果 split_arm_heads=False)
     │   └─ Layer1: Linear(1024→1024) + ReLU
-    │   └─ Layer2: Linear(1024→14)
+    │   └─ Layer2: Linear(1024→14 或 18)
     └─ action_claw_decoder: CategorySpecificMLP
         └─ Layer1: Linear(1024→1024) + ReLU
         └─ Layer2: Linear(1024→2)
@@ -845,8 +907,8 @@ MergedModelWithMoE
 | Smart Routing | backbone_feat | B×T×2048 | task_id | 🆕 训练 |
 | LoRA 变换 | backbone_feat | B×T×2048 | B×T×2048 | 🆕 训练 |
 | **MoE Action Head** |
-| Expert 0 (narrower) | adapted_feat | B×T×2048 | B×T×16 | 📦 narrower |
-| Expert 1 (wider) | adapted_feat | B×T×2048 | B×T×16 | 📦 wider |
+| Expert 0 (narrower) | adapted_feat | B×T×2048 | B×T×16/20 | 📦 narrower<br/>支持 Joint/EEF space |
+| Expert 1 (wider) | adapted_feat | B×T×2048 | B×T×16/20 | 📦 wider<br/>支持 Joint/EEF space |
 | Router | task_id | - | 选择专家 | - |
 
 ### MoE 参数量统计
