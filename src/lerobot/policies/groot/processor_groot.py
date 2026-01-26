@@ -60,6 +60,92 @@ from lerobot.utils.constants import (
 DEFAULT_TOKENIZER_ASSETS_REPO = "lerobot/eagle2hg-processor-groot-n1p5"
 
 
+# ============================================================================
+# 6D Rotation Conversion Utilities (for Relative EEF Action)
+# ============================================================================
+
+def rot6d_to_matrix(rot6d: torch.Tensor) -> torch.Tensor:
+    """
+    Convert 6D rotation representation to 3x3 rotation matrix.
+    
+    Uses Gram-Schmidt orthogonalization to ensure valid rotation matrix.
+    
+    Args:
+        rot6d: 6D rotation vector [R11, R21, R31, R12, R22, R32]
+               Shape: (..., 6) or (6,)
+    
+    Returns:
+        3x3 rotation matrix. Shape: (..., 3, 3) or (3, 3)
+    """
+    # Handle both batched and unbatched inputs
+    original_shape = rot6d.shape
+    is_batched = len(original_shape) > 1
+    if not is_batched:
+        rot6d = rot6d.unsqueeze(0)
+    
+    # Extract first two columns
+    col1 = rot6d[..., :3]  # [R11, R21, R31]
+    col2 = rot6d[..., 3:6]  # [R12, R22, R32]
+    
+    # Gram-Schmidt orthogonalization
+    # Normalize first column
+    col1_norm = torch.norm(col1, dim=-1, keepdim=True)
+    col1_normalized = torch.where(
+        col1_norm < 1e-8,
+        torch.tensor([1.0, 0.0, 0.0], device=rot6d.device, dtype=rot6d.dtype),
+        col1 / (col1_norm + 1e-8)
+    )
+    
+    # Orthogonalize and normalize second column
+    col2_projected = col2 - (col2 * col1_normalized).sum(dim=-1, keepdim=True) * col1_normalized
+    col2_norm = torch.norm(col2_projected, dim=-1, keepdim=True)
+    col2_normalized = torch.where(
+        col2_norm < 1e-8,
+        torch.tensor([0.0, 1.0, 0.0], device=rot6d.device, dtype=rot6d.dtype),
+        col2_projected / (col2_norm + 1e-8)
+    )
+    
+    # Third column via cross product
+    col3_normalized = torch.cross(col1_normalized, col2_normalized, dim=-1)
+    
+    # Stack to form rotation matrix
+    rotation_matrix = torch.stack([col1_normalized, col2_normalized, col3_normalized], dim=-1)
+    
+    if not is_batched:
+        rotation_matrix = rotation_matrix.squeeze(0)
+    
+    return rotation_matrix
+
+
+def matrix_to_rot6d(rotation_matrix: torch.Tensor) -> torch.Tensor:
+    """
+    Convert 3x3 rotation matrix to 6D rotation representation.
+    
+    Args:
+        rotation_matrix: 3x3 rotation matrix. Shape: (..., 3, 3) or (3, 3)
+    
+    Returns:
+        6D rotation vector [R11, R21, R31, R12, R22, R32]. Shape: (..., 6) or (6,)
+    """
+    # Handle both batched and unbatched inputs
+    original_shape = rotation_matrix.shape
+    is_batched = len(original_shape) > 2
+    if not is_batched:
+        rotation_matrix = rotation_matrix.unsqueeze(0)
+    
+    # Extract first two columns
+    col1 = rotation_matrix[..., :, 0]  # [R11, R21, R31]
+    col2 = rotation_matrix[..., :, 1]  # [R12, R22, R32]
+    
+    # Concatenate to form 6D representation
+    rot6d = torch.cat([col1, col2], dim=-1)
+    
+    if not is_batched:
+        rot6d = rot6d.squeeze(0)
+    
+    return rot6d
+
+
 def make_groot_pre_post_processors(
     config: GrootConfig, dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None
 ) -> tuple[
@@ -266,6 +352,79 @@ class GrootPackInputsStep(ProcessorStep):
     action_space_type: str | None = None  # "Delta eef", "Absolute eef", "Absolute joint", etc.
     action_component_indices: dict[str, tuple[int, int]] | None = None  # e.g., {"left_eef_pos": (0, 3), ...}
 
+    def _convert_absolute_to_relative_eef_action(self, absolute_action: torch.Tensor) -> torch.Tensor:
+        """
+        Convert absolute EEF pose to relative EEF action.
+        
+        For each chunk, uses the first timestep as reference:
+        - Position: relative_pos_i = pos_i - pos_ref
+        - Rotation: relative_rot_i = R_ref^-1 @ R_i (in SO(3))
+        
+        Args:
+            absolute_action: Absolute EEF pose tensor. Shape: (B, T, D)
+                            Expected structure for 20D eef:
+                            [left_pos(3), left_rot6d(6), right_pos(3), right_rot6d(6), gripper(2)]
+        
+        Returns:
+            Relative EEF action tensor. Shape: (B, T, D)
+        """
+        if self.action_component_indices is None:
+            return absolute_action
+        
+        b, t, d = absolute_action.shape
+        relative_action = absolute_action.clone()
+        
+        # Extract reference pose (first timestep of each batch)
+        ref_pose = absolute_action[:, 0:1, :]  # (B, 1, D)
+        
+        # Process each component
+        for component_name, (start_idx, end_idx) in self.action_component_indices.items():
+            if end_idx > d:
+                continue
+            
+            # Extract component from reference and all timesteps
+            ref_component = ref_pose[:, :, start_idx:end_idx]  # (B, 1, component_dim)
+            abs_components = absolute_action[:, :, start_idx:end_idx]  # (B, T, component_dim)
+            
+            if "pos" in component_name:
+                # Position: simple subtraction
+                # relative_pos = pos_i - pos_ref
+                rel_components = abs_components - ref_component  # Broadcast: (B, T, dim) - (B, 1, dim)
+                relative_action[:, :, start_idx:end_idx] = rel_components
+                
+            elif "rot6d" in component_name:
+                # Rotation: SO(3) relative rotation
+                # R_rel = R_ref^-1 @ R_i = R_ref^T @ R_i
+                
+                # Convert 6D to rotation matrices
+                # Reshape for batch processing: (B*T, 6) -> (B*T, 3, 3)
+                ref_rot6d = ref_component.squeeze(1)  # (B, 6)
+                abs_rot6d = abs_components.reshape(b * t, -1)  # (B*T, 6)
+                
+                # Convert to matrices
+                ref_matrices = rot6d_to_matrix(ref_rot6d)  # (B, 3, 3)
+                abs_matrices = rot6d_to_matrix(abs_rot6d)  # (B*T, 3, 3)
+                
+                # Compute relative rotation: R_rel = R_ref^T @ R_i
+                ref_matrices_expanded = ref_matrices.unsqueeze(1).expand(-1, t, -1, -1)  # (B, T, 3, 3)
+                ref_matrices_flat = ref_matrices_expanded.reshape(b * t, 3, 3)  # (B*T, 3, 3)
+                
+                # Relative rotation: R_ref^T @ R_i
+                rel_matrices = torch.bmm(ref_matrices_flat.transpose(-2, -1), abs_matrices)  # (B*T, 3, 3)
+                
+                # Convert back to 6D
+                rel_rot6d = matrix_to_rot6d(rel_matrices)  # (B*T, 6)
+                rel_rot6d = rel_rot6d.reshape(b, t, -1)  # (B, T, 6)
+                
+                relative_action[:, :, start_idx:end_idx] = rel_rot6d
+                
+            elif "gripper" in component_name:
+                # Gripper: keep as-is (already relative in most cases, or can be kept absolute)
+                # For now, keep absolute values (can be changed if needed)
+                pass
+        
+        return relative_action
+
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         obs = transition.get(TransitionKey.OBSERVATION, {}) or {}
         comp = transition.get(TransitionKey.COMPLEMENTARY_DATA, {}) or {}
@@ -409,15 +568,7 @@ class GrootPackInputsStep(ProcessorStep):
         # 4) Action/action_mask -> (B, action_horizon, max_action_dim)
         action = transition.get(TransitionKey.ACTION)
         if isinstance(action, torch.Tensor):
-            # Normalize BEFORE temporal expansion/padding
-            if self.normalize_min_max:
-                if action.dim() == 2:
-                    action = _min_max_norm(action, "action")
-                elif action.dim() == 3:
-                    b, t, d = action.shape
-                    flat = action.reshape(b * t, d)
-                    flat = _min_max_norm(flat, "action")
-                    action = flat.view(b, t, d)
+            # Handle temporal expansion first (before relative action conversion)
             if action.dim() == 2:
                 action = action.unsqueeze(1).repeat(1, self.action_horizon, 1)
             elif action.dim() == 3:
@@ -432,6 +583,22 @@ class GrootPackInputsStep(ProcessorStep):
                 raise ValueError(f"action must be (B, D) or (B, T, D), got {tuple(action.shape)}")
 
             b, t, d = action.shape
+            
+            # Convert absolute eef pose to relative eef action if needed
+            # This happens BEFORE normalization
+            if self.action_space_type == "Delta eef" and self.action_component_indices is not None:
+                action = self._convert_absolute_to_relative_eef_action(action)
+            
+            # Normalize AFTER relative action conversion
+            if self.normalize_min_max:
+                if action.dim() == 2:
+                    action = _min_max_norm(action, "action")
+                elif action.dim() == 3:
+                    b, t, d = action.shape
+                    flat = action.reshape(b * t, d)
+                    flat = _min_max_norm(flat, "action")
+                    action = flat.view(b, t, d)
+
             if d > self.max_action_dim:
                 action = action[:, :, : self.max_action_dim]
                 d = self.max_action_dim
@@ -668,6 +835,103 @@ class GrootActionUnpackUnnormalizeStep(ProcessorStep):
     action_space_type: str | None = None  # "Delta eef", "Absolute eef", "Absolute joint", etc.
     action_component_indices: dict[str, tuple[int, int]] | None = None  # e.g., {"left_eef_pos": (0, 3), ...}
 
+    def _convert_relative_to_absolute_eef_action(
+        self, relative_action: torch.Tensor, reference_pose: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """
+        Convert relative EEF action to absolute EEF pose.
+        
+        For inference: uses provided reference pose (current robot eef pose) to convert
+        relative action back to absolute pose.
+        
+        Args:
+            relative_action: Relative EEF action tensor. Shape: (B, D) or (B, T, D)
+            reference_pose: Reference EEF pose (current robot state). Shape: (B, D) or (B, 1, D)
+                           If None, returns relative_action as-is (assumes already absolute)
+        
+        Returns:
+            Absolute EEF pose tensor. Shape: same as relative_action
+        """
+        if reference_pose is None or self.action_component_indices is None:
+            # No reference pose provided or no component indices -> assume already absolute
+            return relative_action
+        
+        if self.action_space_type != "Delta eef":
+            # Only convert if action_space_type is "Delta eef"
+            return relative_action
+        
+        # Handle both (B, D) and (B, T, D) shapes
+        original_shape = relative_action.shape
+        is_temporal = len(original_shape) == 3
+        if not is_temporal:
+            relative_action = relative_action.unsqueeze(1)  # (B, 1, D)
+        
+        b, t, d = relative_action.shape
+        
+        # Ensure reference_pose has correct shape
+        if reference_pose.dim() == 2:
+            reference_pose = reference_pose.unsqueeze(1)  # (B, 1, D)
+        elif reference_pose.dim() == 1:
+            reference_pose = reference_pose.unsqueeze(0).unsqueeze(1)  # (1, 1, D)
+        
+        # Ensure batch size matches
+        if reference_pose.shape[0] != b:
+            if reference_pose.shape[0] == 1:
+                reference_pose = reference_pose.expand(b, -1, -1)
+            else:
+                raise ValueError(f"Batch size mismatch: reference_pose {reference_pose.shape[0]} vs relative_action {b}")
+        
+        absolute_action = relative_action.clone()
+        
+        # Process each component
+        for component_name, (start_idx, end_idx) in self.action_component_indices.items():
+            if end_idx > d:
+                continue
+            
+            # Extract component from reference and relative action
+            ref_component = reference_pose[:, :, start_idx:end_idx]  # (B, 1, component_dim)
+            rel_components = relative_action[:, :, start_idx:end_idx]  # (B, T, component_dim)
+            
+            if "pos" in component_name:
+                # Position: absolute_pos = relative_pos + ref_pos
+                abs_components = rel_components + ref_component  # Broadcast: (B, T, dim) + (B, 1, dim)
+                absolute_action[:, :, start_idx:end_idx] = abs_components
+                
+            elif "rot6d" in component_name:
+                # Rotation: absolute_rot = ref_rot @ relative_rot
+                # R_abs = R_ref @ R_rel
+                
+                # Convert 6D to rotation matrices
+                ref_rot6d = ref_component.squeeze(1)  # (B, 6)
+                rel_rot6d = rel_components.reshape(b * t, -1)  # (B*T, 6)
+                
+                # Convert to matrices
+                ref_matrices = rot6d_to_matrix(ref_rot6d)  # (B, 3, 3)
+                rel_matrices = rot6d_to_matrix(rel_rot6d)  # (B*T, 3, 3)
+                
+                # Compute absolute rotation: R_abs = R_ref @ R_rel
+                ref_matrices_expanded = ref_matrices.unsqueeze(1).expand(-1, t, -1, -1)  # (B, T, 3, 3)
+                ref_matrices_flat = ref_matrices_expanded.reshape(b * t, 3, 3)  # (B*T, 3, 3)
+                
+                # Absolute rotation: R_ref @ R_rel
+                abs_matrices = torch.bmm(ref_matrices_flat, rel_matrices)  # (B*T, 3, 3)
+                
+                # Convert back to 6D
+                abs_rot6d = matrix_to_rot6d(abs_matrices)  # (B*T, 6)
+                abs_rot6d = abs_rot6d.reshape(b, t, -1)  # (B, T, 6)
+                
+                absolute_action[:, :, start_idx:end_idx] = abs_rot6d
+                
+            elif "gripper" in component_name:
+                # Gripper: keep as-is (or add reference if needed)
+                # For now, keep relative values (can be changed if needed)
+                pass
+        
+        if not is_temporal:
+            absolute_action = absolute_action.squeeze(1)  # (B, D)
+        
+        return absolute_action
+
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         # Expect model outputs to be in TransitionKey.ACTION as (B, T, D_model)
         action = transition.get(TransitionKey.ACTION)
@@ -710,6 +974,25 @@ class GrootActionUnpackUnnormalizeStep(ProcessorStep):
                 safe_denom = torch.where(mask, denom, torch.ones_like(denom))
                 inv = (action + 1.0) * 0.5 * safe_denom + min_v
                 action = torch.where(mask, inv, min_v)
+        
+        # Convert relative action to absolute pose if needed (for inference)
+        # NOTE: This requires reference pose (current robot eef pose) from observation
+        # For now, we skip this conversion if reference pose is not available
+        # In practice, the reference pose should be obtained from the environment/robot state
+        # and passed to the postprocessor, or computed from joint positions via forward kinematics
+        if self.action_space_type == "Delta eef" and self.action_component_indices is not None:
+            # Try to get reference pose from observation if available
+            # This is a placeholder - in practice, reference pose should be provided by the caller
+            # or computed from current robot state
+            reference_pose = None
+            # TODO: Extract reference pose from observation.state or compute from joint positions
+            # For now, if reference_pose is None, we assume action is already absolute (backward compatibility)
+            if reference_pose is not None:
+                action = self._convert_relative_to_absolute_eef_action(action, reference_pose)
+            else:
+                # If no reference pose available, log a warning but continue
+                # In practice, this should be handled by the inference code
+                pass
         
         # Update transition with processed action and return
         transition[TransitionKey.ACTION] = action
@@ -784,9 +1067,6 @@ class GrootActionUnpackUnnormalizeStep(ProcessorStep):
             result[..., start_idx:end_idx] = unnormalized_component
         
         return result
-
-        transition[TransitionKey.ACTION] = action
-        return transition
 
     def transform_features(self, features):
         return features
