@@ -167,6 +167,30 @@ def rot6d_to_quaternion_xyzw(rot_6d: np.ndarray) -> np.ndarray:
     return quat
 
 
+def rot6d_to_euler_zyx(rot_6d: np.ndarray) -> np.ndarray:
+    """
+    将6D旋转表示转换为欧拉角 (roll, pitch, yaw)
+    使用ZYX顺序（也称为yaw-pitch-roll或intrinsic rotations）
+    
+    Args:
+        rot_6d: 6维向量 [R11, R21, R31, R12, R22, R32]
+        
+    Returns:
+        欧拉角 [roll, pitch, yaw] (单位：弧度)
+        注意：scipy使用ZYX顺序，返回的是 [yaw, pitch, roll]
+        我们重新排序为 [roll, pitch, yaw] 以便更直观
+    """
+    from scipy.spatial.transform import Rotation as R
+    # 重构旋转矩阵
+    R_mat = reconstruct_rotation_matrix_6d(rot_6d)
+    # 转换为欧拉角（ZYX顺序，即先绕Z轴旋转yaw，再绕Y轴旋转pitch，最后绕X轴旋转roll）
+    # scipy返回的是 [yaw, pitch, roll]（按ZYX顺序）
+    euler_zyx = R.from_matrix(R_mat).as_euler('zyx', degrees=False)
+    # 重新排序为 [roll, pitch, yaw] 以便更直观
+    roll, pitch, yaw = euler_zyx[2], euler_zyx[1], euler_zyx[0]
+    return np.array([roll, pitch, yaw])
+
+
 def convert_eef_action_to_joint_action(eef_action: np.ndarray, model_type: str = '60') -> np.ndarray:
     """
     将20D EEF action转换为16D joint action（用于MuJoCo执行）
@@ -741,6 +765,50 @@ def eval_on_dataset(ckpt_path,
                 width=3.0
             )
         
+        # 可视化ground truth的6D旋转转换为欧拉角（仅对EEF action space）
+        if action_dim == 20:
+            # EEF space结构: [left_pos(0-2), left_rot6d(3-8), right_pos(9-11), right_rot6d(12-17), grippers(18-19)]
+            left_rot6d_start = 3
+            left_rot6d_end = 9
+            right_rot6d_start = 12
+            right_rot6d_end = 18
+            
+            # 提取左右手的6D旋转
+            left_rot6d_gt = all_gt_actions[:, left_rot6d_start:left_rot6d_end]  # (num_frames, 6)
+            right_rot6d_gt = all_gt_actions[:, right_rot6d_start:right_rot6d_end]  # (num_frames, 6)
+            
+            # 将每个6D旋转转换为欧拉角 [roll, pitch, yaw]
+            left_euler_gt = np.zeros((all_gt_actions.shape[0], 3))  # (num_frames, 3)
+            right_euler_gt = np.zeros((all_gt_actions.shape[0], 3))  # (num_frames, 3)
+            
+            for i in range(all_gt_actions.shape[0]):
+                # 左手欧拉角
+                left_euler_gt[i] = rot6d_to_euler_zyx(left_rot6d_gt[i])
+                
+                # 右手欧拉角
+                right_euler_gt[i] = rot6d_to_euler_zyx(right_rot6d_gt[i])
+            
+            # 可视化ground truth欧拉角的每个元素
+            euler_names = ['roll', 'pitch', 'yaw']
+            for elem_idx, elem_name in enumerate(euler_names):
+                # 左手欧拉角（ground truth）
+                vizer.visualize_chunk(
+                    name=f"euler_angles/left_arm_{elem_name}/gt",
+                    chunk_data=left_euler_gt[:, elem_idx],
+                    step_id=0,
+                    width=3.0,
+                    color=[0, 0, 255]  # 深蓝色表示ground truth左手
+                )
+                
+                # 右手欧拉角（ground truth）
+                vizer.visualize_chunk(
+                    name=f"euler_angles/right_arm_{elem_name}/gt",
+                    chunk_data=right_euler_gt[:, elem_idx],
+                    step_id=0,
+                    width=3.0,
+                    color=[255, 0, 0]  # 红色表示ground truth右手
+                )
+        
         # 可视化observations
         for dim in range(obs_dim):
             vizer.visualize_chunk(
@@ -1093,6 +1161,66 @@ def eval_on_dataset(ckpt_path,
                         vizer.del_chunk(
                             name=f"chunk/action_dim_{dim}/pred_seg_{last_data_step}",
                             chunk_data=pred_chunk[:, dim],
+                            step_id=last_data_step,
+                            width=0.5
+                        )
+            
+            # 可视化6D旋转转换为欧拉角（仅对EEF action space）
+            if action_dim == 20 and should_infer:
+                # 对pred_chunk中的每个action，将6D旋转转换为欧拉角
+                # EEF space结构: [left_pos(0-2), left_rot6d(3-8), right_pos(9-11), right_rot6d(12-17), grippers(18-19)]
+                left_rot6d_start = 3
+                left_rot6d_end = 9
+                right_rot6d_start = 12
+                right_rot6d_end = 18
+                
+                # 提取左右手的6D旋转
+                left_rot6d_chunk = pred_chunk[:, left_rot6d_start:left_rot6d_end]  # (chunk_size, 6)
+                right_rot6d_chunk = pred_chunk[:, right_rot6d_start:right_rot6d_end]  # (chunk_size, 6)
+                
+                # 将每个6D旋转转换为欧拉角 [roll, pitch, yaw]
+                left_euler_chunk = np.zeros((pred_chunk.shape[0], 3))  # (chunk_size, 3)
+                right_euler_chunk = np.zeros((pred_chunk.shape[0], 3))  # (chunk_size, 3)
+                
+                for i in range(pred_chunk.shape[0]):
+                    # 左手欧拉角
+                    left_euler_chunk[i] = rot6d_to_euler_zyx(left_rot6d_chunk[i])
+                    
+                    # 右手欧拉角
+                    right_euler_chunk[i] = rot6d_to_euler_zyx(right_rot6d_chunk[i])
+                
+                # 可视化欧拉角的每个元素 (roll, pitch, yaw)
+                euler_names = ['roll', 'pitch', 'yaw']
+                for elem_idx, elem_name in enumerate(euler_names):
+                    # 左手欧拉角
+                    vizer.visualize_chunk(
+                        name=f"euler_angles/left_arm_{elem_name}/pred_seg_{data_step}",
+                        chunk_data=left_euler_chunk[:, elem_idx],
+                        step_id=data_step,
+                        width=2,
+                        color=[0, 128, 255]  # 蓝色表示左手
+                    )
+                    
+                    # 右手欧拉角
+                    vizer.visualize_chunk(
+                        name=f"euler_angles/right_arm_{elem_name}/pred_seg_{data_step}",
+                        chunk_data=right_euler_chunk[:, elem_idx],
+                        step_id=data_step,
+                        width=2,
+                        color=[255, 128, 0]  # 橙色表示右手
+                    )
+                    
+                    # 清理上一次的chunk（如果存在）
+                    if last_data_step != data_step and last_data_step > 0:
+                        vizer.del_chunk(
+                            name=f"euler_angles/left_arm_{elem_name}/pred_seg_{last_data_step}",
+                            chunk_data=left_euler_chunk[:, elem_idx],
+                            step_id=last_data_step,
+                            width=0.5
+                        )
+                        vizer.del_chunk(
+                            name=f"euler_angles/right_arm_{elem_name}/pred_seg_{last_data_step}",
+                            chunk_data=right_euler_chunk[:, elem_idx],
                             step_id=last_data_step,
                             width=0.5
                         )
