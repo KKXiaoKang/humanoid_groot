@@ -469,7 +469,11 @@ class GrootPackInputsStep(ProcessorStep):
             return torch.where(mask, mapped, torch.zeros_like(mapped))
         
         def _min_max_norm_partial(x: torch.Tensor, key: str) -> torch.Tensor:
-            """Apply partial min-max normalization for action with component indices."""
+            """Apply partial min-max normalization for action with component indices.
+            
+            For relative actions (Delta eef), adjusts normalization ranges for position components
+            since relative position distribution differs from absolute position distribution.
+            """
             if self.action_component_indices is None:
                 # Fallback to standard normalization
                 stats_k = self.stats[key]
@@ -488,10 +492,15 @@ class GrootPackInputsStep(ProcessorStep):
             # Define which components should use IDENTITY (no normalization)
             rot6d_components = ["left_eef_rot6d", "right_eef_rot6d"]
             
-            # Get full stats
+            # Get full stats (from absolute eef pose)
             last_dim = x.shape[-1]
             min_v_full = _align_vec(stats_k.get("min", torch.zeros(last_dim)), last_dim, default=0.0)
             max_v_full = _align_vec(stats_k.get("max", torch.ones(last_dim)), last_dim, default=1.0)
+            
+            # For relative actions, adjust normalization ranges for position components
+            # Relative position: rel_pos = abs_pos - ref_pos
+            # Distribution range is approximately 2x the absolute range (centered at 0)
+            is_relative_action = (self.action_space_type == "Delta eef")
             
             # Process each component
             for component_name, (start_idx, end_idx) in self.action_component_indices.items():
@@ -508,6 +517,21 @@ class GrootPackInputsStep(ProcessorStep):
                     # Position or gripper: apply min-max normalization
                     min_v = min_v_full[start_idx:end_idx]
                     max_v = max_v_full[start_idx:end_idx]
+                    
+                    # For relative actions, adjust normalization range for position components
+                    if is_relative_action and "pos" in component_name:
+                        # Relative position distribution: approximately centered at 0
+                        # Range: [-abs_range, abs_range] where abs_range = max(|min|, |max|)
+                        abs_range = torch.maximum(torch.abs(min_v), torch.abs(max_v))
+                        # Use a slightly wider range (1.5x) to account for distribution spread
+                        rel_range = abs_range * 1.5
+                        min_v = -rel_range
+                        max_v = rel_range
+                        # If abs_range is too small, use a default range (e.g., ±1.0 meter)
+                        default_range = torch.ones_like(abs_range) * 1.0
+                        min_v = torch.where(abs_range < 0.1, -default_range, min_v)
+                        max_v = torch.where(abs_range < 0.1, default_range, max_v)
+                    
                     denom = max_v - min_v
                     mask = denom != 0
                     safe_denom = torch.where(mask, denom, torch.ones_like(denom))
@@ -999,7 +1023,11 @@ class GrootActionUnpackUnnormalizeStep(ProcessorStep):
         return transition
     
     def _min_max_unnorm_partial(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply partial inverse min-max normalization for action with component indices."""
+        """Apply partial inverse min-max normalization for action with component indices.
+        
+        For relative actions (Delta eef), uses the same adjusted normalization ranges
+        as in the forward normalization to ensure consistency.
+        """
         if self.action_component_indices is None:
             # Fallback to standard unnormalization
             stats_k = self.stats.get("action", {})
@@ -1028,7 +1056,7 @@ class GrootActionUnpackUnnormalizeStep(ProcessorStep):
         # Define which components should use IDENTITY (no normalization)
         rot6d_components = ["left_eef_rot6d", "right_eef_rot6d"]
         
-        # Get full stats
+        # Get full stats (from absolute eef pose)
         d = x.shape[-1]
         min_v_full = torch.as_tensor(
             stats_k.get("min", torch.zeros(d)), dtype=x.dtype, device=x.device
@@ -1042,6 +1070,9 @@ class GrootActionUnpackUnnormalizeStep(ProcessorStep):
         if max_v_full.numel() != d:
             max_v_full = torch.nn.functional.pad(max_v_full.flatten()[:d], (0, max(0, d - max_v_full.numel())))
             max_v_full = max_v_full.to(x.device, dtype=x.dtype)
+        
+        # For relative actions, adjust normalization ranges for position components (same as forward)
+        is_relative_action = (self.action_space_type == "Delta eef")
         
         # Process each component
         for component_name, (start_idx, end_idx) in self.action_component_indices.items():
@@ -1058,6 +1089,21 @@ class GrootActionUnpackUnnormalizeStep(ProcessorStep):
                 # Position or gripper: apply inverse min-max normalization
                 min_v = min_v_full[start_idx:end_idx]
                 max_v = max_v_full[start_idx:end_idx]
+                
+                # For relative actions, adjust normalization range for position components (same as forward)
+                if is_relative_action and "pos" in component_name:
+                    # Relative position distribution: approximately centered at 0
+                    # Range: [-abs_range, abs_range] where abs_range = max(|min|, |max|)
+                    abs_range = torch.maximum(torch.abs(min_v), torch.abs(max_v))
+                    # Use a slightly wider range (1.5x) to account for distribution spread
+                    rel_range = abs_range * 1.5
+                    min_v = -rel_range
+                    max_v = rel_range
+                    # If abs_range is too small, use a default range (e.g., ±1.0 meter)
+                    default_range = torch.ones_like(abs_range) * 1.0
+                    min_v = torch.where(abs_range < 0.1, -default_range, min_v)
+                    max_v = torch.where(abs_range < 0.1, default_range, max_v)
+                
                 denom = max_v - min_v
                 mask = denom != 0
                 safe_denom = torch.where(mask, denom, torch.ones_like(denom))
