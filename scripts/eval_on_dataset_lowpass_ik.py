@@ -492,17 +492,23 @@ def eval_on_dataset(ckpt_path,
         
         print(f"✅ Using dataset_stats from checkpoint: {list(dataset_stats.keys()) if dataset_stats else 'None'}")
         
-        # 检查 postprocessor 中的部分归一化配置
+        # 检查 postprocessor 中的部分归一化配置，并保存 postprocessor step 引用（用于 relative action 转换）
+        postprocessor_step = None
+        action_space_type = None
+        action_component_indices = None
         for step in postprocessor.steps:
             if hasattr(step, 'action_space_type') and hasattr(step, 'action_component_indices'):
                 action_space_type = getattr(step, 'action_space_type', None)
                 action_component_indices = getattr(step, 'action_component_indices', None)
                 if action_space_type and action_component_indices:
+                    postprocessor_step = step  # 保存引用，用于后续 relative action 转换
                     print(f"✅ Partial normalization configuration found:")
                     print(f"   - action_space_type: {action_space_type}")
                     print(f"   - action_component_indices: {list(action_component_indices.keys())}")
                     if action_space_type in ["Delta eef", "Absolute eef"]:
                         print(f"   ⚠️  6D rotation components (left_eef_rot6d, right_eef_rot6d) will NOT be unnormalized")
+                    if action_space_type == "Delta eef":
+                        print(f"   🔄 Relative action mode detected: Will convert relative actions to absolute poses during inference")
                     break
                 elif action_space_type:
                     print(f"⚠️  Warning: action_space_type={action_space_type} but action_component_indices is None")
@@ -561,6 +567,10 @@ def eval_on_dataset(ckpt_path,
     infer_per_frame = max(1, infer_per_frame)
 
     control_step_cursor = 0
+    
+    # 初始化 relative action mode 的 reference pose（将在 action_dim 定义后设置）
+    current_reference_pose: np.ndarray | None = None
+    is_relative_action_mode = False  # 将在 action_dim 定义后设置
     
     # ✅ 使用标准的LeRobotDataset加载数据
     print(f"\n📂 Loading dataset from {lerobot_dataset_path}")
@@ -622,6 +632,14 @@ def eval_on_dataset(ckpt_path,
     obs_dim = first_batch['observation.state'].shape[1]
     print(f"📊 Action dimension: {action_dim}")
     print(f"📊 Observation dimension: {obs_dim}")
+    
+    # 现在可以设置 is_relative_action_mode（在 action_dim 定义之后）
+    is_relative_action_mode = (action_space_type == "Delta eef" and action_dim == 20)
+    if is_relative_action_mode:
+        print(f"\n🔄 Relative action mode enabled:")
+        print(f"   - action_space_type: Delta eef")
+        print(f"   - Will convert relative actions to absolute poses during inference")
+        print(f"   - Reference pose will be set from current frame's ground truth action at each inference step")
     
     # 根据action_dim动态设置arm和claw的维度切片
     # 16D joint space: arm(0-13, 14D) + claw(14-15, 2D)
@@ -925,6 +943,14 @@ def eval_on_dataset(ckpt_path,
         # 判断是否需要执行推理（根据infer_per_frame参数）
         should_infer = (data_step % infer_per_frame == 0)
         
+        # 对于 relative action mode，每次触发推理时，使用当前 frame 的 ground truth action 作为 reference pose
+        # 第一次推理：使用 episode 的第一帧（data_step=0）作为 reference
+        # 第二次推理：使用 episode 的第 infer_per_frame 帧（data_step=infer_per_frame）作为 reference
+        # 每次触发推理都以当前 episode 的 frame 作为 reference pose
+        if is_relative_action_mode and should_infer:
+            current_reference_pose = gt_action.copy()
+            print(f"   🔄 Updated reference pose from ground truth action at step {data_step}")
+        
         # 模型推理
         tic = time.time()
         if should_infer:
@@ -988,6 +1014,22 @@ def eval_on_dataset(ckpt_path,
             # 堆叠回 (B, chunk_size, action_dim)，然后转换为 numpy
             pred_actions_unnorm = torch.stack(processed_actions, dim=1)  # (B, chunk_size, action_dim)
             pred_chunk = pred_actions_unnorm[0].cpu().numpy()  # (chunk_size, action_dim)
+            
+            # 对于 relative action mode，需要将 relative action 转换为 absolute pose
+            if is_relative_action_mode and postprocessor_step is not None:
+                # 将 numpy 转换为 torch tensor
+                pred_chunk_tensor = torch.from_numpy(pred_chunk).to(device).unsqueeze(0)  # (1, chunk_size, action_dim)
+                reference_pose_tensor = torch.from_numpy(current_reference_pose).to(device).unsqueeze(0)  # (1, action_dim)
+                
+                # 调用 postprocessor step 的转换方法
+                pred_chunk_absolute = postprocessor_step._convert_relative_to_absolute_eef_action(
+                    pred_chunk_tensor, reference_pose_tensor
+                )
+                
+                # 转换回 numpy
+                pred_chunk = pred_chunk_absolute[0].cpu().numpy()  # (chunk_size, action_dim)
+                # 注意：reference pose 已经在推理开始时从当前 frame 的 ground truth 设置，不需要更新
+            
             pred_action_single = pred_chunk[0]  # (action_dim,) - 取第一个 action
             
             # 保存预测结果供后续帧使用
@@ -998,6 +1040,14 @@ def eval_on_dataset(ckpt_path,
             if last_inferred_chunk is not None:
                 pred_chunk = last_inferred_chunk.copy()
                 pred_action_single = pred_chunk[0]  # 取第一个action
+                
+                # 对于 relative action mode，即使复用上一次的预测，也需要更新 reference pose
+                # 因为 reference pose 应该基于实际执行的 action（而不是预测的 action）
+                # 但这里我们使用预测的 action 作为近似
+                if is_relative_action_mode and current_reference_pose is not None:
+                    # 使用当前预测的 action 更新 reference pose（用于下一个 chunk）
+                    # 注意：这只是一个近似，理想情况下应该使用实际执行的 action
+                    pass  # 保持 current_reference_pose 不变，直到下一次推理
             else:
                 # 如果这是第一帧且infer_per_frame > 1，需要先推理一次
                 if data_step == 0:
@@ -1031,6 +1081,22 @@ def eval_on_dataset(ckpt_path,
                     
                     pred_actions_unnorm = torch.stack(processed_actions, dim=1)
                     pred_chunk = pred_actions_unnorm[0].cpu().numpy()
+                    
+                    # 对于 relative action mode，需要将 relative action 转换为 absolute pose
+                    if is_relative_action_mode and postprocessor_step is not None:
+                        # 将 numpy 转换为 torch tensor
+                        pred_chunk_tensor = torch.from_numpy(pred_chunk).to(device).unsqueeze(0)  # (1, chunk_size, action_dim)
+                        reference_pose_tensor = torch.from_numpy(current_reference_pose).to(device).unsqueeze(0)  # (1, action_dim)
+                        
+                        # 调用 postprocessor step 的转换方法
+                        pred_chunk_absolute = postprocessor_step._convert_relative_to_absolute_eef_action(
+                            pred_chunk_tensor, reference_pose_tensor
+                        )
+                        
+                        # 转换回 numpy
+                        pred_chunk = pred_chunk_absolute[0].cpu().numpy()  # (chunk_size, action_dim)
+                        # 注意：reference pose 已经在推理开始时从当前 frame 的 ground truth 设置，不需要更新
+                    
                     pred_action_single = pred_chunk[0]
                     
                     last_inferred_chunk = pred_chunk.copy()
@@ -1068,6 +1134,8 @@ def eval_on_dataset(ckpt_path,
 
         if lowpass_chunk is not None and lowpass_chunk.size > 0:
             previous_resampled_action = lowpass_chunk[-1].copy()
+            # 注意：对于 relative action mode，reference pose 在每次推理时从当前 frame 的 ground truth 设置
+            # 不需要在这里更新，因为下一个推理会使用新的 frame 的 ground truth 作为 reference
     
         inference_time = time.time() - tic
         
