@@ -314,7 +314,7 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
     # 最优方案：共享底层特征 + 交叉注意力 + 协调性损失
     # 这样可以平衡左右手的独立性和协调性
     use_shared_arm_features: bool = field(default=True, metadata={"help": "Whether to share bottom layer features between left and right arms for better coordination"})
-    use_cross_attention_arms: bool = field(default=True, metadata={"help": "Whether to use cross-attention between left and right arm features. Recommended: True for bimanual tasks"})
+    use_cross_attention_arms: bool = field(default=False, metadata={"help": "Whether to use cross-attention between left and right arm features. Recommended: True for bimanual tasks"})
     arm_coordination_loss_weight: float = field(default=0.2, metadata={"help": "Weight for arm coordination loss (encourages synchronized movements). Recommended: 0.1-0.3"})
     
     # Loss weights for different action heads
