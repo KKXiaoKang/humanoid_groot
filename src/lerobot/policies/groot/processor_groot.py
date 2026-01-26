@@ -351,6 +351,7 @@ class GrootPackInputsStep(ProcessorStep):
     # For partial normalization of action (e.g., 6D rotation representation)
     action_space_type: str | None = None  # "Delta eef", "Absolute eef", "Absolute joint", etc.
     action_component_indices: dict[str, tuple[int, int]] | None = None  # e.g., {"left_eef_pos": (0, 3), ...}
+    _relative_action_conversion_logged: bool = False  # Track if we've logged the conversion
 
     def _convert_absolute_to_relative_eef_action(self, absolute_action: torch.Tensor) -> torch.Tensor:
         """
@@ -370,6 +371,16 @@ class GrootPackInputsStep(ProcessorStep):
         """
         if self.action_component_indices is None:
             return absolute_action
+        
+        # Log once that relative action conversion is active
+        if not self._relative_action_conversion_logged:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.info(
+                f"🔄 [Delta EEF] Converting absolute EEF poses to relative actions "
+                f"(shape: {absolute_action.shape}, components: {list(self.action_component_indices.keys())})"
+            )
+            self._relative_action_conversion_logged = True
         
         b, t, d = absolute_action.shape
         relative_action = absolute_action.clone()
