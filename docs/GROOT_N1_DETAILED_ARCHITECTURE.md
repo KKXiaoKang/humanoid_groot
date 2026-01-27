@@ -24,6 +24,32 @@ GROOT N1.5 支持三种 action space 类型：
   - Rotation: 独立处理，不做 cross-attention（保持几何约束）
 - **维度自动配置**：根据 `action_space_type` 自动设置 `action_dim`、`action_left_arm_dim`、`action_right_arm_dim` 等
 
+## RGB-Only 模式（可选）
+
+GROOT N1.5 支持 **RGB-only 模式**，允许禁用 state encoder，模型完全依赖 RGB 观察和语言指令进行动作预测。
+
+**配置选项**：
+- `use_state_encoder: bool = True` (默认启用)
+  - `True`: 使用 state encoder，DiT 输入为 `[state(1), future_tokens(32), action_features(T)]`
+  - `False`: RGB-only 模式，DiT 输入为 `[future_tokens(32), action_features(T)]`
+
+**适用场景**：
+- ✅ **Relative action spaces** (Delta eef): 相对动作空间下，当前状态信息可能不那么关键
+- ✅ **视觉丰富的任务**：RGB 观察已经包含了足够的上下文信息
+- ✅ **简化模型**：减少参数量，降低计算成本
+- ✅ **跨域泛化**：不依赖特定机器人的本体感知信息，提升泛化能力
+
+**技术细节**：
+- 当 `use_state_encoder=False` 时，`state_encoder` 设置为 `None`
+- DiT 的 `hidden_states` 序列长度从 `(1+32+T)` 变为 `(32+T)`
+- `future_tokens` 和 `action_features` 仍然通过 cross-attention 与 vision-language 特征交互
+- 所有其他模块（action_encoder, future_tokens, DiT, decoders）保持不变
+
+**注意事项**：
+- ⚠️ 禁用 state encoder 后，模型将无法直接感知机器人本体状态（如关节角度、速度等）
+- ⚠️ 对于需要精确本体感知的任务（如平衡控制），建议保持 `use_state_encoder=True`
+- ⚠️ 如果数据集包含 state 信息但模型不使用，processor 仍会提供 state，但模型会忽略它
+
 ## 完整数据流和模块结构
 ```mermaid
 graph TB
@@ -218,10 +244,10 @@ graph TB
 | **FlowmatchingActionHead** |
 | vlln | LayerNorm | B×T×2048 | B×T×2048 | 归一化 |
 | vl_self_attention | SelfAttn×4 | B×T×2048 | B×T×2048 | 自注意力处理 |
-| State Encoder | CategoryMLP | B×64 | B×1×1536 | 状态编码 |
+| State Encoder | CategoryMLP | B×64 | B×1×1536 | 状态编码<br/>**可选：RGB-only模式下为None** |
 | Action Encoder | MultiEmbMLP | B×T×32 | B×T×1536 | 动作编码<br/>**注意：encoder_action_dim=32（兼容预训练模型）** |
 | Future Tokens | Embedding | - | B×32×1536 | 未来token |
-| DiT Input | Concat | - | B×(1+32+T)×1536 | 拼接 |
+| DiT Input | Concat | - | B×(1+32+T)×1536<br/>或 B×(32+T)×1536 | 拼接<br/>**RGB-only模式：排除state，只有future+action** |
 | DiT Cross-Attn | Attention | encoder: B×T×2048<br/>query: B×S×1536<br/>to_k/to_v: 2048→1536 | B×S×1536 | 交叉注意力 |
 | DiT Self-Attn | Attention | B×S×1536 | B×S×1536 | 自注意力 |
 | DiT Output | proj_out_2 | B×S×1536 | B×S×1024 | 输出投影(inner_dim→output_dim) |

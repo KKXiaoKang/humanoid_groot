@@ -331,6 +331,9 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
     
     # Action space type configuration
     action_space_type: str = field(default="Absolute joint", metadata={"help": "Action space type: 'Absolute joint', 'Absolute eef', or 'Delta eef'"})
+    
+    # RGB-only mode: disable state encoder for pure vision-language policy
+    use_state_encoder: bool = field(default=True, metadata={"help": "Whether to use state encoder. If False, model relies only on RGB observation and language instruction (RGB-only mode). Recommended for relative action spaces."})
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -474,12 +477,19 @@ class FlowmatchingActionHead(nn.Module):
         if config.action_space_type in ["Delta eef", "Absolute eef", "Absolute joint"]:
             print(f"✅ actual_action_dim={self.actual_action_dim}D (based on action_space_type='{config.action_space_type}')")
 
-        self.state_encoder = CategorySpecificMLP(
-            num_categories=config.max_num_embodiments,
-            input_dim=config.max_state_dim,
-            hidden_dim=self.hidden_size,
-            output_dim=self.input_embedding_dim,
-        )
+        # State encoder (optional, can be disabled for RGB-only mode)
+        if config.use_state_encoder:
+            self.state_encoder = CategorySpecificMLP(
+                num_categories=config.max_num_embodiments,
+                input_dim=config.max_state_dim,
+                hidden_dim=self.hidden_size,
+                output_dim=self.input_embedding_dim,
+            )
+            print(f"✅ State encoder enabled: state features will be included in DiT input")
+        else:
+            self.state_encoder = None
+            print(f"🎨 RGB-only mode enabled: state encoder disabled, model relies only on RGB observation and language")
+            print(f"   DiT input sequence: [future_tokens(32), action_features(T)] instead of [state(1), future_tokens(32), action_features(T)]")
         self.action_encoder = MultiEmbodimentActionEncoder(
             action_dim=encoder_action_dim,  # Use pretrained dimension for encoder
             hidden_size=self.input_embedding_dim,
@@ -618,7 +628,8 @@ class FlowmatchingActionHead(nn.Module):
         for p in self.parameters():
             p.requires_grad = True
         if not tune_projector:
-            self.state_encoder.requires_grad_(False)
+            if self.state_encoder is not None:
+                self.state_encoder.requires_grad_(False)
             self.action_encoder.requires_grad_(False)
             if self.config.use_multi_action_heads:
                 if self.config.split_arm_heads:
@@ -658,7 +669,8 @@ class FlowmatchingActionHead(nn.Module):
         """
         if self.training:
             if not self.tune_projector:
-                self.state_encoder.eval()
+                if self.state_encoder is not None:
+                    self.state_encoder.eval()
                 self.action_encoder.eval()
                 if self.config.use_multi_action_heads:
                     if self.config.split_arm_heads:
@@ -741,8 +753,12 @@ class FlowmatchingActionHead(nn.Module):
         # Get embodiment ID.
         embodiment_id = action_input.embodiment_id
 
-        # Embed state.
-        state_features = self.state_encoder(action_input.state, embodiment_id)
+        # Embed state (optional, can be disabled for RGB-only mode)
+        if self.state_encoder is not None:
+            state_features = self.state_encoder(action_input.state, embodiment_id)
+        else:
+            # RGB-only mode: state_features is None, will be excluded from sa_embs
+            state_features = None
 
         # Embed noised action trajectory.
         # NOTE: Processor (GrootPackInputsStep) already pads action to max_action_dim (32)
@@ -814,7 +830,12 @@ class FlowmatchingActionHead(nn.Module):
         """
         future_tokens = self.future_tokens.weight.unsqueeze(0).expand(vl_embs.shape[0], -1, -1)
         # 6) 拼接为 hidden_states
-        sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1)
+        # RGB-only mode: exclude state_features if state_encoder is disabled
+        if state_features is not None:
+            sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1)
+        else:
+            # RGB-only mode: only future_tokens and action_features
+            sa_embs = torch.cat((future_tokens, action_features), dim=1)
 
         vl_attn_mask = backbone_output.backbone_attention_mask
 
@@ -1009,8 +1030,12 @@ class FlowmatchingActionHead(nn.Module):
         vl_embs = backbone_output.backbone_features
         embodiment_id = action_input.embodiment_id
 
-        # Embed state.
-        state_features = self.state_encoder(action_input.state, embodiment_id)
+        # Embed state (optional, can be disabled for RGB-only mode)
+        if self.state_encoder is not None:
+            state_features = self.state_encoder(action_input.state, embodiment_id)
+        else:
+            # RGB-only mode: state_features is None, will be excluded from sa_embs
+            state_features = None
 
         # Set initial actions as the sampled noise.
         # Use encoder_action_dim for internal processing (compatible with pretrained model)
@@ -1068,9 +1093,16 @@ class FlowmatchingActionHead(nn.Module):
         actions_output = x_t[:, :, :self.actual_action_dim]
         return BatchFeature(data={"action_pred": actions_output})
 
-    def denoise_step(self, x_t: torch.Tensor, timestep, vl_embs, state_features, embodiment_id) -> torch.Tensor:
+    def denoise_step(self, x_t: torch.Tensor, timestep, vl_embs, state_features: torch.Tensor | None, embodiment_id) -> torch.Tensor:
         """
         单步预测 velocity
+        
+        Args:
+            x_t: 当前动作序列 (B, T, D)
+            timestep: 时间步
+            vl_embs: Vision-Language特征 (B, T, 2048)
+            state_features: 状态特征 (B, 1, 1536) 或 None (RGB-only模式)
+            embodiment_id: Embodiment ID (B,)
         """
         # 单步调用 _predict_velocity
         batch_size = x_t.shape[0]
@@ -1082,7 +1114,7 @@ class FlowmatchingActionHead(nn.Module):
     def _predict_velocity(
             self,
             vl_embs: torch.Tensor,
-            state_features: torch.Tensor,
+            state_features: torch.Tensor | None,
             actions: torch.Tensor,
             timesteps_tensor: torch.Tensor,
             embodiment_id: torch.Tensor,
@@ -1095,7 +1127,12 @@ class FlowmatchingActionHead(nn.Module):
                 action_features = action_features + pos_embs
 
             future_tokens = self.future_tokens.weight.unsqueeze(0).expand(vl_embs.shape[0], -1, -1)
-            sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1)
+            # RGB-only mode: exclude state_features if state_encoder is disabled
+            if state_features is not None:
+                sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1)
+            else:
+                # RGB-only mode: only future_tokens and action_features
+                sa_embs = torch.cat((future_tokens, action_features), dim=1)
 
             model_output = self.model(
                 hidden_states=sa_embs,
