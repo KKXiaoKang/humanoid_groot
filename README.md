@@ -328,3 +328,42 @@ python eval/eval_merged_groot.py \
 ```
 * 拆垛左拆例子
     * ![对比结果](./eval/IK_eef_eval/ik_fk_verification_results/3d_trajectory_demo.jpg)
+
+### EEF eval验证
+* 数据集验证
+```bash
+# absolute eef action model - 带发布rostopic话题
+python scripts/eval_on_dataset_lowpass_ik.py \
+    --ckpt-path /home/lab/humanoid_groot/outputs/train/0124_multi_dataset_h100x4_absolute_eef_4322_2X3_groot_cross-attention_ignore_rotation/checkpoints/012000/pretrained_model  \
+    --dataset-root /home/lab/humanoid_groot/lerobot_data/v3_0_dataset/0123_4322_eef_mix_color \
+    --episode 12 \
+    --action-chunk-size 16 \
+    --infer-per-frame 16 --task-description "Depalletize the box" --publish-arm-commands --ik-model-type 60
+
+# relative eef action model
+python scripts/eval_on_dataset_lowpass_ik.py \
+    --ckpt-path /home/lab/humanoid_groot/outputs/train/0126_multi_dataset_h100x4_relative_eef_action_4322/checkpoints/020000/pretrained_model  \
+    --dataset-root /home/lab/humanoid_groot/lerobot_data/v3_0_dataset/0123_4322_eef_mix_color \
+    --episode 62 \
+    --action-chunk-size 16 \
+    --infer-per-frame 16 --task-description "Depalletize the box"
+```
+
+* RTC推理验证
+```bash
+# default="/home/lab/humanoid_groot/outputs/train/0124_multi_dataset_h100x4_absolute_eef_4322_2X3_groot_cross-attention_ignore_rotation/checkpoints/020000/pretrained_model",
+# /home/lab/humanoid_groot/outputs/train/0124_multi_dataset_h100x4_absolute_eef_4322_2X3_groot_cross-attention_ignore_rotation/checkpoints/020000/pretrained_model
+
+# default="/home/lab/humanoid_groot/outputs/train/0126_multi_dataset_h100x4_relative_eef_action_4322/checkpoints/020000/pretrained_model",
+# /home/lab/humanoid_groot/outputs/train/0126_multi_dataset_h100x4_relative_eef_action_4322/checkpoints/020000/pretrained_model
+
+python eval/eval_eef_model.py --rtc.enabled=true --rtc.execution_horizon=10 --task="Depalletize the box" --duration=30 --ik_model_type=60
+```
+
+* 同步推理模式
+```bash
+python scripts/eval_depalletize_camera_model_reload_limit_vel_select_eef.py  --eval --ckpt-path /home/lab/humanoid_groot/outputs/train/0124_multi_dataset_h100x4_absolute_eef_4322_2X3_groot_cross-attention_ignore_rotation/checkpoints/020000/pretrained_model --model-type groot --action_chunk_size 16 --task-description "Depalletize the box" --model-action-dt 0.1 --sync-mode --max-joint-velocity 1.0 --chunk-start 1 --chunk-end 7 --constant-velocity --action-stride 2
+
+python scripts/eval_depalletize_camera_model_reload_limit_vel_select_eef.py --eval --ckpt-path /home/lab/humanoid_groot/outputs/train/0126_multi_dataset_h100x4_relative_eef_action_4322/checkpoints/020000/pretrained_model --model-type groot --action_chunk_size 16 --task-description "Depalletize the box" --model-action-dt 0.1 --sync-mode --max-joint-velocity 1.0 --chunk-start 1 --chunk-end 7 --constant-velocity --action-stride 1
+
+```

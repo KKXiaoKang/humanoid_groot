@@ -70,6 +70,7 @@ logger = logging.getLogger(__name__)
 
 from robot_envs.kuavo_depalletize_env import GrabBoxMpcEnv
 from kuavo_humanoid_sdk.kuavo_strategy_pytree.common.robot_sdk import RobotSDK
+from kuavo_msgs.srv import (changeArmCtrlMode, changeArmCtrlModeRequest)
 
 import rospy
 import numpy as np
@@ -88,6 +89,26 @@ except ImportError:
     pin = None
     logger.warning("⚠️  Pinocchio not available. Forward kinematics will be disabled.")
 
+def direct_to_wbc(control_mode):
+    """
+        切换手臂到wbc轨迹控制模式
+        Args:
+            control_mode: 控制模式
+                0: 禁用wbc控制轨迹模式
+                1: wbc轨迹控制模式
+    """
+    rospy.wait_for_service('/enable_wbc_arm_trajectory_control', timeout=5)
+    try:
+        change_mode = rospy.ServiceProxy('/enable_wbc_arm_trajectory_control', changeArmCtrlMode)
+        req = changeArmCtrlModeRequest()
+        req.control_mode = control_mode
+        res = change_mode(req)
+        if res.result:
+            rospy.loginfo("wbc轨迹控制模式已更改为 %d", control_mode)
+        else:
+            rospy.logerr("无法将wbc轨迹控制模式更改为 %d", control_mode)
+    except rospy.ServiceException as e:
+        rospy.logerr("服务调用失败: %s", e)
 
 class PinocchioFK:
     """使用 Pinocchio 进行正向运动学计算（用于将 joint positions 转换为 EEF pose）"""
@@ -1269,6 +1290,8 @@ def demo_cli(cfg: RTCDemoConfig):
         control_arm=True,
         control_claw=True
     )
+    # FIXME
+    # direct_to_wbc(1)
     set_arm_quick_mode(True)
     
     # ========== 加载单模型 ==========
