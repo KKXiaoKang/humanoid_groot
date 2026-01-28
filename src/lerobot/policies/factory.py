@@ -356,6 +356,7 @@ def make_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
             dataset_num_frames=kwargs.get("dataset_num_frames"),
+            num_processes=kwargs.get("num_processes", 1),  # Default to 1 for single-GPU
         )
 
     else:

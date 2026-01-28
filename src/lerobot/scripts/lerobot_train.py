@@ -241,6 +241,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=cfg.policy,
         pretrained_path=cfg.policy.pretrained_path,
+        num_processes=accelerator.num_processes,  # Pass num_processes for multi-GPU training
         **processor_kwargs,
         **postprocessor_kwargs,
     )

@@ -150,6 +150,7 @@ def make_groot_pre_post_processors(
     config: GrootConfig, 
     dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
     dataset_num_frames: int | None = None,
+    num_processes: int = 1,  # Number of GPUs/processes for multi-GPU training
 ) -> tuple[
     PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     PolicyProcessorPipeline[PolicyAction, PolicyAction],
@@ -261,6 +262,7 @@ def make_groot_pre_post_processors(
             action_space_type=action_space_type,
             action_component_indices=action_component_indices,
             dataset_num_frames=dataset_num_frames,
+            num_processes=num_processes,  # Pass num_processes for multi-GPU training
         ),
         # 4. Eagle encode (creates eagle_content)
         GrootEagleEncodeStep(
@@ -372,6 +374,10 @@ class GrootPackInputsStep(ProcessorStep):
     dataset_num_frames: int | None = field(
         default=None,
         metadata={"help": "Total number of frames in dataset. Used to detect when first epoch is complete."}
+    )
+    num_processes: int = field(
+        default=1,
+        metadata={"help": "Number of GPUs/processes for multi-GPU training. Used to adjust dataset_num_frames threshold."}
     )
 
     def _convert_absolute_to_relative_eef_action(self, absolute_action: torch.Tensor) -> torch.Tensor:
@@ -492,8 +498,11 @@ class GrootPackInputsStep(ProcessorStep):
             logger.info(f"   Device: {device}")
             logger.info(f"   Dtype: {dtype}")
             logger.info(f"   Freeze after first epoch: {self.freeze_stats_after_first_epoch}")
+            logger.info(f"   Num processes (GPUs): {self.num_processes}")
             if self.dataset_num_frames is not None:
+                threshold = self.dataset_num_frames / self.num_processes
                 logger.info(f"   Dataset num frames: {self.dataset_num_frames}")
+                logger.info(f"   Threshold per GPU: {threshold:.0f} frames (will freeze after {threshold:.0f} frames processed)")
             else:
                 logger.warning("   ⚠️  dataset_num_frames not set - auto-freeze disabled")
             
@@ -555,13 +564,28 @@ class GrootPackInputsStep(ProcessorStep):
             
             # 检查是否应该冻结统计值（第一个epoch完成）
             if self.freeze_stats_after_first_epoch and self.dataset_num_frames is not None:
-                # 如果累积的frames数达到或超过数据集大小，说明第一个epoch已完成
-                if new_count >= self.dataset_num_frames:
+                # 在多GPU训练时，每个GPU只处理 dataset_num_frames / num_processes 个frames
+                # 所以阈值应该是 dataset_num_frames / num_processes
+                threshold = self.dataset_num_frames / self.num_processes
+                
+                # 定期打印进度（每500个frames或每10%）
+                progress_pct = (new_count / threshold) * 100
+                if (new_count % 500 < frames_this_batch) or (int(progress_pct) % 10 == 0 and int(progress_pct) > 0):
+                    # 使用一个简单的机制避免重复打印
+                    last_logged_count = getattr(self, f'_last_logged_count_{comp_name}', -1)
+                    if abs(new_count - last_logged_count) >= 500:
+                        import logging
+                        logger = logging.getLogger(__name__)
+                        logger.debug(f"📊 [Delta EEF] Stats progress for {comp_name}: "
+                                   f"frames_processed={new_count:.0f}/{threshold:.0f} ({progress_pct:.1f}%)")
+                        setattr(self, f'_last_logged_count_{comp_name}', new_count)
+                
+                if new_count >= threshold:
                     import logging
                     logger = logging.getLogger(__name__)
-                    progress_pct = (new_count / self.dataset_num_frames) * 100
                     logger.info(f"📈 [Delta EEF] First epoch complete for {comp_name}: "
-                              f"frames_processed={new_count}/{self.dataset_num_frames} ({progress_pct:.1f}%)")
+                              f"frames_processed={new_count:.0f}/{threshold:.0f} "
+                              f"(total_dataset={self.dataset_num_frames}, num_processes={self.num_processes}, {progress_pct:.1f}%)")
                     self.freeze_relative_action_stats()
                     break
     
@@ -880,6 +904,7 @@ class GrootPackInputsStep(ProcessorStep):
             "action_space_type": self.action_space_type,
             "freeze_stats_after_first_epoch": self.freeze_stats_after_first_epoch,
             "dataset_num_frames": self.dataset_num_frames,
+            "num_processes": self.num_processes,
         }
         
         # Include relative_action_stats if available (for Delta eef mode)
