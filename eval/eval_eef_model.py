@@ -383,7 +383,7 @@ class RTCDemoConfig:
     # Model path
     model_path: str = field(
         # default="/home/lab/humanoid_groot/outputs/train/0124_multi_dataset_h100x4_absolute_eef_4322_2X3_groot_cross-attention_ignore_rotation/checkpoints/020000/pretrained_model",
-        default="/home/lab/humanoid_groot/outputs/train/0126_multi_dataset_h100x4_relative_eef_action_4322/checkpoints/014000/pretrained_model",
+        default="/home/lab/humanoid_groot/outputs/train/0126_multi_dataset_h100x4_relative_eef_action_4322/checkpoints/020000/pretrained_model",
         metadata={"help": "Path to the model checkpoint"}
     )
 

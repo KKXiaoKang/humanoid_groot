@@ -378,6 +378,30 @@ def rot6d_to_quaternion_xyzw(rot_6d: np.ndarray) -> np.ndarray:
     return quat
 
 
+def rot6d_to_euler_zyx(rot_6d: np.ndarray) -> np.ndarray:
+    """
+    将6D旋转表示转换为欧拉角 (roll, pitch, yaw)
+    使用ZYX顺序（也称为yaw-pitch-roll或intrinsic rotations）
+    
+    Args:
+        rot_6d: 6维向量 [R11, R21, R31, R12, R22, R32]
+        
+    Returns:
+        欧拉角 [roll, pitch, yaw] (单位：弧度)
+        注意：scipy使用ZYX顺序，返回的是 [yaw, pitch, roll]
+        我们重新排序为 [roll, pitch, yaw] 以便更直观
+    """
+    from scipy.spatial.transform import Rotation as R
+    # 重构旋转矩阵
+    R_mat = reconstruct_rotation_matrix_6d(rot_6d)
+    # 转换为欧拉角（ZYX顺序，即先绕Z轴旋转yaw，再绕Y轴旋转pitch，最后绕X轴旋转roll）
+    # scipy返回的是 [yaw, pitch, roll]（按ZYX顺序）
+    euler_zyx = R.from_matrix(R_mat).as_euler('zyx', degrees=False)
+    # 重新排序为 [roll, pitch, yaw] 以便更直观
+    roll, pitch, yaw = euler_zyx[2], euler_zyx[1], euler_zyx[0]
+    return np.array([roll, pitch, yaw])
+
+
 def convert_eef_action_to_joint_action(eef_action: np.ndarray, model_type: str = '60') -> np.ndarray:
     """
     将20D EEF action转换为16D joint action（用于MuJoCo执行）
@@ -1100,7 +1124,7 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
                        enable_gui=False, rotate_head_camera=False, state_zero=False,
                        is_first_inference=True, chunk_start=None, chunk_end=None, model_action_dt=None,
                        sync_mode=False, max_joint_velocity=None, constant_velocity=False, action_stride=1,
-                       eef_info=None, ik_model_type='60'):
+                       eef_info=None, ik_model_type='60', pause_before_chunk=False):
     """
     运行推理循环（可以多次调用，每次调用开始新的推理会话）
     
@@ -1515,6 +1539,12 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
                     action_chunk = action_chunk[start_idx:end_idx+1].copy()
                     rospy.loginfo(f"⏭️  Selected actions from index {start_idx} to {end_idx} (inclusive): {action_chunk.shape[0]} actions")
 
+                # 保存原始的20D EEF action_chunk用于显示（如果存在）
+                # 在转换为joint space之前保存，这样可以在暂停显示时显示EEF信息
+                original_eef_action_chunk = None
+                if is_eef_mode and action_chunk.shape[1] == 20:
+                    original_eef_action_chunk = action_chunk.copy()
+
                 # 确定arm和claw维度
                 # 注意：对于 EEF mode (20D)，需要先转换为 joint space (16D) 才能生成 transition
                 action_dim_from_chunk = action_chunk.shape[1]
@@ -1532,6 +1562,10 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
                     # 对于 EEF space (20D)，需要先将整个 action_chunk 转换为 joint space
                     # 这样 transition_chunk 和 action_chunk 都在 joint space，可以正常合并和处理
                     if is_eef_mode and action_dim_from_chunk == 20:
+                        # 保存原始的20D EEF action_chunk用于显示（在转换为joint space之前）
+                        if original_eef_action_chunk is None:
+                            original_eef_action_chunk = action_chunk.copy()
+                        
                         rospy.loginfo(f"   EEF mode detected: Converting action_chunk from 20D EEF space to 16D joint space")
                         # 将整个 action_chunk 转换为 joint space
                         joint_action_chunk_list = []
@@ -1637,6 +1671,10 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
                     # 非第一次推理：如果是 EEF mode (20D)，需要先转换为 joint space (16D)
                     # 这样才能正确应用速度限制（速度限制是基于 joint space 的）
                     if is_eef_mode and action_chunk.shape[1] == 20:
+                        # 保存原始的20D EEF action_chunk用于显示（在转换为joint space之前）
+                        if original_eef_action_chunk is None:
+                            original_eef_action_chunk = action_chunk.copy()
+                        
                         rospy.loginfo(f"   EEF mode: Converting action_chunk from 20D EEF space to 16D joint space")
                         joint_action_chunk_list = []
                         for eef_action in action_chunk:
@@ -1644,6 +1682,7 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
                             joint_action_chunk_list.append(joint_action)
                         action_chunk = np.array(joint_action_chunk_list)  # (chunk_size, 16)
                         rospy.loginfo(f"   ✅ Converted action_chunk to joint space: {action_chunk.shape}")
+                    # 如果不是EEF模式，original_eef_action_chunk保持为None（已经在上面初始化）
                     
                     # 确定 arm 和 claw 维度（基于转换后的 action_chunk）
                     action_dim = action_chunk.shape[1]
@@ -1836,12 +1875,89 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
                 
                 # 执行整个chunk
                 rospy.loginfo(f"Executing chunk of size {action_chunk.shape[0]} in sync mode")
+                
+                # 在执行chunk之前暂停，让用户查看chunk信息
+                if pause_before_chunk:
+                    print("\n" + "="*80)
+                    print(f"📊 Chunk Information (Step {step_counter})")
+                    print("="*80)
+                    print(f"Chunk size: {action_chunk.shape[0]} actions")
+                    print(f"Action dimension: {action_chunk.shape[1]}")
+                    if action_chunk.shape[0] > 0:
+                        # 如果有保存的原始20D EEF action_chunk，显示EEF信息
+                        if original_eef_action_chunk is not None and original_eef_action_chunk.shape[1] == 20:
+                            # EEF space结构: [left_pos(0-2), left_rot6d(3-8), right_pos(9-11), right_rot6d(12-17), grippers(18-19)]
+                            first_eef_action = original_eef_action_chunk[0]
+                            last_eef_action = original_eef_action_chunk[-1]
+                            
+                            # 提取left eef信息
+                            left_pos_first = first_eef_action[0:3]
+                            left_rot6d_first = first_eef_action[3:9]
+                            left_euler_first = rot6d_to_euler_zyx(left_rot6d_first)
+                            
+                            left_pos_last = last_eef_action[0:3]
+                            left_rot6d_last = last_eef_action[3:9]
+                            left_euler_last = rot6d_to_euler_zyx(left_rot6d_last)
+                            
+                            # 提取right eef信息
+                            right_pos_first = first_eef_action[9:12]
+                            right_rot6d_first = first_eef_action[12:18]
+                            right_euler_first = rot6d_to_euler_zyx(right_rot6d_first)
+                            
+                            right_pos_last = last_eef_action[9:12]
+                            right_rot6d_last = last_eef_action[12:18]
+                            right_euler_last = rot6d_to_euler_zyx(right_rot6d_last)
+                            
+                            # 显示模式信息
+                            mode_str = "Relative eef" if is_relative_action_mode else "Absolute eef"
+                            print(f"\n🎯 Action mode: {mode_str}")
+                            
+                            # 显示left eef信息
+                            print(f"\n🤚 Left EEF:")
+                            print(f"   First action:")
+                            print(f"     Position (xyz): [{left_pos_first[0]:.4f}, {left_pos_first[1]:.4f}, {left_pos_first[2]:.4f}]")
+                            print(f"     Euler (roll, pitch, yaw): [{np.rad2deg(left_euler_first[0]):.2f}°, {np.rad2deg(left_euler_first[1]):.2f}°, {np.rad2deg(left_euler_first[2]):.2f}°]")
+                            print(f"   Last action:")
+                            print(f"     Position (xyz): [{left_pos_last[0]:.4f}, {left_pos_last[1]:.4f}, {left_pos_last[2]:.4f}]")
+                            print(f"     Euler (roll, pitch, yaw): [{np.rad2deg(left_euler_last[0]):.2f}°, {np.rad2deg(left_euler_last[1]):.2f}°, {np.rad2deg(left_euler_last[2]):.2f}°]")
+                            
+                            # 显示right eef信息
+                            print(f"\n🤚 Right EEF:")
+                            print(f"   First action:")
+                            print(f"     Position (xyz): [{right_pos_first[0]:.4f}, {right_pos_first[1]:.4f}, {right_pos_first[2]:.4f}]")
+                            print(f"     Euler (roll, pitch, yaw): [{np.rad2deg(right_euler_first[0]):.2f}°, {np.rad2deg(right_euler_first[1]):.2f}°, {np.rad2deg(right_euler_first[2]):.2f}°]")
+                            print(f"   Last action:")
+                            print(f"     Position (xyz): [{right_pos_last[0]:.4f}, {right_pos_last[1]:.4f}, {right_pos_last[2]:.4f}]")
+                            print(f"     Euler (roll, pitch, yaw): [{np.rad2deg(right_euler_last[0]):.2f}°, {np.rad2deg(right_euler_last[1]):.2f}°, {np.rad2deg(right_euler_last[2]):.2f}°]")
+                        
+                        # 显示joint space信息（如果已经转换为joint space）
+                        if action_chunk.shape[1] >= 14:
+                            print(f"\n🦾 Arm Joints (Joint Space):")
+                            print(f"   First action arm joints (14D): {action_chunk[0][:14]}")
+                            print(f"   Last action arm joints (14D): {action_chunk[-1][:14]}")
+                        if action_chunk.shape[1] >= 16:
+                            print(f"\n🦀 Claw:")
+                            print(f"   First action claw (2D): {action_chunk[0][14:16]}")
+                            print(f"   Last action claw (2D): {action_chunk[-1][14:16]}")
+                    print("="*80)
+                    user_input = input("Press Enter to execute this chunk, or 'q'+Enter to stop: ").strip().lower()
+                    if user_input == 'q':
+                        print("\n[User] Stopping inference by user request")
+                        FIRST_MODEL_INFERENCE = True
+                        return True
+                    print("Continuing with chunk execution...\n")
+                
                 control_cmd_pose = ("Cmd_pose_z" in ACTION_COMPONENTS or "Cmd_pose_pitch" in ACTION_COMPONENTS)
                 
                 # 对于 EEF action space (20D)，需要转换为 joint space (16D) 用于执行
                 # 注意：如果是在第一次推理时，action_chunk 已经在 transition 生成时转换为 joint space 了
                 # 所以这里只需要检查 action_dim 是否为 20（表示还没有转换）
+                # 但如果在暂停显示时已经保存了original_eef_action_chunk，这里就不需要再保存了
                 if is_eef_mode and action_chunk.shape[1] == 20:
+                    # 如果还没有保存原始的20D EEF action_chunk，现在保存（用于显示）
+                    if original_eef_action_chunk is None:
+                        original_eef_action_chunk = action_chunk.copy()
+                    
                     # 将整个 chunk 转换为 joint space
                     joint_action_chunk = []
                     for eef_action in action_chunk:
@@ -1993,7 +2109,7 @@ def final_reset_arm(json_path, env, control_arm=True, control_claw=True):
     rospy.loginfo("Arm reset completed!")
 
 
-def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chunk_size=50, enable_gui=False, rotate_head_camera=False, state_zero=False, task_description=None, chunk_start=None, chunk_end=None, model_action_dt=None, sync_mode=False, max_joint_velocity=None, constant_velocity=False, action_stride=1, claw_lock_threshold=50.0, claw_lock_count_threshold=5, claw_locked_value=90.0, ik_model_type='60'):
+def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chunk_size=50, enable_gui=False, rotate_head_camera=False, state_zero=False, task_description=None, chunk_start=None, chunk_end=None, model_action_dt=None, sync_mode=False, max_joint_velocity=None, constant_velocity=False, action_stride=1, claw_lock_threshold=50.0, claw_lock_count_threshold=5, claw_locked_value=90.0, ik_model_type='60', pause_before_chunk=False):
     """
     在这里和实机/仿真交互，做网络推理（depalletize任务）
     支持多次推理：按'q'退出当前推理，可以快速重新开始下一次推理而无需重新加载模型
@@ -2078,7 +2194,8 @@ def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chun
                 constant_velocity=constant_velocity,
                 action_stride=action_stride,
                 eef_info=eef_info,
-                ik_model_type=ik_model_type
+                ik_model_type=ik_model_type,
+                pause_before_chunk=pause_before_chunk
             )
             
             if normal_exit:
@@ -2195,6 +2312,9 @@ if __name__ == '__main__':
     parser.add_argument('--ik-model-type', type=str, default='60',
                         choices=['45', '46', '60'],
                         help='Robot model type for IK solving (default: 60). Used when action space is EEF (20D).')
+    parser.add_argument('--pause-before-chunk', action='store_true',
+                        help='If set, pause before executing each chunk to allow inspection. '
+                             'Press Enter to continue, or "q"+Enter to stop.')
     
     args = parser.parse_args()
     
@@ -2264,6 +2384,8 @@ if __name__ == '__main__':
             print(f"⚙️  Constant velocity mode: Enabled (actions will execute at constant velocity within speed limit)")
     if args.action_stride > 1:
         print(f"⚡ Action stride: {args.action_stride} (executing every {args.action_stride}-th action, ~{args.action_stride}x speedup)")
+    if args.pause_before_chunk:
+        print(f"⏸️  Pause before chunk: Enabled (will pause before executing each chunk for inspection)")
     print(f"🔒 Claw lock mechanism: threshold={args.claw_lock_threshold}, count_threshold={args.claw_lock_count_threshold}, locked_value={args.claw_locked_value}")
     print("="*80 + "\n")
 
@@ -2285,7 +2407,8 @@ if __name__ == '__main__':
              claw_lock_threshold=args.claw_lock_threshold,
              claw_lock_count_threshold=args.claw_lock_count_threshold,
              claw_locked_value=args.claw_locked_value,
-             ik_model_type=args.ik_model_type)
+             ik_model_type=args.ik_model_type,
+             pause_before_chunk=args.pause_before_chunk)
     elif args.replay:
         print("Replaying the model")
         lerobot_dataset_path = '/home/lab/kuavo-manip/lerobot_data/vel_wrend_box_613'
