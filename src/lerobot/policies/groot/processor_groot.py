@@ -513,7 +513,9 @@ class GrootPackInputsStep(ProcessorStep):
         
         # 更新每个position组件的统计值
         b, t, d = relative_action.shape
-        total_samples_this_batch = b * t
+        # 注意：dataset_num_frames是数据集的帧数（samples数），不是batch_size * action_horizon的累积
+        # 每个batch处理了b个不同的frames，所以应该统计b而不是b*t
+        frames_this_batch = b  # 实际处理的frames数
         device = relative_action.device  # 确保使用正确的设备
         
         for comp_name, (start_idx, end_idx) in self.action_component_indices.items():
@@ -523,7 +525,7 @@ class GrootPackInputsStep(ProcessorStep):
             # 提取组件数据 (B, T, comp_dim)
             comp_data = relative_action[:, :, start_idx:end_idx]
             
-            # 计算当前batch的min/max
+            # 计算当前batch的min/max（考虑所有timesteps）
             comp_min = comp_data.min(dim=0)[0].min(dim=0)[0]  # (comp_dim,)
             comp_max = comp_data.max(dim=0)[0].max(dim=0)[0]  # (comp_dim,)
             
@@ -544,7 +546,8 @@ class GrootPackInputsStep(ProcessorStep):
             # 使用running min/max更新
             new_min = torch.minimum(current_min, comp_min)
             new_max = torch.maximum(current_max, comp_max)
-            new_count = current_count + total_samples_this_batch
+            # 统计实际处理的frames数，而不是batch_size * action_horizon
+            new_count = current_count + frames_this_batch
             
             self.relative_action_stats[comp_name]["min"] = new_min
             self.relative_action_stats[comp_name]["max"] = new_max
@@ -552,13 +555,13 @@ class GrootPackInputsStep(ProcessorStep):
             
             # 检查是否应该冻结统计值（第一个epoch完成）
             if self.freeze_stats_after_first_epoch and self.dataset_num_frames is not None:
-                # 如果累积的样本数达到或超过数据集大小，说明第一个epoch已完成
+                # 如果累积的frames数达到或超过数据集大小，说明第一个epoch已完成
                 if new_count >= self.dataset_num_frames:
                     import logging
                     logger = logging.getLogger(__name__)
                     progress_pct = (new_count / self.dataset_num_frames) * 100
                     logger.info(f"📈 [Delta EEF] First epoch complete for {comp_name}: "
-                              f"count={new_count}/{self.dataset_num_frames} ({progress_pct:.1f}%)")
+                              f"frames_processed={new_count}/{self.dataset_num_frames} ({progress_pct:.1f}%)")
                     self.freeze_relative_action_stats()
                     break
     
