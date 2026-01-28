@@ -215,6 +215,8 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     if (cfg.policy.pretrained_path and not cfg.resume) or not cfg.policy.pretrained_path:
         # Only provide dataset_stats when not resuming from saved processor state
         processor_kwargs["dataset_stats"] = dataset.meta.stats
+        # Pass dataset_num_frames for relative action stats accumulation (Delta eef mode)
+        processor_kwargs["dataset_num_frames"] = dataset.num_frames
 
     if cfg.policy.pretrained_path is not None:
         processor_kwargs["preprocessor_overrides"] = {

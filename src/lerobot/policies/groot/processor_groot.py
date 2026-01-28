@@ -147,7 +147,9 @@ def matrix_to_rot6d(rotation_matrix: torch.Tensor) -> torch.Tensor:
 
 
 def make_groot_pre_post_processors(
-    config: GrootConfig, dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None
+    config: GrootConfig, 
+    dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
+    dataset_num_frames: int | None = None,
 ) -> tuple[
     PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     PolicyProcessorPipeline[PolicyAction, PolicyAction],
@@ -172,6 +174,8 @@ def make_groot_pre_post_processors(
     Args:
         config: Groot configuration containing data_config, embodiment_tag, etc.
         dataset_stats: Optional per-key min/max statistics for normalization before padding.
+        dataset_num_frames: Optional total number of frames in dataset. Used to detect when first epoch
+                           is complete for relative action stats accumulation (Delta eef mode).
 
     Returns:
         Tuple of (preprocessor, postprocessor) pipelines
@@ -256,6 +260,7 @@ def make_groot_pre_post_processors(
             stats=padded_stats,
             action_space_type=action_space_type,
             action_component_indices=action_component_indices,
+            dataset_num_frames=dataset_num_frames,
         ),
         # 4. Eagle encode (creates eagle_content)
         GrootEagleEncodeStep(
@@ -352,6 +357,22 @@ class GrootPackInputsStep(ProcessorStep):
     action_space_type: str | None = None  # "Delta eef", "Absolute eef", "Absolute joint", etc.
     action_component_indices: dict[str, tuple[int, int]] | None = None  # e.g., {"left_eef_pos": (0, 3), ...}
     _relative_action_conversion_logged: bool = False  # Track if we've logged the conversion
+    
+    # Dynamic normalization statistics for relative action position components
+    # These are accumulated during training and saved to model config
+    relative_action_stats: dict[str, dict[str, torch.Tensor]] | None = field(
+        default=None, init=False, repr=False
+    )  # e.g., {"left_eef_pos": {"min": ..., "max": ..., "count": ...}, ...}
+    _relative_stats_initialized: bool = field(default=False, init=False, repr=False)
+    _relative_stats_frozen: bool = field(default=False, init=False, repr=False)  # 是否已冻结统计值
+    freeze_stats_after_first_epoch: bool = field(
+        default=True, 
+        metadata={"help": "If True, freeze relative action stats after first epoch (recommended for fixed datasets)"}
+    )
+    dataset_num_frames: int | None = field(
+        default=None,
+        metadata={"help": "Total number of frames in dataset. Used to detect when first epoch is complete."}
+    )
 
     def _convert_absolute_to_relative_eef_action(self, absolute_action: torch.Tensor) -> torch.Tensor:
         """
@@ -435,7 +456,104 @@ class GrootPackInputsStep(ProcessorStep):
                 pass
         
         return relative_action
-
+    
+    def update_relative_action_stats(self, relative_action: torch.Tensor):
+        """
+        更新relative action position组件的统计值（min/max/count）。
+        
+        这个方法在训练过程中被调用，用于累积relative action的统计值。
+        只对position组件（left_eef_pos, right_eef_pos）进行统计，因为：
+        1. rotation组件使用IDENTITY归一化，不需要统计
+        2. gripper组件可以使用absolute stats
+        
+        对于固定数据集，建议设置freeze_stats_after_first_epoch=True，
+        这样在第一个epoch完成后会停止累积统计值，避免不必要的计算。
+        
+        Args:
+            relative_action: Relative EEF action tensor. Shape: (B, T, D)
+        """
+        if self.action_space_type != "Delta eef" or self.action_component_indices is None:
+            return
+        
+        # 如果统计值已冻结，跳过更新
+        if self._relative_stats_frozen:
+            return
+        
+        if not self._relative_stats_initialized:
+            # 初始化统计值字典
+            self.relative_action_stats = {}
+            for comp_name, (start_idx, end_idx) in self.action_component_indices.items():
+                if "pos" in comp_name:
+                    # 只对position组件初始化统计值
+                    comp_dim = end_idx - start_idx
+                    self.relative_action_stats[comp_name] = {
+                        "min": torch.full((comp_dim,), float('inf'), dtype=torch.float32),
+                        "max": torch.full((comp_dim,), float('-inf'), dtype=torch.float32),
+                        "count": torch.tensor(0, dtype=torch.long),
+                    }
+            self._relative_stats_initialized = True
+        
+        # 更新每个position组件的统计值
+        b, t, d = relative_action.shape
+        total_samples_this_batch = b * t
+        
+        for comp_name, (start_idx, end_idx) in self.action_component_indices.items():
+            if comp_name not in self.relative_action_stats:
+                continue
+            
+            # 提取组件数据 (B, T, comp_dim)
+            comp_data = relative_action[:, :, start_idx:end_idx]
+            
+            # 计算当前batch的min/max
+            comp_min = comp_data.min(dim=0)[0].min(dim=0)[0]  # (comp_dim,)
+            comp_max = comp_data.max(dim=0)[0].max(dim=0)[0]  # (comp_dim,)
+            
+            # 更新全局min/max
+            current_min = self.relative_action_stats[comp_name]["min"]
+            current_max = self.relative_action_stats[comp_name]["max"]
+            current_count = self.relative_action_stats[comp_name]["count"]
+            
+            # 使用running min/max更新
+            new_min = torch.minimum(current_min, comp_min)
+            new_max = torch.maximum(current_max, comp_max)
+            new_count = current_count + total_samples_this_batch
+            
+            self.relative_action_stats[comp_name]["min"] = new_min
+            self.relative_action_stats[comp_name]["max"] = new_max
+            self.relative_action_stats[comp_name]["count"] = new_count
+            
+            # 检查是否应该冻结统计值（第一个epoch完成）
+            if self.freeze_stats_after_first_epoch and self.dataset_num_frames is not None:
+                # 如果累积的样本数达到或超过数据集大小，说明第一个epoch已完成
+                if new_count >= self.dataset_num_frames:
+                    self.freeze_relative_action_stats()
+                    break
+    
+    def freeze_relative_action_stats(self):
+        """
+        冻结relative action统计值，停止累积。
+        
+        对于固定数据集，在第一个epoch完成后调用此方法可以：
+        1. 避免不必要的计算开销
+        2. 确保统计值稳定（不会因为浮点误差产生微小变化）
+        3. 符合统计学的直觉（统计值应该基于完整数据集计算一次）
+        """
+        if self._relative_stats_frozen:
+            return
+        
+        self._relative_stats_frozen = True
+        
+        # 打印统计值摘要
+        if self.relative_action_stats is not None:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.info("🔒 [Delta EEF] Freezing relative action stats after first epoch:")
+            for comp_name, stats in self.relative_action_stats.items():
+                count = stats["count"].item() if isinstance(stats["count"], torch.Tensor) else stats["count"]
+                min_vals = stats["min"].tolist() if isinstance(stats["min"], torch.Tensor) else stats["min"]
+                max_vals = stats["max"].tolist() if isinstance(stats["max"], torch.Tensor) else stats["max"]
+                logger.info(f"   {comp_name}: count={count}, min={min_vals}, max={max_vals}")
+    
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         obs = transition.get(TransitionKey.OBSERVATION, {}) or {}
         comp = transition.get(TransitionKey.COMPLEMENTARY_DATA, {}) or {}
@@ -531,17 +649,49 @@ class GrootPackInputsStep(ProcessorStep):
                     
                     # For relative actions, adjust normalization range for position components
                     if is_relative_action and "pos" in component_name:
-                        # Relative position distribution: approximately centered at 0
-                        # Range: [-abs_range, abs_range] where abs_range = max(|min|, |max|)
-                        abs_range = torch.maximum(torch.abs(min_v), torch.abs(max_v))
-                        # Use a slightly wider range (1.5x) to account for distribution spread
-                        rel_range = abs_range * 1.5
-                        min_v = -rel_range
-                        max_v = rel_range
-                        # If abs_range is too small, use a default range (e.g., ±1.0 meter)
-                        default_range = torch.ones_like(abs_range) * 1.0
-                        min_v = torch.where(abs_range < 0.1, -default_range, min_v)
-                        max_v = torch.where(abs_range < 0.1, default_range, max_v)
+                        # Use dynamically accumulated relative_action_stats if available
+                        if (self.relative_action_stats is not None and 
+                            component_name in self.relative_action_stats):
+                            # Use accumulated relative action stats
+                            rel_stats = self.relative_action_stats[component_name]
+                            rel_min = rel_stats["min"]
+                            rel_max = rel_stats["max"]
+                            
+                            # Ensure stats are on the correct device and have correct shape
+                            if isinstance(rel_min, torch.Tensor):
+                                rel_min = rel_min.to(device=component.device, dtype=component.dtype)
+                                rel_max = rel_max.to(device=component.device, dtype=component.dtype)
+                            else:
+                                rel_min = torch.as_tensor(rel_min, device=component.device, dtype=component.dtype)
+                                rel_max = torch.as_tensor(rel_max, device=component.device, dtype=component.dtype)
+                            
+                            # Use accumulated stats directly
+                            min_v = rel_min
+                            max_v = rel_max
+                            
+                            # If stats are invalid (all inf), fallback to adjusted absolute range
+                            if torch.any(torch.isinf(rel_min)) or torch.any(torch.isinf(rel_max)):
+                                abs_range = torch.maximum(torch.abs(min_v_full[start_idx:end_idx]), 
+                                                         torch.abs(max_v_full[start_idx:end_idx]))
+                                rel_range = abs_range * 1.5
+                                min_v = -rel_range
+                                max_v = rel_range
+                                default_range = torch.ones_like(abs_range) * 1.0
+                                min_v = torch.where(abs_range < 0.1, -default_range, min_v)
+                                max_v = torch.where(abs_range < 0.1, default_range, max_v)
+                        else:
+                            # Fallback: use adjusted absolute range (original behavior)
+                            # Relative position distribution: approximately centered at 0
+                            # Range: [-abs_range, abs_range] where abs_range = max(|min|, |max|)
+                            abs_range = torch.maximum(torch.abs(min_v), torch.abs(max_v))
+                            # Use a slightly wider range (1.5x) to account for distribution spread
+                            rel_range = abs_range * 1.5
+                            min_v = -rel_range
+                            max_v = rel_range
+                            # If abs_range is too small, use a default range (e.g., ±1.0 meter)
+                            default_range = torch.ones_like(abs_range) * 1.0
+                            min_v = torch.where(abs_range < 0.1, -default_range, min_v)
+                            max_v = torch.where(abs_range < 0.1, default_range, max_v)
                     
                     denom = max_v - min_v
                     mask = denom != 0
@@ -623,6 +773,11 @@ class GrootPackInputsStep(ProcessorStep):
             # This happens BEFORE normalization
             if self.action_space_type == "Delta eef" and self.action_component_indices is not None:
                 action = self._convert_absolute_to_relative_eef_action(action)
+                # Update relative action statistics for position components
+                # This accumulates stats during training
+                # Note: We always update stats when processing data (training or inference)
+                # During inference, stats won't change since they're already loaded from checkpoint
+                self.update_relative_action_stats(action)
             
             # Normalize AFTER relative action conversion
             if self.normalize_min_max:
@@ -674,8 +829,9 @@ class GrootPackInputsStep(ProcessorStep):
         Returns a serializable dictionary of the processor's configuration.
 
         Excludes 'stats' since they are saved separately via state_dict().
+        Includes relative_action_stats if available (for Delta eef mode).
         """
-        return {
+        config = {
             "state_horizon": self.state_horizon,
             "action_horizon": self.action_horizon,
             "max_state_dim": self.max_state_dim,
@@ -685,22 +841,48 @@ class GrootPackInputsStep(ProcessorStep):
             "embodiment_tag": self.embodiment_tag,
             "embodiment_mapping": self.embodiment_mapping,
             "normalize_min_max": self.normalize_min_max,
+            "action_space_type": self.action_space_type,
+            "freeze_stats_after_first_epoch": self.freeze_stats_after_first_epoch,
+            "dataset_num_frames": self.dataset_num_frames,
         }
+        
+        # Include relative_action_stats if available (for Delta eef mode)
+        if self.relative_action_stats is not None:
+            # Convert to serializable format (list instead of tensor)
+            relative_stats_serializable = {}
+            for comp_name, stats in self.relative_action_stats.items():
+                relative_stats_serializable[comp_name] = {
+                    "min": stats["min"].cpu().tolist() if isinstance(stats["min"], torch.Tensor) else stats["min"],
+                    "max": stats["max"].cpu().tolist() if isinstance(stats["max"], torch.Tensor) else stats["max"],
+                    "count": int(stats["count"].item() if isinstance(stats["count"], torch.Tensor) else stats["count"]),
+                }
+            config["relative_action_stats"] = relative_stats_serializable
+        
+        return config
 
     def state_dict(self) -> dict[str, torch.Tensor]:
         """
         Returns normalization statistics as a flat state dictionary.
 
         This enables saving stats to safetensors files, similar to normalizer_processor.
+        Also includes relative_action_stats for Delta eef mode.
         """
-        if not self.stats:
-            return {}
-
         flat: dict[str, torch.Tensor] = {}
-        for key, sub in self.stats.items():
-            for stat_name, value in sub.items():
-                tensor = torch.as_tensor(value).cpu()
-                flat[f"{key}.{stat_name}"] = tensor
+        
+        # Save standard stats
+        if self.stats:
+            for key, sub in self.stats.items():
+                for stat_name, value in sub.items():
+                    tensor = torch.as_tensor(value).cpu()
+                    flat[f"{key}.{stat_name}"] = tensor
+        
+        # Save relative_action_stats for Delta eef mode
+        if self.relative_action_stats is not None:
+            for comp_name, stats in self.relative_action_stats.items():
+                for stat_name, value in stats.items():
+                    tensor = torch.as_tensor(value).cpu()
+                    flat[f"relative_action.{comp_name}.{stat_name}"] = tensor
+        
         return flat
 
     def load_state_dict(self, state: dict[str, torch.Tensor]) -> None:
@@ -708,13 +890,26 @@ class GrootPackInputsStep(ProcessorStep):
         Loads normalization statistics from a flat state dictionary.
 
         This enables loading stats from safetensors files during from_pretrained.
+        Also loads relative_action_stats for Delta eef mode.
         """
         if not state:
             return
 
         reconstructed: dict[str, dict[str, Any]] = {}
+        relative_stats_reconstructed: dict[str, dict[str, torch.Tensor]] = {}
+        
         for flat_key, tensor in state.items():
-            if "." in flat_key:
+            if flat_key.startswith("relative_action."):
+                # Handle relative_action_stats
+                # Format: "relative_action.{comp_name}.{stat_name}"
+                parts = flat_key.split(".")
+                if len(parts) == 3:
+                    _, comp_name, stat_name = parts
+                    if comp_name not in relative_stats_reconstructed:
+                        relative_stats_reconstructed[comp_name] = {}
+                    relative_stats_reconstructed[comp_name][stat_name] = tensor
+            elif "." in flat_key:
+                # Handle standard stats
                 key, stat_name = flat_key.rsplit(".", 1)
                 if key not in reconstructed:
                     reconstructed[key] = {}
@@ -722,6 +917,10 @@ class GrootPackInputsStep(ProcessorStep):
 
         if reconstructed:
             self.stats = reconstructed
+        
+        if relative_stats_reconstructed:
+            self.relative_action_stats = relative_stats_reconstructed
+            self._relative_stats_initialized = True
 
 
 @dataclass
@@ -1103,17 +1302,49 @@ class GrootActionUnpackUnnormalizeStep(ProcessorStep):
                 
                 # For relative actions, adjust normalization range for position components (same as forward)
                 if is_relative_action and "pos" in component_name:
-                    # Relative position distribution: approximately centered at 0
-                    # Range: [-abs_range, abs_range] where abs_range = max(|min|, |max|)
-                    abs_range = torch.maximum(torch.abs(min_v), torch.abs(max_v))
-                    # Use a slightly wider range (1.5x) to account for distribution spread
-                    rel_range = abs_range * 1.5
-                    min_v = -rel_range
-                    max_v = rel_range
-                    # If abs_range is too small, use a default range (e.g., ±1.0 meter)
-                    default_range = torch.ones_like(abs_range) * 1.0
-                    min_v = torch.where(abs_range < 0.1, -default_range, min_v)
-                    max_v = torch.where(abs_range < 0.1, default_range, max_v)
+                    # Use dynamically accumulated relative_action_stats if available
+                    if (self.relative_action_stats is not None and 
+                        component_name in self.relative_action_stats):
+                        # Use accumulated relative action stats
+                        rel_stats = self.relative_action_stats[component_name]
+                        rel_min = rel_stats["min"]
+                        rel_max = rel_stats["max"]
+                        
+                        # Ensure stats are on the correct device and have correct shape
+                        if isinstance(rel_min, torch.Tensor):
+                            rel_min = rel_min.to(device=component.device, dtype=component.dtype)
+                            rel_max = rel_max.to(device=component.device, dtype=component.dtype)
+                        else:
+                            rel_min = torch.as_tensor(rel_min, device=component.device, dtype=component.dtype)
+                            rel_max = torch.as_tensor(rel_max, device=component.device, dtype=component.dtype)
+                        
+                        # Use accumulated stats directly
+                        min_v = rel_min
+                        max_v = rel_max
+                        
+                        # If stats are invalid (all inf), fallback to adjusted absolute range
+                        if torch.any(torch.isinf(rel_min)) or torch.any(torch.isinf(rel_max)):
+                            abs_range = torch.maximum(torch.abs(min_v_full[start_idx:end_idx]), 
+                                                     torch.abs(max_v_full[start_idx:end_idx]))
+                            rel_range = abs_range * 1.5
+                            min_v = -rel_range
+                            max_v = rel_range
+                            default_range = torch.ones_like(abs_range) * 1.0
+                            min_v = torch.where(abs_range < 0.1, -default_range, min_v)
+                            max_v = torch.where(abs_range < 0.1, default_range, max_v)
+                    else:
+                        # Fallback: use adjusted absolute range (original behavior)
+                        # Relative position distribution: approximately centered at 0
+                        # Range: [-abs_range, abs_range] where abs_range = max(|min|, |max|)
+                        abs_range = torch.maximum(torch.abs(min_v), torch.abs(max_v))
+                        # Use a slightly wider range (1.5x) to account for distribution spread
+                        rel_range = abs_range * 1.5
+                        min_v = -rel_range
+                        max_v = rel_range
+                        # If abs_range is too small, use a default range (e.g., ±1.0 meter)
+                        default_range = torch.ones_like(abs_range) * 1.0
+                        min_v = torch.where(abs_range < 0.1, -default_range, min_v)
+                        max_v = torch.where(abs_range < 0.1, default_range, max_v)
                 
                 denom = max_v - min_v
                 mask = denom != 0
