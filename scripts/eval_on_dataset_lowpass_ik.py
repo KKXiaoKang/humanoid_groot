@@ -399,6 +399,7 @@ def eval_on_dataset(ckpt_path,
                     image_zero=False,
                     state_zero=False,
                     cam_head_zero=False,
+                    rgb_only=False,
                     infer_per_frame: int = 1,
                     task_description: str | None = None,
                     publish_arm_commands: bool = False,
@@ -527,6 +528,41 @@ def eval_on_dataset(ckpt_path,
     # Debug: Print model configuration
     print(f"🔍 Model configuration input_features keys: {list(policy.config.input_features.keys()) if hasattr(policy.config, 'input_features') else 'N/A'}")
     print(f"🔍 Model configuration output_features keys: {list(policy.config.output_features.keys()) if hasattr(policy.config, 'output_features') else 'N/A'}")
+    
+    # 检查模型是否为RGB-only模式（use_state_encoder=False）
+    is_rgb_only_model = False
+    use_state_encoder_value = None
+    if rgb_only:
+        # 用户显式指定RGB-only模式
+        is_rgb_only_model = True
+        print(f"\n🎨 RGB-only mode enabled via --rgb-only flag")
+        print(f"   State inputs will be automatically set to zero during inference")
+    else:
+        # 自动检测模型配置
+        try:
+            # 尝试从action_head配置中获取use_state_encoder设置
+            if hasattr(policy, '_groot_model') and hasattr(policy._groot_model, 'action_head'):
+                action_head_config = policy._groot_model.action_head.config
+                if hasattr(action_head_config, 'use_state_encoder'):
+                    use_state_encoder_value = action_head_config.use_state_encoder
+                    is_rgb_only_model = not use_state_encoder_value
+                    if is_rgb_only_model:
+                        print(f"\n🎨 RGB-only model auto-detected: use_state_encoder=False")
+                        print(f"   Model relies only on RGB observation and language instruction")
+                        print(f"   State inputs will be automatically set to zero during inference")
+                    else:
+                        print(f"\n✅ State encoder enabled: use_state_encoder=True")
+                        print(f"   Model uses state input. Ensure state is not zeroed out.")
+        except Exception as e:
+            print(f"⚠️  Warning: Could not check RGB-only mode from model config: {e}")
+            print(f"   Will rely on --state-zero or --rgb-only flag if provided")
+    
+    # 验证：如果模型使用state_encoder，确保state不会被置零
+    if use_state_encoder_value is True and (state_zero or is_rgb_only_model):
+        print(f"\n⚠️  WARNING: Model has use_state_encoder=True, but state will be zeroed out!")
+        print(f"   This may cause incorrect inference. Consider:")
+        print(f"   1. Remove --rgb-only or --state-zero flags")
+        print(f"   2. Or retrain model with use_state_encoder=False for RGB-only mode")
     
     policy.reset()
     print("✅ Model loaded and ready")
@@ -888,10 +924,19 @@ def eval_on_dataset(ckpt_path,
                 if 'image' in key.lower() and key.startswith('observation'):
                     observation[key] = batch[key]
         
-        # 如果启用state_zero模式，将状态输入置零（用于验证模型对状态的依赖性）
-        if state_zero:
+        # 如果启用state_zero模式或模型是RGB-only模式，将状态输入置零
+        # RGB-only模型不需要state输入，但processor可能仍然期望state存在（用于padding等）
+        # 所以我们将state置零以保持兼容性
+        if state_zero or is_rgb_only_model:
             # 保持相同的形状和设备，但将所有状态值设为0
-            observation['observation.state'] = torch.zeros_like(observation['observation.state'])
+            if 'observation.state' in observation:
+                observation['observation.state'] = torch.zeros_like(observation['observation.state'])
+                if is_rgb_only_model and data_step == 0:
+                    # 只在第一帧打印一次，避免刷屏
+                    print(f"   🎨 RGB-only mode: State input set to zero (model does not use state encoder)")
+            elif is_rgb_only_model and data_step == 0:
+                # State不存在，对于RGB-only模式这是正常的
+                print(f"   🎨 RGB-only mode: State input not provided (model does not use state encoder)")
         
         # 如果启用image_zero模式，将所有图像输入置零（用于验证模型对图像的依赖性）
         if image_zero:
@@ -1578,6 +1623,8 @@ if __name__ == "__main__":
                        help='Set all state inputs to zero (for testing model dependency on state)')
     parser.add_argument('--cam-head-zero', action='store_true',
                        help='Set cam_head (image) input to zero (for testing model dependency on cam_head)')
+    parser.add_argument('--rgb-only', action='store_true',
+                       help='Force RGB-only mode: automatically set state to zero (useful for RGB-only trained models). Model will auto-detect RGB-only mode from config, but this flag can override.')
     parser.add_argument('--infer-per-frame', type=int, default=1,
                        help='Run policy inference every N frames (default: 1 = every frame)')
     parser.add_argument('--task-description', type=str, default=None,
@@ -1601,6 +1648,7 @@ if __name__ == "__main__":
     print(f"Image Zero Mode: {args.image_zero}")
     print(f"State Zero Mode: {args.state_zero}")
     print(f"Cam Head Zero Mode: {args.cam_head_zero}")
+    print(f"RGB-Only Mode: {args.rgb_only}")
     print(f"Infer Every N Frames: {args.infer_per_frame}")
     if args.task_description:
         print(f"Task Description (overridden): '{args.task_description}'")
@@ -1621,6 +1669,7 @@ if __name__ == "__main__":
         image_zero=args.image_zero,
         state_zero=args.state_zero,
         cam_head_zero=args.cam_head_zero,
+        rgb_only=args.rgb_only,
         infer_per_frame=args.infer_per_frame,
         task_description=args.task_description,
         publish_arm_commands=args.publish_arm_commands,
