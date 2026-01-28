@@ -481,21 +481,40 @@ class GrootPackInputsStep(ProcessorStep):
         
         if not self._relative_stats_initialized:
             # 初始化统计值字典
+            # 从输入tensor获取设备信息，确保统计值在正确的设备上
+            device = relative_action.device
+            dtype = relative_action.dtype
+            
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.info("📊 [Delta EEF] Initializing relative action stats accumulation:")
+            logger.info(f"   Action space: {self.action_space_type}")
+            logger.info(f"   Device: {device}")
+            logger.info(f"   Dtype: {dtype}")
+            logger.info(f"   Freeze after first epoch: {self.freeze_stats_after_first_epoch}")
+            if self.dataset_num_frames is not None:
+                logger.info(f"   Dataset num frames: {self.dataset_num_frames}")
+            else:
+                logger.warning("   ⚠️  dataset_num_frames not set - auto-freeze disabled")
+            
             self.relative_action_stats = {}
             for comp_name, (start_idx, end_idx) in self.action_component_indices.items():
                 if "pos" in comp_name:
                     # 只对position组件初始化统计值
                     comp_dim = end_idx - start_idx
                     self.relative_action_stats[comp_name] = {
-                        "min": torch.full((comp_dim,), float('inf'), dtype=torch.float32),
-                        "max": torch.full((comp_dim,), float('-inf'), dtype=torch.float32),
-                        "count": torch.tensor(0, dtype=torch.long),
+                        "min": torch.full((comp_dim,), float('inf'), dtype=dtype, device=device),
+                        "max": torch.full((comp_dim,), float('-inf'), dtype=dtype, device=device),
+                        "count": torch.tensor(0, dtype=torch.long, device=device),
                     }
+                    logger.info(f"   ✅ Tracking {comp_name} (indices [{start_idx}:{end_idx}], dim={comp_dim})")
             self._relative_stats_initialized = True
+            logger.info("   🚀 Stats accumulation started - will update during training")
         
         # 更新每个position组件的统计值
         b, t, d = relative_action.shape
         total_samples_this_batch = b * t
+        device = relative_action.device  # 确保使用正确的设备
         
         for comp_name, (start_idx, end_idx) in self.action_component_indices.items():
             if comp_name not in self.relative_action_stats:
@@ -513,6 +532,15 @@ class GrootPackInputsStep(ProcessorStep):
             current_max = self.relative_action_stats[comp_name]["max"]
             current_count = self.relative_action_stats[comp_name]["count"]
             
+            # 确保所有tensor都在同一设备上（防止设备不匹配）
+            if current_min.device != device:
+                current_min = current_min.to(device=device)
+                current_max = current_max.to(device=device)
+                current_count = current_count.to(device=device)
+                self.relative_action_stats[comp_name]["min"] = current_min
+                self.relative_action_stats[comp_name]["max"] = current_max
+                self.relative_action_stats[comp_name]["count"] = current_count
+            
             # 使用running min/max更新
             new_min = torch.minimum(current_min, comp_min)
             new_max = torch.maximum(current_max, comp_max)
@@ -526,6 +554,11 @@ class GrootPackInputsStep(ProcessorStep):
             if self.freeze_stats_after_first_epoch and self.dataset_num_frames is not None:
                 # 如果累积的样本数达到或超过数据集大小，说明第一个epoch已完成
                 if new_count >= self.dataset_num_frames:
+                    import logging
+                    logger = logging.getLogger(__name__)
+                    progress_pct = (new_count / self.dataset_num_frames) * 100
+                    logger.info(f"📈 [Delta EEF] First epoch complete for {comp_name}: "
+                              f"count={new_count}/{self.dataset_num_frames} ({progress_pct:.1f}%)")
                     self.freeze_relative_action_stats()
                     break
     
