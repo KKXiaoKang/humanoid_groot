@@ -1188,7 +1188,8 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
                        enable_gui=False, rotate_head_camera=False, state_zero=False,
                        is_first_inference=True, chunk_start=None, chunk_end=None, model_action_dt=None,
                        sync_mode=False, max_joint_velocity=None, constant_velocity=False, action_stride=1,
-                       eef_info=None, ik_model_type='60', pause_before_chunk=False):
+                       eef_info=None, ik_model_type='60', pause_before_chunk=False,
+                       use_predicted_as_reference=False):
     """
     运行推理循环（可以多次调用，每次调用开始新的推理会话）
     
@@ -1215,6 +1216,10 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
         action_stride: 动作采样间隔，用于加速执行。例如：action_stride=2表示每隔2个action执行一次，跳过中间的action。
                        设置为1表示不跳过任何action（正常速度）。设置为N表示执行速度约为原来的N倍。
                        注意：这不会改变速度限制，只是减少执行的action数量。
+        use_predicted_as_reference: 是否使用模型预测的上一个绝对位姿作为下一个chunk的reference（仅对Delta eef模式有效）。
+                                   如果True，使用上一个chunk预测的最后一个绝对位姿作为reference，而不是机器人的实际状态。
+                                   这可以减少因跟踪误差导致的误差累积问题。
+                                   默认False（使用机器人实际状态作为reference，与训练时一致）。
     
     Returns:
         bool: True表示正常退出（按q），False表示被中断（Ctrl+C）
@@ -1254,6 +1259,9 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
         print(f"⚙️  Constant velocity mode: Enabled (actions will execute at constant velocity within speed limit)")
     if action_stride > 1:
         print(f"⚡ Action stride: {action_stride} (executing every {action_stride}-th action, ~{action_stride}x speedup)")
+    if use_predicted_as_reference:
+        print(f"🔗 Use predicted as reference: Enabled (for Delta eef: use last predicted absolute pose as next reference)")
+        print(f"   This helps reduce error accumulation from tracking errors.")
     print(f"📝 Task description: '{task_description}'")
     print("="*80 + "\n")
     
@@ -1343,6 +1351,7 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
     postprocessor_step = eef_info.get('postprocessor_step')
     fk_getter = eef_info.get('fk_getter')
     current_reference_pose = None  # 用于 relative action mode
+    last_executed_absolute_action = None  # 用于 use_predicted_as_reference 模式：保存上一个chunk执行的最后一个绝对位姿
     
     # 如果 action_dim 是 None 但 action_space_type 是 EEF space，推断 action_dim 为 20
     if action_dim is None and action_space_type in ["Delta eef", "Absolute eef"]:
@@ -1354,6 +1363,8 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
     
     if is_eef_mode:
         rospy.loginfo(f"[INFERENCE] ✅ EEF mode detected: action_space_type={action_space_type}, action_dim={action_dim}")
+        if use_predicted_as_reference and is_relative_action_mode:
+            rospy.loginfo(f"[INFERENCE] 🔗 Use predicted as reference: ENABLED (will use last predicted absolute pose as next reference)")
     else:
         rospy.loginfo(f"[INFERENCE] Not in EEF mode: action_space_type={action_space_type}, action_dim={action_dim}")
     
@@ -1361,12 +1372,25 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
     if sync_mode:
         while True:
             try:
+                # 重置 reference pose（根据 use_predicted_as_reference 决定是否使用上一个预测的绝对位姿）
+                # 如果 use_predicted_as_reference=True 且有上一个预测的绝对位姿，则使用它
+                # 否则使用当前机器人状态（通过FK计算）
+                if use_predicted_as_reference and last_executed_absolute_action is not None and is_relative_action_mode:
+                    current_reference_pose = last_executed_absolute_action.copy()
+                    if step_counter > 0:
+                        rospy.loginfo(f"[INFERENCE] 🔗 Using last predicted absolute pose as reference (use_predicted_as_reference=True)")
+                else:
+                    current_reference_pose = None  # 将在下面通过FK从当前机器人状态计算
+                
                 # 准备观测
                 state_raw = obs_data["state"]  # 原始 state (可能是 16D joint positions)
                 observation = {}
                 
                 # 对于 EEF action space (Delta eef 或 Absolute eef)，需要将 joint positions 转换为 EEF pose
                 # 因为训练时 state 是 20 维的 EEF pose，而推理时只有 16 维的 joint positions
+                # 同时，如果是 relative action mode，也需要计算 reference pose（使用相同的FK结果）
+                arm_joint_pos = None
+                gripper_state = None
                 if is_eef_mode and fk_getter is not None:
                     # 从 joint positions 计算 EEF pose
                     current_state_np = state_raw[0]  # (state_dim,) - 取第一个时间步
@@ -1429,6 +1453,12 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
                             gripper_state    # (2,)
                         ]).astype(np.float32)
                         
+                        # 如果是 relative action mode，同时计算并保存 reference pose（用于后续转换）
+                        if is_relative_action_mode:
+                            current_reference_pose = eef_state.copy()
+                            if step_counter == 0:
+                                rospy.loginfo(f"[INFERENCE] ✅ Computed reference pose from current joint state using FK (relative action mode)")
+                        
                         # 转换为 torch tensor，并添加时间维度以匹配训练格式
                         state = torch.from_numpy(eef_state).float().unsqueeze(0)  # (1, 20)
                         
@@ -1442,6 +1472,9 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
                         # Fallback: 使用原始 state（16D），但模型可能无法正常工作
                         rospy.logwarn(f"[INFERENCE] Using original joint state (16D) as fallback - model may not work correctly!")
                         state = torch.from_numpy(state_raw).float()
+                        # FK失败时，reference pose也设为None
+                        if is_relative_action_mode:
+                            current_reference_pose = None
                 else:
                     # Joint space 或 FK 不可用：使用原始 state
                     state = torch.from_numpy(state_raw).float()
@@ -1495,78 +1528,15 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
                 action_chunk = pred_actions_unnorm[0].cpu().numpy()  # (chunk_size, action_dim)
                 
                 # 对于 relative action mode (Delta eef)，需要将 relative action 转换为 absolute pose
+                # 注意：reference pose 已经在上面准备 observation 时计算好了（使用相同的 get_obs 数据）
+                # 这样可以确保 reference pose 和 observation state 使用的是同一个时刻的机器人状态
+                # 如果 use_predicted_as_reference=True，则使用上一个chunk的最后一个绝对位姿作为reference
                 if is_relative_action_mode and postprocessor_step is not None:
-                    # 每次推理时，从当前 robot joint state 通过 FK 计算 reference pose
-                    # 这是正确的做法：使用当前机器人的实际状态作为 reference
-                    current_state_np = obs_data["state"][0]  # (state_dim,) - 取第一个时间步
-                    
-                    # 从 state 中提取 arm joint positions 和 gripper state
-                    state_dim = len(current_state_np)
-                    
-                    # 尝试从 config 获取 STATE_COMPONENTS（如果可用）
-                    try:
-                        from configs.config import STATE_COMPONENTS
-                        joint_start_idx = 0
-                        joint_end_idx = 0
-                        gripper_start_idx = 0
-                        gripper_end_idx = 0
-                        
-                        current_idx = 0
-                        for component in STATE_COMPONENTS:
-                            if component == "J_q":
-                                joint_start_idx = current_idx
-                                joint_end_idx = current_idx + 14
-                                current_idx += 14
-                            elif component == "Claw_pos":
-                                gripper_start_idx = current_idx
-                                gripper_end_idx = current_idx + 2
-                                current_idx += 2
-                            elif component == "IMU":
-                                current_idx += 6
-                            elif component == "Com_z_pitch":
-                                current_idx += 2
-                    except ImportError:
-                        joint_start_idx = 0
-                        joint_end_idx = 14
-                        gripper_start_idx = 14
-                        gripper_end_idx = 16
-                    
-                    # 提取 arm joint positions (14维)
-                    if joint_end_idx <= state_dim:
-                        arm_joint_pos = current_state_np[joint_start_idx:joint_end_idx]
-                    else:
-                        arm_joint_pos = np.zeros(14, dtype=np.float32)
-                    
-                    # 提取 gripper state (2维)
-                    if gripper_end_idx <= state_dim:
-                        gripper_state = current_state_np[gripper_start_idx:gripper_end_idx]
-                    else:
-                        gripper_state = np.zeros(2, dtype=np.float32)
-                    
-                    # 使用 forward kinematics 计算 EEF pose（每次推理都重新计算）
-                    if fk_getter is not None:
-                        try:
-                            left_eef_pose, right_eef_pose = fk_getter(arm_joint_pos)
-                            # 组合成 20D EEF pose: left_eef(9) + right_eef(9) + gripper(2)
-                            current_reference_pose = np.concatenate([
-                                left_eef_pose,   # (9,)
-                                right_eef_pose,  # (9,)
-                                gripper_state    # (2,)
-                            ]).astype(np.float32)
-                            
-                            if step_counter == 0:
-                                rospy.loginfo(f"[INFERENCE] ✅ Computed reference pose from current joint state using FK (relative action mode)")
-                        except Exception as e:
-                            rospy.logerr(f"[INFERENCE] ❌ Failed to compute FK: {e}")
-                            # Fallback: 如果 FK 失败，使用上一次的 reference pose 或零向量
-                            if current_reference_pose is None:
-                                rospy.logwarn(f"[INFERENCE] Using zero vector as fallback reference pose")
-                                current_reference_pose = np.zeros(action_dim, dtype=np.float32)
-                    else:
-                        # FK 不可用，使用上一次的 reference pose 或零向量
-                        if current_reference_pose is None:
-                            rospy.logwarn(f"[INFERENCE] ⚠️  FK not available. Using zero vector as initial reference pose")
-                            current_reference_pose = np.zeros(action_dim, dtype=np.float32)
+                    # 检查 reference pose 是否已经计算好
+                    if current_reference_pose is None:
+                        # 如果 reference pose 未计算（可能是 FK 失败或非 EEF mode），使用零向量作为 fallback
+                        rospy.logwarn(f"[INFERENCE] ⚠️  Reference pose not available. Using zero vector as fallback.")
+                        current_reference_pose = np.zeros(action_dim, dtype=np.float32)
                     
                     # 将 numpy 转换为 torch tensor
                     pred_chunk_tensor = torch.from_numpy(action_chunk).to(device).unsqueeze(0)  # (1, chunk_size, action_dim)
@@ -1577,11 +1547,20 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
                         pred_chunk_tensor, reference_pose_tensor
                     )
                     
-                    # 更新 action_chunk
+                    # 更新 action_chunk（现在是绝对位姿）
                     action_chunk = pred_chunk_absolute[0].cpu().numpy()  # (chunk_size, action_dim)
+                    
+                    # 保存最后一个绝对位姿，用于 use_predicted_as_reference 模式
+                    # 这样下一个chunk可以使用这个位姿作为reference，而不是机器人的实际状态
+                    if use_predicted_as_reference:
+                        last_executed_absolute_action = action_chunk[-1].copy()  # (action_dim,)
                     
                     if step_counter == 0:
                         rospy.loginfo(f"[INFERENCE] Converted relative actions to absolute poses (relative action mode)")
+                        if use_predicted_as_reference:
+                            rospy.loginfo(f"[INFERENCE]   🔗 use_predicted_as_reference=True: will use last predicted pose as next reference")
+                        else:
+                            rospy.loginfo(f"[INFERENCE]   Reference pose computed from same get_obs() call as observation state")
                 
                 # 根据chunk_start和chunk_end选择要执行的action范围
                 chunk_size = action_chunk.shape[0]
@@ -2173,7 +2152,7 @@ def final_reset_arm(json_path, env, control_arm=True, control_claw=True):
     rospy.loginfo("Arm reset completed!")
 
 
-def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chunk_size=50, enable_gui=False, rotate_head_camera=False, state_zero=False, task_description=None, chunk_start=None, chunk_end=None, model_action_dt=None, sync_mode=False, max_joint_velocity=None, constant_velocity=False, action_stride=1, claw_lock_threshold=50.0, claw_lock_count_threshold=5, claw_locked_value=90.0, ik_model_type='60', pause_before_chunk=False):
+def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chunk_size=50, enable_gui=False, rotate_head_camera=False, state_zero=False, task_description=None, chunk_start=None, chunk_end=None, model_action_dt=None, sync_mode=False, max_joint_velocity=None, constant_velocity=False, action_stride=1, claw_lock_threshold=50.0, claw_lock_count_threshold=5, claw_locked_value=90.0, ik_model_type='60', pause_before_chunk=False, use_predicted_as_reference=False):
     """
     在这里和实机/仿真交互，做网络推理（depalletize任务）
     支持多次推理：按'q'退出当前推理，可以快速重新开始下一次推理而无需重新加载模型
@@ -2198,6 +2177,8 @@ def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chun
         action_stride: 动作采样间隔，用于加速执行。例如：action_stride=2表示每隔2个action执行一次，跳过中间的action。
                        设置为1表示不跳过任何action（正常速度）。设置为N表示执行速度约为原来的N倍。
                        注意：这不会改变速度限制，只是减少执行的action数量。建议值：1-5。
+        use_predicted_as_reference: [Delta eef only] 是否使用上一个chunk预测的最后一个绝对位姿作为下一个chunk的reference。
+                                   这可以减少因跟踪误差导致的误差累积问题。默认False。
     """
     
     # 加载模型和环境（只执行一次）
@@ -2259,7 +2240,8 @@ def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chun
                 action_stride=action_stride,
                 eef_info=eef_info,
                 ik_model_type=ik_model_type,
-                pause_before_chunk=pause_before_chunk
+                pause_before_chunk=pause_before_chunk,
+                use_predicted_as_reference=use_predicted_as_reference
             )
             
             if normal_exit:
@@ -2379,6 +2361,11 @@ if __name__ == '__main__':
     parser.add_argument('--pause-before-chunk', action='store_true',
                         help='If set, pause before executing each chunk to allow inspection. '
                              'Press Enter to continue, or "q"+Enter to stop.')
+    parser.add_argument('--use-predicted-as-reference', action='store_true',
+                        help='[Delta eef only] Use the last predicted absolute pose from the previous chunk as the '
+                             'reference for the next chunk, instead of the robot\'s actual state. '
+                             'This can help reduce error accumulation caused by tracking errors (2-3cm). '
+                             'Default: False (use robot actual state, which matches training setup).')
     
     args = parser.parse_args()
     
@@ -2450,6 +2437,8 @@ if __name__ == '__main__':
         print(f"⚡ Action stride: {args.action_stride} (executing every {args.action_stride}-th action, ~{args.action_stride}x speedup)")
     if args.pause_before_chunk:
         print(f"⏸️  Pause before chunk: Enabled (will pause before executing each chunk for inspection)")
+    if args.use_predicted_as_reference:
+        print(f"🔗 Use predicted as reference: Enabled (for Delta eef: use last predicted absolute pose as next reference)")
     print(f"🔒 Claw lock mechanism: threshold={args.claw_lock_threshold}, count_threshold={args.claw_lock_count_threshold}, locked_value={args.claw_locked_value}")
     print("="*80 + "\n")
 
@@ -2472,7 +2461,8 @@ if __name__ == '__main__':
              claw_lock_count_threshold=args.claw_lock_count_threshold,
              claw_locked_value=args.claw_locked_value,
              ik_model_type=args.ik_model_type,
-             pause_before_chunk=args.pause_before_chunk)
+             pause_before_chunk=args.pause_before_chunk,
+             use_predicted_as_reference=args.use_predicted_as_reference)
     elif args.replay:
         print("Replaying the model")
         lerobot_dataset_path = '/home/lab/kuavo-manip/lerobot_data/vel_wrend_box_613'
