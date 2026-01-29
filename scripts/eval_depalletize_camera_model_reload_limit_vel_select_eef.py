@@ -2163,10 +2163,16 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
                         current_robot_eef_pose = eef_state.copy()
                         
                         # 如果是 relative action mode，同时计算并保存 reference pose（用于后续转换）
-                        if is_relative_action_mode:
+                        # 注意：只有当 current_reference_pose 未设置时才从FK计算
+                        # 如果 use_predicted_as_reference=True，current_reference_pose 已经在上面设置为 last_executed_absolute_action
+                        if is_relative_action_mode and current_reference_pose is None:
                             current_reference_pose = eef_state.copy()
                             if step_counter == 0:
                                 rospy.loginfo(f"[INFERENCE] ✅ Computed reference pose from current joint state using FK (relative action mode)")
+                        elif is_relative_action_mode and current_reference_pose is not None:
+                            # use_predicted_as_reference=True 的情况，reference pose 已经设置
+                            if step_counter == 0:
+                                rospy.loginfo(f"[INFERENCE] 🔗 Using last predicted absolute pose as reference (use_predicted_as_reference=True)")
                         
                         # 转换为 torch tensor，并添加时间维度以匹配训练格式
                         state = torch.from_numpy(eef_state).float().unsqueeze(0)  # (1, 20)
