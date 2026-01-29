@@ -403,18 +403,31 @@ class GrootPackInputsStep(ProcessorStep):
                 if isinstance(first_stat, list):
                     self.relative_action_stats = None
 
-    def _convert_absolute_to_relative_eef_action(self, absolute_action: torch.Tensor) -> torch.Tensor:
+    def _convert_absolute_to_relative_eef_action(
+        self, 
+        absolute_action: torch.Tensor,
+        current_state: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """
         Convert absolute EEF pose to relative EEF action.
         
-        For each chunk, uses the first timestep as reference:
-        - Position: relative_pos_i = pos_i - pos_ref
-        - Rotation: relative_rot_i = R_ref^-1 @ R_i (in SO(3))
+        **重要设计变更 (2026-01):**
+        使用 current_state（observation.state）作为 reference pose，而不是 action[0]！
+        
+        这样做的原因：
+        1. 符合马尔科夫性质：state 是当前状态，action 是要去的目标
+        2. 训练和推理一致：训练时用 dataset 中的 state，推理时用 FK 计算的 state
+        3. 自然 cover 跟踪误差：数据集中的 state 和前一帧 action 之间本来就有误差
+        
+        relative_action = absolute_action - current_state
+        表示"从当前实际状态出发，需要移动多少到达目标"
         
         Args:
             absolute_action: Absolute EEF pose tensor. Shape: (B, T, D)
                             Expected structure for 20D eef:
                             [left_pos(3), left_rot6d(6), right_pos(3), right_rot6d(6), gripper(2)]
+            current_state: Current observation state (absolute EEF pose). Shape: (B, D)
+                          If None, falls back to using action[0] (legacy behavior, not recommended)
         
         Returns:
             Relative EEF action tensor. Shape: (B, T, D)
@@ -422,21 +435,47 @@ class GrootPackInputsStep(ProcessorStep):
         if self.action_component_indices is None:
             return absolute_action
         
-        # Log once that relative action conversion is active
-        if not self._relative_action_conversion_logged:
-            import logging
-            logger = logging.getLogger(__name__)
-            logger.info(
-                f"🔄 [Delta EEF] Converting absolute EEF poses to relative actions "
-                f"(shape: {absolute_action.shape}, components: {list(self.action_component_indices.keys())})"
-            )
-            self._relative_action_conversion_logged = True
-        
         b, t, d = absolute_action.shape
         relative_action = absolute_action.clone()
         
-        # Extract reference pose (first timestep of each batch)
-        ref_pose = absolute_action[:, 0:1, :]  # (B, 1, D)
+        # 使用 current_state 作为 reference pose（正确的做法）
+        # 这样训练和推理时的 reference 来源是一致的！
+        if current_state is not None:
+            # current_state: (B, D) -> (B, 1, D)
+            if current_state.dim() == 2:
+                ref_pose = current_state.unsqueeze(1)  # (B, 1, D)
+            else:
+                ref_pose = current_state[:, 0:1, :]  # (B, 1, D)
+            
+            # Log once that we're using state as reference
+            if not self._relative_action_conversion_logged:
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.info(
+                    f"🔄 [Delta EEF] Converting absolute EEF to relative actions using STATE as reference "
+                    f"(action shape: {absolute_action.shape}, state shape: {current_state.shape})"
+                )
+                logger.info(
+                    f"   ✅ This is the CORRECT approach: state represents actual robot pose"
+                )
+                logger.info(
+                    f"   ✅ Training and inference use consistent reference (actual state, not action command)"
+                )
+                self._relative_action_conversion_logged = True
+        else:
+            # Fallback: use action[0] as reference (legacy behavior, NOT RECOMMENDED)
+            ref_pose = absolute_action[:, 0:1, :]  # (B, 1, D)
+            
+            if not self._relative_action_conversion_logged:
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.warning(
+                    f"⚠️  [Delta EEF] Falling back to action[0] as reference (NO STATE PROVIDED)"
+                )
+                logger.warning(
+                    f"   This may cause train-inference mismatch if robot has tracking errors!"
+                )
+                self._relative_action_conversion_logged = True
         
         # Process each component
         for component_name, (start_idx, end_idx) in self.action_component_indices.items():
@@ -832,6 +871,12 @@ class GrootPackInputsStep(ProcessorStep):
             if state.dim() != 2:
                 raise ValueError(f"state must be (B, D), got {tuple(state.shape)}")
             bsz, d = state.shape
+            
+            # **重要**: 保存原始的 state（归一化之前）用于 Delta eef 的 reference pose
+            # 这确保训练和推理时的 reference 来源一致！
+            if self.action_space_type == "Delta eef":
+                obs["_original_observation_state"] = state.clone()
+            
             # Normalize BEFORE padding
             if self.normalize_min_max:
                 state = _min_max_norm(state, "observation.state")
@@ -868,8 +913,17 @@ class GrootPackInputsStep(ProcessorStep):
             
             # Convert absolute eef pose to relative eef action if needed
             # This happens BEFORE normalization
+            # 
+            # **重要**: 使用 observation.state 作为 reference pose！
+            # 这确保训练和推理时的 reference 来源一致：
+            # - 训练时: state 来自 dataset（机器人录制时的实际状态）
+            # - 推理时: state 来自 FK（机器人当前的实际状态）
             if self.action_space_type == "Delta eef" and self.action_component_indices is not None:
-                action = self._convert_absolute_to_relative_eef_action(action)
+                # 获取原始的 observation.state（归一化之前的版本）
+                # 注意：这里需要在 state 归一化之前保存原始值
+                current_state_for_ref = obs.get("_original_observation_state", None)
+                
+                action = self._convert_absolute_to_relative_eef_action(action, current_state_for_ref)
                 # Update relative action statistics for position components
                 # This accumulates stats during training
                 # Note: We always update stats when processing data (training or inference)
