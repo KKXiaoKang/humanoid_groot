@@ -362,9 +362,11 @@ class GrootPackInputsStep(ProcessorStep):
     
     # Dynamic normalization statistics for relative action position components
     # These are accumulated during training and saved to model config
+    # Note: This field accepts a value in __init__ (from JSON config) but is ignored.
+    # The actual value should be loaded via load_state_dict() after initialization.
     relative_action_stats: dict[str, dict[str, torch.Tensor]] | None = field(
-        default=None, init=False, repr=False
-    )  # e.g., {"left_eef_pos": {"min": ..., "max": ..., "count": ...}, ...}
+        default=None, init=True, repr=False
+    )  # Accepts from JSON but ignored - should be loaded via load_state_dict
     _relative_stats_initialized: bool = field(default=False, init=False, repr=False)
     _relative_stats_frozen: bool = field(default=False, init=False, repr=False)  # 是否已冻结统计值
     freeze_stats_after_first_epoch: bool = field(
@@ -379,6 +381,27 @@ class GrootPackInputsStep(ProcessorStep):
         default=1,
         metadata={"help": "Number of GPUs/processes for multi-GPU training. Used to adjust dataset_num_frames threshold."}
     )
+
+    def __post_init__(self):
+        """
+        Post-initialization hook to handle relative_action_stats from JSON config.
+        
+        When loading from JSON config, relative_action_stats may be passed to __init__,
+        but it should be ignored (actual loading happens via load_state_dict).
+        This method resets relative_action_stats to None if it was passed from JSON.
+        """
+        # If relative_action_stats was passed from JSON config (not None and not tensor dict),
+        # reset it to None - actual loading happens via load_state_dict
+        if self.relative_action_stats is not None:
+            # Check if it's from JSON (dict with list values) vs actual tensor dict
+            # JSON format: {"left_eef_pos": {"min": [0.1, 0.2], "max": [0.3, 0.4], "count": 100}}
+            # Tensor format: {"left_eef_pos": {"min": tensor(...), "max": tensor(...), "count": tensor(...)}}
+            first_comp = next(iter(self.relative_action_stats.values()), None)
+            if first_comp is not None:
+                first_stat = next(iter(first_comp.values()), None)
+                # If it's a list (from JSON), reset to None (will be loaded via load_state_dict)
+                if isinstance(first_stat, list):
+                    self.relative_action_stats = None
 
     def _convert_absolute_to_relative_eef_action(self, absolute_action: torch.Tensor) -> torch.Tensor:
         """
@@ -580,14 +603,28 @@ class GrootPackInputsStep(ProcessorStep):
                                    f"frames_processed={new_count:.0f}/{threshold:.0f} ({progress_pct:.1f}%)")
                         setattr(self, f'_last_logged_count_{comp_name}', new_count)
                 
+                # 标记这个组件是否达到阈值
                 if new_count >= threshold:
+                    setattr(self, f'_component_reached_threshold_{comp_name}', True)
                     import logging
                     logger = logging.getLogger(__name__)
                     logger.info(f"📈 [Delta EEF] First epoch complete for {comp_name}: "
                               f"frames_processed={new_count:.0f}/{threshold:.0f} "
                               f"(total_dataset={self.dataset_num_frames}, num_processes={self.num_processes}, {progress_pct:.1f}%)")
-                    self.freeze_relative_action_stats()
+        
+        # 在所有组件更新完成后，检查是否所有组件都达到阈值
+        if self.freeze_stats_after_first_epoch and self.dataset_num_frames is not None and not self._relative_stats_frozen:
+            threshold = self.dataset_num_frames / self.num_processes
+            all_reached = True
+            for comp_name in self.relative_action_stats.keys():
+                count = self.relative_action_stats[comp_name]["count"]
+                count_val = count.item() if isinstance(count, torch.Tensor) else count
+                if count_val < threshold:
+                    all_reached = False
                     break
+            
+            if all_reached:
+                self.freeze_relative_action_stats()
     
     def freeze_relative_action_stats(self):
         """
@@ -1129,6 +1166,10 @@ class GrootActionUnpackUnnormalizeStep(ProcessorStep):
     # For partial normalization of action (e.g., 6D rotation representation)
     action_space_type: str | None = None  # "Delta eef", "Absolute eef", "Absolute joint", etc.
     action_component_indices: dict[str, tuple[int, int]] | None = None  # e.g., {"left_eef_pos": (0, 3), ...}
+    # Dynamic normalization statistics for relative action position components (loaded from checkpoint)
+    relative_action_stats: dict[str, dict[str, torch.Tensor]] | None = field(
+        default=None, init=False, repr=False
+    )  # e.g., {"left_eef_pos": {"min": ..., "max": ..., "count": ...}, ...}
 
     def _convert_relative_to_absolute_eef_action(
         self, relative_action: torch.Tensor, reference_pose: torch.Tensor | None = None
@@ -1383,6 +1424,14 @@ class GrootActionUnpackUnnormalizeStep(ProcessorStep):
                         min_v = rel_min
                         max_v = rel_max
                         
+                        # Debug logging (only log once per component to avoid spam)
+                        if not hasattr(self, f'_unnorm_logged_{component_name}'):
+                            print(
+                                f"🔓 [Delta EEF Unnorm] Using dynamic stats for {component_name}: "
+                                f"min={rel_min.tolist()}, max={rel_max.tolist()}"
+                            )
+                            setattr(self, f'_unnorm_logged_{component_name}', True)
+                        
                         # If stats are invalid (all inf), fallback to adjusted absolute range
                         if torch.any(torch.isinf(rel_min)) or torch.any(torch.isinf(rel_max)):
                             abs_range = torch.maximum(torch.abs(min_v_full[start_idx:end_idx]), 
@@ -1395,6 +1444,13 @@ class GrootActionUnpackUnnormalizeStep(ProcessorStep):
                             max_v = torch.where(abs_range < 0.1, default_range, max_v)
                     else:
                         # Fallback: use adjusted absolute range (original behavior)
+                        # Log warning if relative_action_stats is not available
+                        if not hasattr(self, f'_fallback_logged_{component_name}'):
+                            print(
+                                f"⚠️  [Delta EEF Unnorm] Fallback to adjusted absolute range for {component_name} "
+                                f"(relative_action_stats not available or component not found)"
+                            )
+                            setattr(self, f'_fallback_logged_{component_name}', True)
                         # Relative position distribution: approximately centered at 0
                         # Range: [-abs_range, abs_range] where abs_range = max(|min|, |max|)
                         abs_range = torch.maximum(torch.abs(min_v), torch.abs(max_v))

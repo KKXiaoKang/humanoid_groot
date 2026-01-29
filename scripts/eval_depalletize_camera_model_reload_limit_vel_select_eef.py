@@ -955,10 +955,44 @@ def load_model_and_env(ckpt_path, model_type, action_chunk_size=50, enable_gui=F
     # 从 checkpoint 加载 preprocessor 和 postprocessor（必须包含 dataset_stats）
     print(f"\n🔧 Loading preprocessor and postprocessor from checkpoint...")
     try:
+        # 如果是 Delta eef 模式，需要先读取 relative_action_stats，然后在加载时排除它
+        # 因为 relative_action_stats 不是 __init__ 参数，应该通过 load_state_dict 加载
+        ckpt_path_obj = Path(ckpt_path) if not isinstance(ckpt_path, Path) else ckpt_path
+        preprocessor_json_path = ckpt_path_obj / "policy_preprocessor.json"
+        relative_action_stats_json = None
+        
+        # 预先读取 relative_action_stats（如果存在）
+        if preprocessor_json_path.exists():
+            try:
+                with open(preprocessor_json_path, 'r') as f:
+                    preprocessor_config = json.load(f)
+                
+                # 查找 groot_pack_inputs_v3 step 中的 relative_action_stats
+                if "steps" in preprocessor_config:
+                    for step_config in preprocessor_config["steps"]:
+                        if (step_config.get("registry_name") == "groot_pack_inputs_v3" and
+                            "config" in step_config and
+                            "relative_action_stats" in step_config["config"]):
+                            relative_action_stats_json = step_config["config"]["relative_action_stats"]
+                            break
+            except Exception as e:
+                print(f"⚠️  Warning: Failed to pre-read relative_action_stats: {e}")
+        
+        # 使用 preprocessor_overrides 排除 relative_action_stats（如果存在）
+        # relative_action_stats 现在可以接受但会被 __post_init__ 忽略（实际加载通过 load_state_dict）
+        preprocessor_overrides = {}
+        if relative_action_stats_json is not None:
+            # 设置为 None，__post_init__ 会忽略它，实际加载通过 load_state_dict
+            preprocessor_overrides["groot_pack_inputs_v3"] = {
+                "relative_action_stats": None  # 设置为 None，__post_init__ 会忽略，实际加载通过 load_state_dict
+            }
+            print(f"✅ Pre-read relative_action_stats, will exclude from __init__")
+        
         # 从 checkpoint 加载，不提供 dataset_stats，让它从 checkpoint 中加载
         preprocessor, postprocessor = make_pre_post_processors(
             policy_cfg=policy.config,
             pretrained_path=ckpt_path,
+            preprocessor_overrides=preprocessor_overrides if preprocessor_overrides else None,
         )
         print("✅ Preprocessor and postprocessor loaded from checkpoint")
         
@@ -1002,6 +1036,36 @@ def load_model_and_env(ckpt_path, model_type, action_chunk_size=50, enable_gui=F
                     print(f"⚠️  Warning: action_space_type={action_space_type} but action_component_indices is None")
                     print(f"   This may cause incorrect unnormalization for 6D rotation components!")
                 break
+        
+        # 如果是 Delta eef 模式，将预先读取的 relative_action_stats 设置到 postprocessor
+        if action_space_type == "Delta eef" and postprocessor_step is not None:
+            if relative_action_stats_json:
+                try:
+                    # 转换为 torch.Tensor 格式
+                    relative_action_stats_tensors = {}
+                    for comp_name, stats in relative_action_stats_json.items():
+                        relative_action_stats_tensors[comp_name] = {
+                            "min": torch.tensor(stats["min"], dtype=torch.float32),
+                            "max": torch.tensor(stats["max"], dtype=torch.float32),
+                            "count": torch.tensor(stats["count"], dtype=torch.long),
+                        }
+                    
+                    # 设置到 postprocessor step
+                    postprocessor_step.relative_action_stats = relative_action_stats_tensors
+                    print(f"✅ Loaded relative_action_stats from preprocessor config:")
+                    for comp_name, stats in relative_action_stats_tensors.items():
+                        count = stats["count"].item()
+                        min_vals = stats["min"].tolist()
+                        max_vals = stats["max"].tolist()
+                        print(f"   - {comp_name}: count={count}, min={min_vals}, max={max_vals}")
+                except Exception as e:
+                    import traceback
+                    print(f"⚠️  Warning: Failed to set relative_action_stats to postprocessor: {e}")
+                    print(f"   Traceback: {traceback.format_exc()}")
+                    print(f"   Will use fallback normalization (adjusted absolute range)")
+            else:
+                print(f"⚠️  Warning: relative_action_stats not found in preprocessor config")
+                print(f"   Will use fallback normalization (adjusted absolute range)")
                 
     except ValueError as e:
         # 如果是我们抛出的 ValueError（stats 缺失），直接抛出
