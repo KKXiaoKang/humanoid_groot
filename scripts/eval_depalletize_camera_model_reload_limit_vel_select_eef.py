@@ -10,6 +10,13 @@ from sensor_msgs.msg import JointState
 import json
 from std_srvs.srv import Trigger, TriggerRequest, SetBool, SetBoolRequest
 
+# ROS可视化相关导入
+from visualization_msgs.msg import Marker, MarkerArray
+from geometry_msgs.msg import Point, PoseStamped, Pose, Quaternion
+import tf2_ros
+# 注意：不导入tf2_geometry_msgs以避免PyKDL依赖问题（在conda环境中）
+# 我们使用自己实现的坐标变换函数，不需要do_transform_point
+
 def resample_actions_with_speed_limit(actions: np.ndarray, dt: float, v_max, arm_dims: slice = slice(None), constant_velocity: bool = False):
     '''
         resample actions (joint positions) which satisfy joint velocity limits
@@ -318,6 +325,677 @@ class PinocchioFK:
             rot[0, 0], rot[1, 0], rot[2, 0],  # R11, R21, R31 (第一列)
             rot[0, 1], rot[1, 1], rot[2, 1],  # R12, R22, R32 (第二列)
         ], dtype=np.float32)
+
+
+# ========== EEF Pose ROS Visualization ==========
+
+class EEFPoseVisualizer:
+    """
+    ROS可视化器，用于显示EEF pose的MarkerArray
+    
+    支持三种类型的可视化：
+    1. Robot Real State: 从传感器数据通过FK计算的当前EEF pose（绿色）
+    2. Robot Reference State: 每次chunk推理的reference pose（黄色，仅Delta eef模式）
+    3. Chunk Action EEF: 预测的action转换为EEF pose（蓝色=左手, 红色=右手）
+    
+    所有pose都从robot base frame (waist_yaw_link) 转换到odom frame进行可视化
+    """
+    
+    # 颜色定义 (RGBA)
+    COLOR_REAL_STATE_LEFT = (0.0, 1.0, 0.0, 0.8)      # 绿色 - 左手真实状态
+    COLOR_REAL_STATE_RIGHT = (0.0, 0.8, 0.0, 0.8)     # 深绿色 - 右手真实状态
+    COLOR_REFERENCE_LEFT = (1.0, 1.0, 0.0, 0.8)       # 黄色 - 左手reference
+    COLOR_REFERENCE_RIGHT = (1.0, 0.8, 0.0, 0.8)      # 橙黄色 - 右手reference
+    COLOR_ACTION_LEFT = (0.0, 0.5, 1.0, 0.6)          # 蓝色 - 左手action轨迹
+    COLOR_ACTION_RIGHT = (1.0, 0.3, 0.3, 0.6)         # 红色 - 右手action轨迹
+    
+    def __init__(self, 
+                 robot_frame: str = "waist_yaw_link",
+                 odom_frame: str = "odom",
+                 marker_topic: str = "/policy/eef_pose_markers"):
+        """
+        初始化EEF可视化器
+        
+        Args:
+            robot_frame: 机器人基座frame名称
+            odom_frame: 世界/odom frame名称
+            marker_topic: MarkerArray发布的topic名称
+        """
+        self.robot_frame = robot_frame
+        self.odom_frame = odom_frame
+        
+        # TF2 buffer和listener
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
+        
+        # MarkerArray发布器
+        self.marker_pub = rospy.Publisher(marker_topic, MarkerArray, queue_size=10)
+        
+        # PoseStamped发布器（用于记录和rosbag录制）
+        # Delta eef模式：6个话题（left/right分别发布）
+        # Absolute eef模式：4个话题（left/right分别发布）
+        # 所有pose都转换到odom坐标系（frame_id = "odom"）
+        self.real_eef_pose_pub_left = rospy.Publisher("/policy/eef_pose/real_state_left", PoseStamped, queue_size=10)
+        self.real_eef_pose_pub_right = rospy.Publisher("/policy/eef_pose/real_state_right", PoseStamped, queue_size=10)
+        self.predicted_eef_pose_pub_left = rospy.Publisher("/policy/eef_pose/predicted_absolute_left", PoseStamped, queue_size=10)
+        self.predicted_eef_pose_pub_right = rospy.Publisher("/policy/eef_pose/predicted_absolute_right", PoseStamped, queue_size=10)
+        self.reference_eef_pose_pub_left = rospy.Publisher("/policy/eef_pose/reference_left", PoseStamped, queue_size=10)
+        self.reference_eef_pose_pub_right = rospy.Publisher("/policy/eef_pose/reference_right", PoseStamped, queue_size=10)
+        
+        # 累积的action轨迹markers（不清空，保留历史）
+        self.action_markers_left = []   # 左手action轨迹
+        self.action_markers_right = []  # 右手action轨迹
+        
+        # Marker ID计数器
+        self.marker_id_counter = 0
+        
+        # Chunk计数器（用于为每个chunk生成不同颜色）
+        self.chunk_counter = 0
+        
+        # 真实状态marker ID（用于更新）
+        self.real_state_marker_id_left = 0
+        self.real_state_marker_id_right = 1
+        
+        # 球体大小
+        self.real_state_sphere_size = 0.03    # 真实状态：3cm
+        self.reference_sphere_size = 0.025    # Reference：2.5cm
+        self.action_sphere_size = 0.015       # Action轨迹：1.5cm
+        
+        rospy.loginfo(f"[EEFVisualizer] Initialized:")
+        rospy.loginfo(f"   Robot frame: {robot_frame}")
+        rospy.loginfo(f"   Odom frame: {odom_frame}")
+        rospy.loginfo(f"   Marker topic: {marker_topic}")
+        rospy.loginfo(f"   PoseStamped topics (all in odom frame):")
+        rospy.loginfo(f"     - /policy/eef_pose/real_state_left (FK计算的真实EEF pose - 左手)")
+        rospy.loginfo(f"     - /policy/eef_pose/real_state_right (FK计算的真实EEF pose - 右手)")
+        rospy.loginfo(f"     - /policy/eef_pose/predicted_absolute_left (预测的absolute eef - 左手)")
+        rospy.loginfo(f"     - /policy/eef_pose/predicted_absolute_right (预测的absolute eef - 右手)")
+        rospy.loginfo(f"     - /policy/eef_pose/reference_left (reference pose - 左手, Delta eef only)")
+        rospy.loginfo(f"     - /policy/eef_pose/reference_right (reference pose - 右手, Delta eef only)")
+    
+    def _get_transform_to_odom(self) -> tuple:
+        """
+        获取从robot_frame到odom_frame的变换
+        
+        Returns:
+            tuple: (translation, rotation_matrix) 或 (None, None) 如果失败
+        """
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                self.odom_frame, 
+                self.robot_frame, 
+                rospy.Time(0),  # 使用最新可用的变换
+                rospy.Duration(0.1)  # 超时时间
+            )
+            
+            # 提取平移
+            trans = np.array([
+                transform.transform.translation.x,
+                transform.transform.translation.y,
+                transform.transform.translation.z
+            ])
+            
+            # 提取旋转（四元数转旋转矩阵）
+            q = transform.transform.rotation
+            # 四元数 (x, y, z, w) 转旋转矩阵
+            rot_matrix = self._quaternion_to_rotation_matrix(q.x, q.y, q.z, q.w)
+            
+            return trans, rot_matrix
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
+            rospy.logwarn_throttle(5.0, f"[EEFVisualizer] TF lookup failed: {e}")
+            return None, None
+    
+    def _quaternion_to_rotation_matrix(self, qx, qy, qz, qw) -> np.ndarray:
+        """四元数转3x3旋转矩阵"""
+        # 归一化四元数
+        norm = np.sqrt(qx*qx + qy*qy + qz*qz + qw*qw)
+        qx, qy, qz, qw = qx/norm, qy/norm, qz/norm, qw/norm
+        
+        # 旋转矩阵
+        R = np.array([
+            [1 - 2*(qy*qy + qz*qz), 2*(qx*qy - qz*qw), 2*(qx*qz + qy*qw)],
+            [2*(qx*qy + qz*qw), 1 - 2*(qx*qx + qz*qz), 2*(qy*qz - qx*qw)],
+            [2*(qx*qz - qy*qw), 2*(qy*qz + qx*qw), 1 - 2*(qx*qx + qy*qy)]
+        ])
+        return R
+    
+    def _transform_point_to_odom(self, point_in_robot: np.ndarray, trans: np.ndarray, rot: np.ndarray) -> np.ndarray:
+        """
+        将robot frame中的点转换到odom frame
+        
+        Args:
+            point_in_robot: 机器人坐标系中的点 (3,)
+            trans: robot_frame到odom的平移
+            rot: robot_frame到odom的旋转矩阵
+        
+        Returns:
+            odom坐标系中的点 (3,)
+        """
+        return rot @ point_in_robot + trans
+    
+    def _create_sphere_marker(self, position: np.ndarray, color: tuple, size: float, 
+                               marker_id: int, ns: str, frame_id: str) -> Marker:
+        """
+        创建球体Marker
+        
+        Args:
+            position: 位置 (x, y, z)
+            color: RGBA颜色
+            size: 球体直径
+            marker_id: Marker ID
+            ns: namespace
+            frame_id: frame ID
+        
+        Returns:
+            Marker对象
+        """
+        marker = Marker()
+        marker.header.frame_id = frame_id
+        marker.header.stamp = rospy.Time.now()
+        marker.ns = ns
+        marker.id = marker_id
+        marker.type = Marker.SPHERE
+        marker.action = Marker.ADD
+        
+        marker.pose.position.x = position[0]
+        marker.pose.position.y = position[1]
+        marker.pose.position.z = position[2]
+        marker.pose.orientation.w = 1.0
+        
+        marker.scale.x = size
+        marker.scale.y = size
+        marker.scale.z = size
+        
+        marker.color.r = color[0]
+        marker.color.g = color[1]
+        marker.color.b = color[2]
+        marker.color.a = color[3]
+        
+        marker.lifetime = rospy.Duration(0)  # 永不过期
+        
+        return marker
+    
+    def _extract_eef_positions(self, eef_pose_20d: np.ndarray) -> tuple:
+        """
+        从20D EEF pose中提取左右手位置
+        
+        Args:
+            eef_pose_20d: 20D EEF pose [left_pos(3), left_rot6d(6), right_pos(3), right_rot6d(6), gripper(2)]
+        
+        Returns:
+            tuple: (left_pos, right_pos) 各3D
+        """
+        left_pos = eef_pose_20d[0:3]
+        right_pos = eef_pose_20d[9:12]
+        return left_pos, right_pos
+    
+    def _hsv_to_rgb(self, h: float, s: float, v: float) -> tuple:
+        """
+        将HSV颜色转换为RGB (0-1范围)
+        
+        Args:
+            h: 色相 (0-360)
+            s: 饱和度 (0-1)
+            v: 明度 (0-1)
+        
+        Returns:
+            tuple: (r, g, b) 各在0-1范围
+        """
+        import colorsys
+        r, g, b = colorsys.hsv_to_rgb(h / 360.0, s, v)
+        return (r, g, b)
+    
+    def _get_chunk_color(self, chunk_idx: int, arm_side: str = "left") -> tuple:
+        """
+        为每个chunk生成不同的颜色（使用HSV颜色空间）
+        
+        Args:
+            chunk_idx: chunk索引（从0开始）
+            arm_side: "left" 或 "right"
+        
+        Returns:
+            tuple: (r, g, b, a) RGBA颜色
+        """
+        # 使用HSV颜色空间，每次改变hue（色相）
+        # 左手：使用蓝色系（hue从240度开始）
+        # 右手：使用红色系（hue从0度开始）
+        
+        # 每个chunk改变30度色相，确保颜色区分明显
+        hue_step = 30.0
+        base_hue_left = 240.0  # 蓝色
+        base_hue_right = 0.0   # 红色
+        
+        if arm_side == "left":
+            hue = (base_hue_left + chunk_idx * hue_step) % 360.0
+        else:
+            hue = (base_hue_right + chunk_idx * hue_step) % 360.0
+        
+        # 饱和度和明度：保持较高值以确保颜色鲜明
+        saturation = 0.8
+        value = 0.9
+        
+        r, g, b = self._hsv_to_rgb(hue, saturation, value)
+        
+        # Alpha值
+        alpha = 0.7
+        
+        return (r, g, b, alpha)
+    
+    def compute_tracking_error(self, predicted_eef_pose: np.ndarray, actual_eef_pose: np.ndarray) -> dict:
+        """
+        计算预测EEF pose和实际EEF pose之间的差异
+        
+        Args:
+            predicted_eef_pose: 预测的20D EEF pose
+            actual_eef_pose: 实际的20D EEF pose
+        
+        Returns:
+            dict: 包含左右手的位置误差和旋转误差
+        """
+        left_pred_pos = predicted_eef_pose[0:3]
+        left_pred_rot6d = predicted_eef_pose[3:9]
+        right_pred_pos = predicted_eef_pose[9:12]
+        right_pred_rot6d = predicted_eef_pose[12:18]
+        
+        left_actual_pos = actual_eef_pose[0:3]
+        left_actual_rot6d = actual_eef_pose[3:9]
+        right_actual_pos = actual_eef_pose[9:12]
+        right_actual_rot6d = actual_eef_pose[12:18]
+        
+        # 计算位置误差（欧氏距离）
+        left_pos_error = np.linalg.norm(left_pred_pos - left_actual_pos)
+        right_pos_error = np.linalg.norm(right_pred_pos - right_actual_pos)
+        
+        # 计算旋转误差（通过旋转矩阵的差异）
+        # 将6D旋转转换为旋转矩阵，然后计算角度差异
+        try:
+            from scipy.spatial.transform import Rotation as R
+            
+            left_pred_rot_mat = reconstruct_rotation_matrix_6d(left_pred_rot6d)
+            left_actual_rot_mat = reconstruct_rotation_matrix_6d(left_actual_rot6d)
+            left_pred_rot = R.from_matrix(left_pred_rot_mat)
+            left_actual_rot = R.from_matrix(left_actual_rot_mat)
+            left_rot_error_rad = (left_pred_rot.inv() * left_actual_rot).magnitude()
+            left_rot_error_deg = np.rad2deg(left_rot_error_rad)
+            
+            right_pred_rot_mat = reconstruct_rotation_matrix_6d(right_pred_rot6d)
+            right_actual_rot_mat = reconstruct_rotation_matrix_6d(right_actual_rot6d)
+            right_pred_rot = R.from_matrix(right_pred_rot_mat)
+            right_actual_rot = R.from_matrix(right_actual_rot_mat)
+            right_rot_error_rad = (right_pred_rot.inv() * right_actual_rot).magnitude()
+            right_rot_error_deg = np.rad2deg(right_rot_error_rad)
+        except Exception as e:
+            rospy.logwarn_throttle(5.0, f"[EEFVisualizer] Failed to compute rotation error: {e}")
+            left_rot_error_deg = 0.0
+            right_rot_error_deg = 0.0
+        
+        return {
+            'left_pos_error_m': left_pos_error,
+            'left_pos_error_cm': left_pos_error * 100.0,
+            'left_rot_error_deg': left_rot_error_deg,
+            'right_pos_error_m': right_pos_error,
+            'right_pos_error_cm': right_pos_error * 100.0,
+            'right_rot_error_deg': right_rot_error_deg,
+        }
+    
+    def _eef_pose_20d_to_pose_stamped(self, eef_pose_20d: np.ndarray, frame_id: str = None) -> tuple:
+        """
+        将20D EEF pose转换为左右手的PoseStamped消息
+        
+        Args:
+            eef_pose_20d: 20D EEF pose [left_pos(3), left_rot6d(6), right_pos(3), right_rot6d(6), gripper(2)]
+            frame_id: 目标frame ID（如果为None，使用self.odom_frame）
+        
+        Returns:
+            tuple: (left_pose_stamped, right_pose_stamped)
+        """
+        if frame_id is None:
+            frame_id = self.odom_frame
+        
+        # 提取左右手的位置和旋转
+        left_pos = eef_pose_20d[0:3]
+        left_rot6d = eef_pose_20d[3:9]
+        right_pos = eef_pose_20d[9:12]
+        right_rot6d = eef_pose_20d[12:18]
+        
+        # 转换到odom frame
+        trans, rot = self._get_transform_to_odom()
+        if trans is None:
+            return None, None
+        
+        left_pos_odom = self._transform_point_to_odom(left_pos, trans, rot)
+        right_pos_odom = self._transform_point_to_odom(right_pos, trans, rot)
+        
+        # 将6D旋转转换为四元数
+        left_quat = rot6d_to_quaternion_xyzw(left_rot6d)
+        right_quat = rot6d_to_quaternion_xyzw(right_rot6d)
+        
+        # 创建PoseStamped消息
+        left_pose_stamped = PoseStamped()
+        left_pose_stamped.header.frame_id = frame_id
+        left_pose_stamped.header.stamp = rospy.Time.now()
+        left_pose_stamped.pose.position.x = left_pos_odom[0]
+        left_pose_stamped.pose.position.y = left_pos_odom[1]
+        left_pose_stamped.pose.position.z = left_pos_odom[2]
+        left_pose_stamped.pose.orientation.x = left_quat[0]
+        left_pose_stamped.pose.orientation.y = left_quat[1]
+        left_pose_stamped.pose.orientation.z = left_quat[2]
+        left_pose_stamped.pose.orientation.w = left_quat[3]
+        
+        right_pose_stamped = PoseStamped()
+        right_pose_stamped.header.frame_id = frame_id
+        right_pose_stamped.header.stamp = rospy.Time.now()
+        right_pose_stamped.pose.position.x = right_pos_odom[0]
+        right_pose_stamped.pose.position.y = right_pos_odom[1]
+        right_pose_stamped.pose.position.z = right_pos_odom[2]
+        right_pose_stamped.pose.orientation.x = right_quat[0]
+        right_pose_stamped.pose.orientation.y = right_quat[1]
+        right_pose_stamped.pose.orientation.z = right_quat[2]
+        right_pose_stamped.pose.orientation.w = right_quat[3]
+        
+        return left_pose_stamped, right_pose_stamped
+    
+    def publish_real_eef_pose(self, current_eef_pose: np.ndarray):
+        """
+        发布FK计算的真实EEF pose（PoseStamped）
+        
+        Args:
+            current_eef_pose: 20D EEF pose（robot frame下）
+        """
+        left_pose, right_pose = self._eef_pose_20d_to_pose_stamped(current_eef_pose)
+        if left_pose is not None and right_pose is not None:
+            # 使用相同的时间戳，frame_id是odom坐标系
+            current_time = rospy.Time.now()
+            left_pose.header.stamp = current_time
+            right_pose.header.stamp = current_time
+            # frame_id已经是odom坐标系（在_eef_pose_20d_to_pose_stamped中转换）
+            left_pose.header.frame_id = self.odom_frame
+            right_pose.header.frame_id = self.odom_frame
+            # 发布到独立的left/right topic
+            self.real_eef_pose_pub_left.publish(left_pose)
+            self.real_eef_pose_pub_right.publish(right_pose)
+    
+    def publish_predicted_eef_pose(self, predicted_eef_pose: np.ndarray):
+        """
+        发布预测的absolute EEF pose（PoseStamped）
+        
+        Args:
+            predicted_eef_pose: 20D EEF pose（robot frame下，已经是absolute）
+        """
+        left_pose, right_pose = self._eef_pose_20d_to_pose_stamped(predicted_eef_pose)
+        if left_pose is not None and right_pose is not None:
+            # 使用相同的时间戳，frame_id是odom坐标系
+            current_time = rospy.Time.now()
+            left_pose.header.stamp = current_time
+            right_pose.header.stamp = current_time
+            # frame_id已经是odom坐标系（在_eef_pose_20d_to_pose_stamped中转换）
+            left_pose.header.frame_id = self.odom_frame
+            right_pose.header.frame_id = self.odom_frame
+            # 发布到独立的left/right topic
+            self.predicted_eef_pose_pub_left.publish(left_pose)
+            self.predicted_eef_pose_pub_right.publish(right_pose)
+    
+    def publish_reference_eef_pose(self, reference_eef_pose: np.ndarray):
+        """
+        发布reference EEF pose（PoseStamped，仅Delta eef模式）
+        
+        Args:
+            reference_eef_pose: 20D EEF pose（robot frame下）
+        """
+        left_pose, right_pose = self._eef_pose_20d_to_pose_stamped(reference_eef_pose)
+        if left_pose is not None and right_pose is not None:
+            # 使用相同的时间戳，frame_id是odom坐标系
+            current_time = rospy.Time.now()
+            left_pose.header.stamp = current_time
+            right_pose.header.stamp = current_time
+            # frame_id已经是odom坐标系（在_eef_pose_20d_to_pose_stamped中转换）
+            left_pose.header.frame_id = self.odom_frame
+            right_pose.header.frame_id = self.odom_frame
+            # 发布到独立的left/right topic
+            self.reference_eef_pose_pub_left.publish(left_pose)
+            self.reference_eef_pose_pub_right.publish(right_pose)
+    
+    def visualize_real_state(self, current_eef_pose: np.ndarray, update_only: bool = False):
+        """
+        可视化当前机器人的真实EEF状态（可更新已有marker）
+        
+        Args:
+            current_eef_pose: 20D EEF pose（robot frame下）
+            update_only: 如果True，只更新位置，不创建新marker
+        """
+        trans, rot = self._get_transform_to_odom()
+        if trans is None:
+            return
+        
+        left_pos, right_pos = self._extract_eef_positions(current_eef_pose)
+        
+        # 转换到odom frame
+        left_pos_odom = self._transform_point_to_odom(left_pos, trans, rot)
+        right_pos_odom = self._transform_point_to_odom(right_pos, trans, rot)
+        
+        # 创建或更新markers
+        marker_array = MarkerArray()
+        
+        # 左手真实状态（使用固定ID以便更新）
+        marker_left = self._create_sphere_marker(
+            left_pos_odom, self.COLOR_REAL_STATE_LEFT, self.real_state_sphere_size,
+            self.real_state_marker_id_left, "real_state_left", self.odom_frame
+        )
+        marker_array.markers.append(marker_left)
+        
+        # 右手真实状态（使用固定ID以便更新）
+        marker_right = self._create_sphere_marker(
+            right_pos_odom, self.COLOR_REAL_STATE_RIGHT, self.real_state_sphere_size,
+            self.real_state_marker_id_right, "real_state_right", self.odom_frame
+        )
+        marker_array.markers.append(marker_right)
+        
+        self.marker_pub.publish(marker_array)
+    
+    def visualize_reference_pose(self, reference_pose: np.ndarray):
+        """
+        可视化reference pose（仅Delta eef模式）
+        
+        Args:
+            reference_pose: 20D EEF pose（robot frame下）
+        """
+        trans, rot = self._get_transform_to_odom()
+        if trans is None:
+            return
+        
+        left_pos, right_pos = self._extract_eef_positions(reference_pose)
+        
+        # 转换到odom frame
+        left_pos_odom = self._transform_point_to_odom(left_pos, trans, rot)
+        right_pos_odom = self._transform_point_to_odom(right_pos, trans, rot)
+        
+        # 创建markers
+        marker_array = MarkerArray()
+        
+        # 左手reference
+        marker_left = self._create_sphere_marker(
+            left_pos_odom, self.COLOR_REFERENCE_LEFT, self.reference_sphere_size,
+            0, "reference_left", self.odom_frame
+        )
+        marker_array.markers.append(marker_left)
+        
+        # 右手reference
+        marker_right = self._create_sphere_marker(
+            right_pos_odom, self.COLOR_REFERENCE_RIGHT, self.reference_sphere_size,
+            1, "reference_right", self.odom_frame
+        )
+        marker_array.markers.append(marker_right)
+        
+        self.marker_pub.publish(marker_array)
+    
+    def visualize_action_chunk(self, action_chunk: np.ndarray, 
+                                is_relative_action: bool = False,
+                                reference_pose: np.ndarray = None):
+        """
+        可视化action chunk的EEF轨迹
+        
+        Args:
+            action_chunk: (N, 20) action chunk（已经是absolute eef pose）
+            is_relative_action: 是否是relative action模式
+            reference_pose: reference pose（仅relative action模式需要，用于叠加显示）
+                           注意：如果action_chunk已经转换为absolute，则不需要再叠加
+        """
+        trans, rot = self._get_transform_to_odom()
+        if trans is None:
+            return
+        
+        # 如果action_chunk不是20D，跳过
+        if action_chunk.shape[1] != 20:
+            rospy.logwarn_throttle(5.0, f"[EEFVisualizer] Action chunk is not 20D (got {action_chunk.shape[1]}D), skipping visualization")
+            return
+        
+        # 遍历chunk中的每个action
+        for i, action in enumerate(action_chunk):
+            left_pos, right_pos = self._extract_eef_positions(action)
+            
+            # 转换到odom frame
+            left_pos_odom = self._transform_point_to_odom(left_pos, trans, rot)
+            right_pos_odom = self._transform_point_to_odom(right_pos, trans, rot)
+            
+            # 创建并累积markers
+            marker_id = self.marker_id_counter
+            self.marker_id_counter += 1
+            
+            marker_left = self._create_sphere_marker(
+                left_pos_odom, self.COLOR_ACTION_LEFT, self.action_sphere_size,
+                marker_id, "action_trajectory_left", self.odom_frame
+            )
+            self.action_markers_left.append(marker_left)
+            
+            marker_id = self.marker_id_counter
+            self.marker_id_counter += 1
+            
+            marker_right = self._create_sphere_marker(
+                right_pos_odom, self.COLOR_ACTION_RIGHT, self.action_sphere_size,
+                marker_id, "action_trajectory_right", self.odom_frame
+            )
+            self.action_markers_right.append(marker_right)
+        
+        # 发布所有累积的action markers
+        self._publish_action_markers()
+        
+        rospy.loginfo(f"[EEFVisualizer] Added {action_chunk.shape[0]} action poses to visualization (total: {len(self.action_markers_left)} left, {len(self.action_markers_right)} right)")
+    
+    def _publish_action_markers(self):
+        """发布所有累积的action markers"""
+        marker_array = MarkerArray()
+        marker_array.markers.extend(self.action_markers_left)
+        marker_array.markers.extend(self.action_markers_right)
+        self.marker_pub.publish(marker_array)
+    
+    def clear_action_markers(self):
+        """清除所有action轨迹markers"""
+        # 发布DELETE markers
+        marker_array = MarkerArray()
+        
+        for marker in self.action_markers_left + self.action_markers_right:
+            delete_marker = Marker()
+            delete_marker.header.frame_id = self.odom_frame
+            delete_marker.header.stamp = rospy.Time.now()
+            delete_marker.ns = marker.ns
+            delete_marker.id = marker.id
+            delete_marker.action = Marker.DELETE
+            marker_array.markers.append(delete_marker)
+        
+        self.marker_pub.publish(marker_array)
+        
+        # 清空列表并重置计数器
+        self.action_markers_left = []
+        self.action_markers_right = []
+        self.marker_id_counter = 0
+        self.chunk_counter = 0  # 重置chunk计数器
+        
+        rospy.loginfo("[EEFVisualizer] Cleared all action trajectory markers")
+    
+    def publish_all(self, current_eef_pose: np.ndarray = None,
+                    reference_pose: np.ndarray = None,
+                    action_chunk: np.ndarray = None,
+                    is_relative_action: bool = False):
+        """
+        一次性发布所有类型的markers
+        
+        Args:
+            current_eef_pose: 当前机器人EEF状态 (20D)
+            reference_pose: reference pose (20D, 仅Delta eef)
+            action_chunk: action chunk (N, 20)
+            is_relative_action: 是否是relative action模式
+        """
+        trans, rot = self._get_transform_to_odom()
+        if trans is None:
+            rospy.logwarn_throttle(5.0, "[EEFVisualizer] Cannot get TF transform, skipping visualization")
+            return
+        
+        marker_array = MarkerArray()
+        
+        # 1. 当前真实状态（使用固定ID以便更新）
+        if current_eef_pose is not None:
+            left_pos, right_pos = self._extract_eef_positions(current_eef_pose)
+            left_pos_odom = self._transform_point_to_odom(left_pos, trans, rot)
+            right_pos_odom = self._transform_point_to_odom(right_pos, trans, rot)
+            
+            marker_array.markers.append(self._create_sphere_marker(
+                left_pos_odom, self.COLOR_REAL_STATE_LEFT, self.real_state_sphere_size,
+                self.real_state_marker_id_left, "real_state_left", self.odom_frame
+            ))
+            marker_array.markers.append(self._create_sphere_marker(
+                right_pos_odom, self.COLOR_REAL_STATE_RIGHT, self.real_state_sphere_size,
+                self.real_state_marker_id_right, "real_state_right", self.odom_frame
+            ))
+        
+        # 2. Reference pose（仅Delta eef模式）
+        if reference_pose is not None and is_relative_action:
+            left_pos, right_pos = self._extract_eef_positions(reference_pose)
+            left_pos_odom = self._transform_point_to_odom(left_pos, trans, rot)
+            right_pos_odom = self._transform_point_to_odom(right_pos, trans, rot)
+            
+            marker_array.markers.append(self._create_sphere_marker(
+                left_pos_odom, self.COLOR_REFERENCE_LEFT, self.reference_sphere_size,
+                0, "reference_left", self.odom_frame
+            ))
+            marker_array.markers.append(self._create_sphere_marker(
+                right_pos_odom, self.COLOR_REFERENCE_RIGHT, self.reference_sphere_size,
+                1, "reference_right", self.odom_frame
+            ))
+        
+        # 3. Action chunk轨迹（使用chunk特定的颜色）
+        if action_chunk is not None and action_chunk.shape[1] == 20:
+            # 为当前chunk生成颜色
+            chunk_color_left = self._get_chunk_color(self.chunk_counter, arm_side="left")
+            chunk_color_right = self._get_chunk_color(self.chunk_counter, arm_side="right")
+            
+            for i, action in enumerate(action_chunk):
+                left_pos, right_pos = self._extract_eef_positions(action)
+                left_pos_odom = self._transform_point_to_odom(left_pos, trans, rot)
+                right_pos_odom = self._transform_point_to_odom(right_pos, trans, rot)
+                
+                marker_id = self.marker_id_counter
+                self.marker_id_counter += 1
+                marker_left = self._create_sphere_marker(
+                    left_pos_odom, chunk_color_left, self.action_sphere_size,
+                    marker_id, f"action_trajectory_left_chunk_{self.chunk_counter}", self.odom_frame
+                )
+                self.action_markers_left.append(marker_left)
+                marker_array.markers.append(marker_left)
+                
+                marker_id = self.marker_id_counter
+                self.marker_id_counter += 1
+                marker_right = self._create_sphere_marker(
+                    right_pos_odom, chunk_color_right, self.action_sphere_size,
+                    marker_id, f"action_trajectory_right_chunk_{self.chunk_counter}", self.odom_frame
+                )
+                self.action_markers_right.append(marker_right)
+                marker_array.markers.append(marker_right)
+            
+            # 增加chunk计数器，为下一个chunk准备新颜色
+            self.chunk_counter += 1
+        
+        # 发布
+        self.marker_pub.publish(marker_array)
 
 
 def reconstruct_rotation_matrix_6d(rotation_6d: np.ndarray) -> np.ndarray:
@@ -895,13 +1573,15 @@ def load_and_replay_init_trajectory(bag_path: str, env, control_arm: bool = True
     
     return True
 
-def reset_inference_state(policy, env):
+def reset_inference_state(policy, env, eef_visualizer=None, clear_visualization=False):
     """
     重置推理状态，为下一次推理做准备
     
     Args:
         policy: GrootPolicy模型实例
         env: GrabBoxMpcEnv环境实例
+        eef_visualizer: EEF可视化器（可选）
+        clear_visualization: 是否清除可视化markers（默认False，保留历史轨迹）
     """
     rospy.loginfo("🔄 Resetting inference state...")
     
@@ -913,6 +1593,11 @@ def reset_inference_state(policy, env):
     env.reset_claw_lock()
     rospy.loginfo("   ✅ Claw lock reset")
     
+    # 清除EEF可视化markers（如果需要）
+    if clear_visualization and eef_visualizer is not None:
+        eef_visualizer.clear_action_markers()
+        rospy.loginfo("   ✅ EEF visualization markers cleared")
+    
     # 等待buffer重新ready（buffer会自动保持最新数据，但确保数据充足）
     rospy.loginfo("   ⏳ Waiting for buffer to be ready...")
     env.obs_buffer.wait_buffer_ready()
@@ -921,7 +1606,7 @@ def reset_inference_state(policy, env):
     rospy.loginfo("✅ Inference state reset complete")
 
 
-def load_model_and_env(ckpt_path, model_type, action_chunk_size=50, enable_gui=False, rotate_head_camera=False, state_zero=False, task_description=None, claw_lock_threshold=50.0, claw_lock_count_threshold=5, claw_locked_value=90.0):
+def load_model_and_env(ckpt_path, model_type, action_chunk_size=50, enable_gui=False, rotate_head_camera=False, state_zero=False, task_description=None, claw_lock_threshold=50.0, claw_lock_count_threshold=5, claw_locked_value=90.0, enable_eef_visualization=False):
     """
     加载模型和环境（只执行一次，避免重复加载）
     
@@ -1157,6 +1842,24 @@ def load_model_and_env(ckpt_path, model_type, action_chunk_size=50, enable_gui=F
     print(" ======================  Buffer ready ====================== ")
     time.sleep(1)
     
+    # 初始化EEF可视化器（如果是EEF mode且启用了可视化）
+    eef_visualizer = None
+    if is_eef_mode and enable_eef_visualization:
+        try:
+            eef_visualizer = EEFPoseVisualizer(
+                robot_frame="waist_yaw_link",
+                odom_frame="odom",
+                marker_topic="/policy/eef_pose_markers"
+            )
+            rospy.loginfo("[LOAD] ✅ EEF Pose Visualizer initialized")
+            rospy.loginfo("[LOAD]    Topic: /policy/eef_pose_markers")
+            rospy.loginfo("[LOAD]    Colors: Green=Real State, Yellow=Reference (Delta eef), Blue=Left Action, Red=Right Action")
+        except Exception as e:
+            rospy.logwarn(f"[LOAD] ⚠️  Failed to initialize EEF Pose Visualizer: {e}")
+            eef_visualizer = None
+    elif is_eef_mode and not enable_eef_visualization:
+        rospy.loginfo("[LOAD] ℹ️  EEF Pose Visualization disabled (use --enable-eef-visualization to enable)")
+    
     # 返回额外的信息用于EEF space处理
     return policy, preprocessor, postprocessor, env, task_description, device, {
         'action_dim': action_dim,
@@ -1164,6 +1867,7 @@ def load_model_and_env(ckpt_path, model_type, action_chunk_size=50, enable_gui=F
         'is_relative_action_mode': is_relative_action_mode,
         'postprocessor_step': postprocessor_step,
         'fk_getter': fk_getter,
+        'eef_visualizer': eef_visualizer,
     }
 
 def set_arm_quick_mode(enable: bool) -> bool:
@@ -1350,8 +2054,10 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
     is_relative_action_mode = eef_info.get('is_relative_action_mode', False)
     postprocessor_step = eef_info.get('postprocessor_step')
     fk_getter = eef_info.get('fk_getter')
+    eef_visualizer = eef_info.get('eef_visualizer')  # EEF可视化器
     current_reference_pose = None  # 用于 relative action mode
     last_executed_absolute_action = None  # 用于 use_predicted_as_reference 模式：保存上一个chunk执行的最后一个绝对位姿
+    current_robot_eef_pose = None  # 当前机器人的EEF pose（通过FK计算，用于可视化）
     
     # 如果 action_dim 是 None 但 action_space_type 是 EEF space，推断 action_dim 为 20
     if action_dim is None and action_space_type in ["Delta eef", "Absolute eef"]:
@@ -1452,6 +2158,9 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
                             right_eef_pose,  # (9,)
                             gripper_state    # (2,)
                         ]).astype(np.float32)
+                        
+                        # 保存当前机器人的EEF pose用于可视化
+                        current_robot_eef_pose = eef_state.copy()
                         
                         # 如果是 relative action mode，同时计算并保存 reference pose（用于后续转换）
                         if is_relative_action_mode:
@@ -1587,6 +2296,52 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
                 original_eef_action_chunk = None
                 if is_eef_mode and action_chunk.shape[1] == 20:
                     original_eef_action_chunk = action_chunk.copy()
+                    
+                    # ===== ROS可视化：EEF Pose Markers =====
+                    # 在这里添加可视化，此时action_chunk是20D的absolute EEF pose
+                    # 对于Delta eef模式，action_chunk已经从relative转换为absolute了
+                    if eef_visualizer is not None:
+                        try:
+                            # 可视化当前机器人真实状态、reference pose和action轨迹
+                            eef_visualizer.publish_all(
+                                current_eef_pose=current_robot_eef_pose,
+                                reference_pose=current_reference_pose if is_relative_action_mode else None,
+                                action_chunk=original_eef_action_chunk,
+                                is_relative_action=is_relative_action_mode
+                            )
+                            
+                            # 发布PoseStamped话题（用于rosbag录制）
+                            # 1. 发布真实EEF pose（所有模式都需要）
+                            if current_robot_eef_pose is not None:
+                                eef_visualizer.publish_real_eef_pose(current_robot_eef_pose)
+                            
+                            # 2. 发布reference pose（仅Delta eef模式）
+                            if is_relative_action_mode and current_reference_pose is not None:
+                                eef_visualizer.publish_reference_eef_pose(current_reference_pose)
+                            
+                            # 3. 发布预测的absolute eef pose（chunk的第一个action，用于记录chunk开始时的预测）
+                            # 注意：在执行chunk的过程中，每个action都会在实时跟踪时发布
+                            if original_eef_action_chunk is not None and original_eef_action_chunk.shape[0] > 0:
+                                # 发布chunk的第一个action作为预测的起始pose
+                                eef_visualizer.publish_predicted_eef_pose(original_eef_action_chunk[0])
+                            
+                            if step_counter == 0:
+                                rospy.loginfo(f"[VIS] 🎨 EEF pose visualization enabled:")
+                                rospy.loginfo(f"   - Green spheres: Robot real state")
+                                if is_relative_action_mode:
+                                    rospy.loginfo(f"   - Yellow spheres: Reference pose (Delta eef)")
+                                rospy.loginfo(f"   - Blue spheres: Left arm action trajectory")
+                                rospy.loginfo(f"   - Red spheres: Right arm action trajectory")
+                                rospy.loginfo(f"[VIS] 📡 PoseStamped topics enabled for rosbag recording (all in odom frame):")
+                                rospy.loginfo(f"   - /policy/eef_pose/real_state_left (FK计算的真实EEF pose - 左手)")
+                                rospy.loginfo(f"   - /policy/eef_pose/real_state_right (FK计算的真实EEF pose - 右手)")
+                                rospy.loginfo(f"   - /policy/eef_pose/predicted_absolute_left (预测的absolute eef - 左手)")
+                                rospy.loginfo(f"   - /policy/eef_pose/predicted_absolute_right (预测的absolute eef - 右手)")
+                                if is_relative_action_mode:
+                                    rospy.loginfo(f"   - /policy/eef_pose/reference_left (reference pose - 左手, Delta eef only)")
+                                    rospy.loginfo(f"   - /policy/eef_pose/reference_right (reference pose - 右手, Delta eef only)")
+                        except Exception as e:
+                            rospy.logwarn_throttle(5.0, f"[VIS] ⚠️  EEF visualization failed: {e}")
 
                 # 确定arm和claw维度
                 # 注意：对于 EEF mode (20D)，需要先转换为 joint space (16D) 才能生成 transition
@@ -2011,13 +2766,104 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
                         rospy.loginfo(f"[INFERENCE] ✅ Converted EEF actions (20D) to joint actions (16D) using IK")
                         rospy.loginfo(f"[INFERENCE]   Action chunk shape: {action_chunk.shape}")
                 
-                for action_step in action_chunk:
+                # 日志打印频率：每N个action打印一次差异信息（避免日志过多）
+                # 注意：FK计算和可视化更新会对每个action都执行，但日志打印可以控制频率
+                log_print_frequency = 10  # 每10个action打印一次日志
+                
+                for action_idx, action_step in enumerate(action_chunk):
                     env.exec_actions(actions=action_step,
                                      control_arm=control_arm,
                                      control_claw=control_claw,
                                      control_cmd_pose=control_cmd_pose)
                     step_counter += 1
                     last_executed_action = action_step.copy()
+                    
+                    # ===== 实时跟踪：每个action都更新真实状态并计算差异 =====
+                    # 对每个action都进行FK计算和可视化更新，确保实时反馈跟踪情况
+                    if eef_visualizer is not None and is_eef_mode and fk_getter is not None:
+                        try:
+                            # 获取当前机器人状态
+                            obs_data_temp, _, _, robot_obs_temp, _ = env.get_obs()
+                            state_raw_temp = obs_data_temp["state"]
+                            current_state_np_temp = state_raw_temp[0]
+                            
+                            # 提取arm joint positions
+                            try:
+                                from configs.config import STATE_COMPONENTS
+                                joint_start_idx = 0
+                                joint_end_idx = 0
+                                gripper_start_idx = 0
+                                gripper_end_idx = 0
+                                current_idx = 0
+                                for component in STATE_COMPONENTS:
+                                    if component == "J_q":
+                                        joint_start_idx = current_idx
+                                        joint_end_idx = current_idx + 14
+                                        current_idx += 14
+                                    elif component == "Claw_pos":
+                                        gripper_start_idx = current_idx
+                                        gripper_end_idx = current_idx + 2
+                                        current_idx += 2
+                                    elif component == "IMU":
+                                        current_idx += 6
+                                    elif component == "Com_z_pitch":
+                                        current_idx += 2
+                            except ImportError:
+                                joint_start_idx = 0
+                                joint_end_idx = 14
+                                gripper_start_idx = 14
+                                gripper_end_idx = 16
+                            
+                            state_dim_temp = len(current_state_np_temp)
+                            if joint_end_idx <= state_dim_temp:
+                                arm_joint_pos_temp = current_state_np_temp[joint_start_idx:joint_end_idx]
+                            else:
+                                arm_joint_pos_temp = np.zeros(14, dtype=np.float32)
+                            
+                            if gripper_end_idx <= state_dim_temp:
+                                gripper_state_temp = current_state_np_temp[gripper_start_idx:gripper_end_idx]
+                            else:
+                                gripper_state_temp = np.zeros(2, dtype=np.float32)
+                            
+                            # 计算当前真实EEF pose（每个action都计算）
+                            left_eef_pose_temp, right_eef_pose_temp = fk_getter(arm_joint_pos_temp)
+                            current_real_eef_pose = np.concatenate([
+                                left_eef_pose_temp,
+                                right_eef_pose_temp,
+                                gripper_state_temp
+                            ]).astype(np.float32)
+                            
+                            # 更新真实状态的marker（每个action都更新）
+                            eef_visualizer.visualize_real_state(current_real_eef_pose)
+                            
+                            # 发布真实EEF pose的PoseStamped（用于rosbag录制）
+                            eef_visualizer.publish_real_eef_pose(current_real_eef_pose)
+                            
+                            # 计算预测和实际的差异（如果有对应的预测action）
+                            if original_eef_action_chunk is not None and original_eef_action_chunk.shape[1] == 20:
+                                # 找到当前action对应的预测EEF pose
+                                # 注意：由于resample和stride，索引映射可能不准确，这里使用线性映射
+                                if len(original_eef_action_chunk) > 0:
+                                    # 计算在original_eef_action_chunk中的对应索引
+                                    pred_idx = min(int(action_idx * len(original_eef_action_chunk) / len(action_chunk)), 
+                                                  len(original_eef_action_chunk) - 1)
+                                    predicted_eef_pose = original_eef_action_chunk[pred_idx]
+                                    
+                                    # 发布预测的absolute eef pose的PoseStamped（用于rosbag录制）
+                                    eef_visualizer.publish_predicted_eef_pose(predicted_eef_pose)
+                                    
+                                    # 计算差异（每个action都计算）
+                                    error_dict = eef_visualizer.compute_tracking_error(
+                                        predicted_eef_pose, current_real_eef_pose
+                                    )
+                                    
+                                    # 打印差异信息（控制频率，避免日志过多）
+                                    if action_idx % log_print_frequency == 0 or action_idx == len(action_chunk) - 1:
+                                        rospy.loginfo(f"[TRACKING] Action {action_idx}/{len(action_chunk)-1}:")
+                                        rospy.loginfo(f"   Left arm error: {error_dict['left_pos_error_cm']:.2f} cm, {error_dict['left_rot_error_deg']:.2f} deg")
+                                        rospy.loginfo(f"   Right arm error: {error_dict['right_pos_error_cm']:.2f} cm, {error_dict['right_rot_error_deg']:.2f} deg")
+                        except Exception as e:
+                            rospy.logwarn_throttle(5.0, f"[TRACKING] Failed to update real state tracking: {e}")
                     
                     # 键盘监听
                     key = 0
@@ -2152,7 +2998,7 @@ def final_reset_arm(json_path, env, control_arm=True, control_claw=True):
     rospy.loginfo("Arm reset completed!")
 
 
-def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chunk_size=50, enable_gui=False, rotate_head_camera=False, state_zero=False, task_description=None, chunk_start=None, chunk_end=None, model_action_dt=None, sync_mode=False, max_joint_velocity=None, constant_velocity=False, action_stride=1, claw_lock_threshold=50.0, claw_lock_count_threshold=5, claw_locked_value=90.0, ik_model_type='60', pause_before_chunk=False, use_predicted_as_reference=False):
+def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chunk_size=50, enable_gui=False, rotate_head_camera=False, state_zero=False, task_description=None, chunk_start=None, chunk_end=None, model_action_dt=None, sync_mode=False, max_joint_velocity=None, constant_velocity=False, action_stride=1, claw_lock_threshold=50.0, claw_lock_count_threshold=5, claw_locked_value=90.0, ik_model_type='60', pause_before_chunk=False, use_predicted_as_reference=False, enable_eef_visualization=False, clear_visualization_on_reset=False):
     """
     在这里和实机/仿真交互，做网络推理（depalletize任务）
     支持多次推理：按'q'退出当前推理，可以快速重新开始下一次推理而无需重新加载模型
@@ -2192,7 +3038,8 @@ def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chun
         task_description=task_description,
         claw_lock_threshold=claw_lock_threshold,
         claw_lock_count_threshold=claw_lock_count_threshold,
-        claw_locked_value=claw_locked_value
+        claw_locked_value=claw_locked_value,
+        enable_eef_visualization=enable_eef_visualization
     )
     
     # 主循环：支持多次推理
@@ -2211,9 +3058,12 @@ def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chun
             print(f"{'='*80}\n")
             
             # 重置推理状态
+            # clear_visualization_on_reset: 如果为True，在每次推理开始时清除可视化markers
             reset_inference_state(
                 policy=policy,
-                env=env
+                env=env,
+                eef_visualizer=eef_info.get('eef_visualizer'),
+                clear_visualization=clear_visualization_on_reset
             )
             
             # 运行推理循环
@@ -2366,6 +3216,13 @@ if __name__ == '__main__':
                              'reference for the next chunk, instead of the robot\'s actual state. '
                              'This can help reduce error accumulation caused by tracking errors (2-3cm). '
                              'Default: False (use robot actual state, which matches training setup).')
+    parser.add_argument('--enable-eef-visualization', action='store_true',
+                        help='[EEF mode only] Enable ROS MarkerArray visualization of EEF poses in RViz. '
+                             'Visualizes: 1) Robot real state (green), 2) Reference pose (yellow, Delta eef only), '
+                             '3) Action trajectory (blue=left, red=right). Publishes to /policy/eef_pose_markers.')
+    parser.add_argument('--clear-visualization-on-reset', action='store_true',
+                        help='If set, clear EEF visualization markers when starting a new inference session. '
+                             'Default: False (markers accumulate to show full execution history).')
     
     args = parser.parse_args()
     
@@ -2439,6 +3296,13 @@ if __name__ == '__main__':
         print(f"⏸️  Pause before chunk: Enabled (will pause before executing each chunk for inspection)")
     if args.use_predicted_as_reference:
         print(f"🔗 Use predicted as reference: Enabled (for Delta eef: use last predicted absolute pose as next reference)")
+    if args.enable_eef_visualization:
+        print(f"🎨 EEF Visualization: Enabled (topic: /policy/eef_pose_markers)")
+        print(f"   - Green: Robot real state | Yellow: Reference pose | Blue: Left action | Red: Right action")
+        if args.clear_visualization_on_reset:
+            print(f"   - Clear on reset: Enabled (markers will be cleared at each new inference)")
+        else:
+            print(f"   - Clear on reset: Disabled (markers accumulate for full history)")
     print(f"🔒 Claw lock mechanism: threshold={args.claw_lock_threshold}, count_threshold={args.claw_lock_count_threshold}, locked_value={args.claw_locked_value}")
     print("="*80 + "\n")
 
@@ -2462,7 +3326,9 @@ if __name__ == '__main__':
              claw_locked_value=args.claw_locked_value,
              ik_model_type=args.ik_model_type,
              pause_before_chunk=args.pause_before_chunk,
-             use_predicted_as_reference=args.use_predicted_as_reference)
+             use_predicted_as_reference=args.use_predicted_as_reference,
+             enable_eef_visualization=args.enable_eef_visualization,
+             clear_visualization_on_reset=args.clear_visualization_on_reset)
     elif args.replay:
         print("Replaying the model")
         lerobot_dataset_path = '/home/lab/kuavo-manip/lerobot_data/vel_wrend_box_613'
