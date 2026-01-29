@@ -233,6 +233,20 @@ def make_groot_pre_post_processors(
         print(f"✅ Partial normalization enabled for action space: {action_space_type}")
         print(f"   Components: {list(action_component_indices.keys())}")
         print(f"   6D rotation components (left_eef_rot6d, right_eef_rot6d) will use IDENTITY normalization")
+        
+        # Print reference pose noise injection settings for Delta eef mode
+        if action_space_type == "Delta eef":
+            ref_noise_std = getattr(config, 'relative_action_reference_noise_std', 0.0)
+            ref_rot_noise_deg = getattr(config, 'relative_action_rotation_noise_deg', 0.0)
+            if ref_noise_std > 0 or ref_rot_noise_deg > 0:
+                print(f"🎲 Reference pose noise injection ENABLED for Delta eef mode:")
+                print(f"   Position noise std: {ref_noise_std:.3f}m ({ref_noise_std*100:.1f}cm)")
+                print(f"   Rotation noise std: {ref_rot_noise_deg:.1f}°")
+                print(f"   💡 This helps the model learn to handle real-world tracking errors (2-3cm)")
+            else:
+                print(f"⚠️  Reference pose noise injection DISABLED for Delta eef mode")
+                print(f"   💡 Consider enabling with --policy.relative_action_reference_noise_std=0.025")
+                print(f"   💡 This can improve robustness to tracking errors during inference")
     else:
         print(f"📊 Using standard normalization for action space: {action_space_type}")
 
@@ -263,6 +277,9 @@ def make_groot_pre_post_processors(
             action_component_indices=action_component_indices,
             dataset_num_frames=dataset_num_frames,
             num_processes=num_processes,  # Pass num_processes for multi-GPU training
+            # Reference pose noise injection for Delta eef mode (robustness training)
+            relative_action_reference_noise_std=getattr(config, 'relative_action_reference_noise_std', 0.0),
+            relative_action_rotation_noise_deg=getattr(config, 'relative_action_rotation_noise_deg', 0.0),
         ),
         # 4. Eagle encode (creates eagle_content)
         GrootEagleEncodeStep(
@@ -360,6 +377,32 @@ class GrootPackInputsStep(ProcessorStep):
     action_component_indices: dict[str, tuple[int, int]] | None = None  # e.g., {"left_eef_pos": (0, 3), ...}
     _relative_action_conversion_logged: bool = False  # Track if we've logged the conversion
     
+    # ============ Reference Pose Noise Injection (for Delta eef mode) ============
+    # These parameters inject noise into the reference pose during training to simulate
+    # real-world tracking errors. This helps the model learn to be robust to imperfect
+    # reference poses during inference.
+    relative_action_reference_noise_std: float = field(
+        default=0.0,
+        metadata={
+            "help": "Standard deviation of Gaussian noise to add to reference pose position (meters). "
+                    "Recommended: 0.02-0.03 (2-3cm) to match typical tracking error. "
+                    "Set to 0.0 to disable noise injection."
+        }
+    )
+    relative_action_rotation_noise_deg: float = field(
+        default=0.0,
+        metadata={
+            "help": "Standard deviation of rotation noise in degrees to add to reference pose. "
+                    "Recommended: 2-5 degrees. Set to 0.0 to disable rotation noise."
+        }
+    )
+    _reference_noise_logged: bool = field(default=False, init=False, repr=False)
+    # Training mode flag - noise injection only happens during training
+    training: bool = field(
+        default=True,
+        metadata={"help": "Whether the processor is in training mode. Noise injection only happens during training."}
+    )
+    
     # Dynamic normalization statistics for relative action position components
     # These are accumulated during training and saved to model config
     # Note: This field accepts a value in __init__ (from JSON config) but is ignored.
@@ -403,6 +446,89 @@ class GrootPackInputsStep(ProcessorStep):
                 if isinstance(first_stat, list):
                     self.relative_action_stats = None
 
+    def _add_noise_to_eef_pose(self, eef_pose: torch.Tensor) -> torch.Tensor:
+        """
+        Add noise to EEF pose to simulate tracking errors during training.
+        
+        This helps the model learn to be robust to imperfect reference poses
+        during inference, where the actual robot state differs from commanded state.
+        
+        Args:
+            eef_pose: EEF pose tensor. Shape: (B, 1, D) or (B, D)
+                     Expected structure for 20D eef:
+                     [left_pos(3), left_rot6d(6), right_pos(3), right_rot6d(6), gripper(2)]
+        
+        Returns:
+            Noisy EEF pose tensor. Same shape as input.
+        """
+        if self.action_component_indices is None:
+            return eef_pose
+        
+        # Handle both (B, 1, D) and (B, D) shapes
+        original_shape = eef_pose.shape
+        if eef_pose.dim() == 2:
+            eef_pose = eef_pose.unsqueeze(1)  # (B, 1, D)
+        
+        b, t, d = eef_pose.shape
+        noisy_pose = eef_pose.clone()
+        
+        for component_name, (start_idx, end_idx) in self.action_component_indices.items():
+            if end_idx > d:
+                continue
+            
+            component = eef_pose[:, :, start_idx:end_idx]  # (B, 1, component_dim)
+            
+            if "pos" in component_name and self.relative_action_reference_noise_std > 0:
+                # Add Gaussian noise to position components
+                pos_noise = torch.randn_like(component) * self.relative_action_reference_noise_std
+                noisy_pose[:, :, start_idx:end_idx] = component + pos_noise
+                
+            elif "rot6d" in component_name and self.relative_action_rotation_noise_deg > 0:
+                # Add rotation noise: perturb the rotation matrix by a small random rotation
+                # Convert degrees to radians
+                noise_rad = self.relative_action_rotation_noise_deg * (3.14159265 / 180.0)
+                
+                # Get current rotation matrices
+                rot6d = component.reshape(b, -1)  # (B, 6)
+                rot_matrices = rot6d_to_matrix(rot6d)  # (B, 3, 3)
+                
+                # Generate random axis-angle perturbations
+                # Random axis (unit vector)
+                random_axis = torch.randn(b, 3, device=rot6d.device, dtype=rot6d.dtype)
+                random_axis = random_axis / (random_axis.norm(dim=-1, keepdim=True) + 1e-8)
+                # Random angle with std = noise_rad
+                random_angle = torch.randn(b, 1, device=rot6d.device, dtype=rot6d.dtype) * noise_rad
+                
+                # Rodrigues formula: R = I + sin(θ)K + (1-cos(θ))K²
+                # where K is the skew-symmetric matrix of the axis
+                K = torch.zeros(b, 3, 3, device=rot6d.device, dtype=rot6d.dtype)
+                K[:, 0, 1] = -random_axis[:, 2]
+                K[:, 0, 2] = random_axis[:, 1]
+                K[:, 1, 0] = random_axis[:, 2]
+                K[:, 1, 2] = -random_axis[:, 0]
+                K[:, 2, 0] = -random_axis[:, 1]
+                K[:, 2, 1] = random_axis[:, 0]
+                
+                sin_angle = torch.sin(random_angle).unsqueeze(-1)  # (B, 1, 1)
+                cos_angle = torch.cos(random_angle).unsqueeze(-1)  # (B, 1, 1)
+                I = torch.eye(3, device=rot6d.device, dtype=rot6d.dtype).unsqueeze(0).expand(b, -1, -1)
+                
+                # Perturbation rotation matrix
+                delta_R = I + sin_angle * K + (1 - cos_angle) * torch.bmm(K, K)
+                
+                # Apply perturbation: R_noisy = delta_R @ R
+                noisy_rot_matrices = torch.bmm(delta_R, rot_matrices)  # (B, 3, 3)
+                
+                # Convert back to 6D
+                noisy_rot6d = matrix_to_rot6d(noisy_rot_matrices)  # (B, 6)
+                noisy_pose[:, :, start_idx:end_idx] = noisy_rot6d.unsqueeze(1)
+        
+        # Restore original shape
+        if len(original_shape) == 2:
+            noisy_pose = noisy_pose.squeeze(1)
+        
+        return noisy_pose
+
     def _convert_absolute_to_relative_eef_action(self, absolute_action: torch.Tensor) -> torch.Tensor:
         """
         Convert absolute EEF pose to relative EEF action.
@@ -410,6 +536,10 @@ class GrootPackInputsStep(ProcessorStep):
         For each chunk, uses the first timestep as reference:
         - Position: relative_pos_i = pos_i - pos_ref
         - Rotation: relative_rot_i = R_ref^-1 @ R_i (in SO(3))
+        
+        During training, if relative_action_reference_noise_std > 0, adds noise to the
+        reference pose to simulate real-world tracking errors. This helps the model
+        learn to be robust to imperfect reference poses during inference.
         
         Args:
             absolute_action: Absolute EEF pose tensor. Shape: (B, T, D)
@@ -430,6 +560,12 @@ class GrootPackInputsStep(ProcessorStep):
                 f"🔄 [Delta EEF] Converting absolute EEF poses to relative actions "
                 f"(shape: {absolute_action.shape}, components: {list(self.action_component_indices.keys())})"
             )
+            if self.relative_action_reference_noise_std > 0 or self.relative_action_rotation_noise_deg > 0:
+                logger.info(
+                    f"   🎲 Reference pose noise injection ENABLED: "
+                    f"pos_std={self.relative_action_reference_noise_std:.3f}m, "
+                    f"rot_std={self.relative_action_rotation_noise_deg:.1f}°"
+                )
             self._relative_action_conversion_logged = True
         
         b, t, d = absolute_action.shape
@@ -437,6 +573,20 @@ class GrootPackInputsStep(ProcessorStep):
         
         # Extract reference pose (first timestep of each batch)
         ref_pose = absolute_action[:, 0:1, :]  # (B, 1, D)
+        
+        # Add noise to reference pose during training to simulate tracking errors
+        # This helps the model learn to be robust to imperfect reference poses
+        if self.training and (self.relative_action_reference_noise_std > 0 or self.relative_action_rotation_noise_deg > 0):
+            ref_pose = self._add_noise_to_eef_pose(ref_pose)
+            if not self._reference_noise_logged:
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.info(
+                    f"   🎲 [Training] Adding noise to reference pose: "
+                    f"pos_std={self.relative_action_reference_noise_std:.3f}m, "
+                    f"rot_std={self.relative_action_rotation_noise_deg:.1f}°"
+                )
+                self._reference_noise_logged = True
         
         # Process each component
         for component_name, (start_idx, end_idx) in self.action_component_indices.items():
@@ -942,6 +1092,9 @@ class GrootPackInputsStep(ProcessorStep):
             "freeze_stats_after_first_epoch": self.freeze_stats_after_first_epoch,
             "dataset_num_frames": self.dataset_num_frames,
             "num_processes": self.num_processes,
+            # Reference pose noise injection parameters (for Delta eef mode robustness)
+            "relative_action_reference_noise_std": self.relative_action_reference_noise_std,
+            "relative_action_rotation_noise_deg": self.relative_action_rotation_noise_deg,
         }
         
         # Include relative_action_stats if available (for Delta eef mode)

@@ -125,6 +125,23 @@ BASE_LR=1e-4           # 单卡时的基础学习率
 LR_SCALING_MODE="very_conservative"  # "linear", "sqrt", "conservative", "very_conservative", "fixed_scale"
 FIXED_SCALE_FACTOR=1.3  # 仅在 LR_SCALING_MODE="fixed_scale" 时使用
 
+# Delta EEF Reference Pose Noise Injection 配置
+# ============================================================================
+# 对于 Delta eef 动作空间，可以在训练时对 reference pose 添加噪声，
+# 模拟真实世界中机器人末端跟踪误差（2-3cm），让模型学会处理不完美的参考位姿
+#
+# 参数说明:
+#   - REFERENCE_POSE_NOISE_STD: 位置噪声标准差（米），推荐 0.02-0.03 (2-3cm)
+#   - REFERENCE_ROTATION_NOISE_DEG: 旋转噪声标准差（度），推荐 2-5 度
+#   - 设置为 0.0 表示禁用噪声注入
+#
+# 使用场景:
+#   - 如果您的机器人末端跟踪有 2-3cm 误差，启用噪声注入可以提高模型鲁棒性
+#   - 噪声注入只在训练时生效，推理时不会添加噪声
+# ============================================================================
+REFERENCE_POSE_NOISE_STD=0.025    # 位置噪声: 2.5cm
+REFERENCE_ROTATION_NOISE_DEG=3.0  # 旋转噪声: 3度
+
 # 根据GPU数量自动计算缩放后的学习率
 if [ "$LR_SCALING_MODE" = "linear" ]; then
     # 线性缩放: lr = base_lr × num_gpus
@@ -151,6 +168,21 @@ else
     echo "支持的模式: linear, sqrt, conservative, very_conservative, fixed_scale"
     exit 1
 fi
+
+# 打印噪声注入配置
+echo "=========================================="
+echo "🎲 Delta EEF 噪声注入配置:"
+if [ "$(echo "${REFERENCE_POSE_NOISE_STD} > 0" | bc -l)" = "1" ] || [ "$(echo "${REFERENCE_ROTATION_NOISE_DEG} > 0" | bc -l)" = "1" ]; then
+    echo "   状态: 已启用"
+    echo "   位置噪声标准差: ${REFERENCE_POSE_NOISE_STD}m ($(echo "${REFERENCE_POSE_NOISE_STD} * 100" | bc -l)cm)"
+    echo "   旋转噪声标准差: ${REFERENCE_ROTATION_NOISE_DEG}°"
+    echo "   💡 模型将学习处理实际机器人的末端跟踪误差"
+else
+    echo "   状态: 已禁用"
+    echo "   ⚠️  建议: 如果机器人有2-3cm跟踪误差，考虑启用噪声注入"
+    echo "   设置: REFERENCE_POSE_NOISE_STD=0.025 REFERENCE_ROTATION_NOISE_DEG=3.0"
+fi
+echo "=========================================="
 
 # 是否从checkpoint继续训练
 RESUME=false
@@ -203,6 +235,8 @@ accelerate launch \
   --policy.max_state_dim=64 \
   --policy.max_action_dim=32 \
   --policy.action_space_type="Delta eef" \
+  --policy.relative_action_reference_noise_std=${REFERENCE_POSE_NOISE_STD} \
+  --policy.relative_action_rotation_noise_deg=${REFERENCE_ROTATION_NOISE_DEG} \
   --policy.optimizer_lr=${SCALED_LR} \
   --policy.warmup_ratio=0.10 \
   --policy.chunk_size=32 \
@@ -223,5 +257,8 @@ echo "模型保存在: ${OUTPUT_DIR}"
 echo "Checkpoints保存在: ${OUTPUT_DIR}/checkpoints/"
 echo "有效batch size: ${BATCH_SIZE} x ${NUM_GPUS} = $((BATCH_SIZE * NUM_GPUS))"
 echo "学习率配置: 基础LR=${BASE_LR}, 缩放后LR=${SCALED_LR} (${LR_SCALING_MODE}缩放)"
+if [ "$(echo "${REFERENCE_POSE_NOISE_STD} > 0" | bc -l)" = "1" ] || [ "$(echo "${REFERENCE_ROTATION_NOISE_DEG} > 0" | bc -l)" = "1" ]; then
+    echo "🎲 噪声注入配置: 位置噪声=${REFERENCE_POSE_NOISE_STD}m, 旋转噪声=${REFERENCE_ROTATION_NOISE_DEG}°"
+fi
 echo "=========================================="
 

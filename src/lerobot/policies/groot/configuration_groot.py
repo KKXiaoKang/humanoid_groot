@@ -123,6 +123,28 @@ class GrootConfig(PreTrainedConfig):
     
     # Action space type configuration (passed to action_head_cfg)
     action_space_type: str = field(default="Absolute joint", metadata={"help": "Action space type: 'Absolute joint', 'Absolute eef', or 'Delta eef'. This will be passed to action_head_cfg."})
+    
+    # ============ Reference Pose Noise Injection (for Delta eef mode) ============
+    # These parameters inject noise into the reference pose during training to simulate
+    # real-world tracking errors. This helps the model learn to be robust to imperfect
+    # reference poses during inference.
+    relative_action_reference_noise_std: float = field(
+        default=0.0,
+        metadata={
+            "help": "Standard deviation of Gaussian noise (meters) to add to reference pose position during training. "
+                    "Only applies when action_space_type='Delta eef'. "
+                    "Recommended: 0.02-0.03 (2-3cm) to match typical tracking error. "
+                    "Set to 0.0 to disable noise injection."
+        }
+    )
+    relative_action_rotation_noise_deg: float = field(
+        default=0.0,
+        metadata={
+            "help": "Standard deviation of rotation noise (degrees) to add to reference pose during training. "
+                    "Only applies when action_space_type='Delta eef'. "
+                    "Recommended: 2-5 degrees. Set to 0.0 to disable rotation noise."
+        }
+    )
 
     def __post_init__(self):
         super().__post_init__()
