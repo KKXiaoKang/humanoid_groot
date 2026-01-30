@@ -13,8 +13,8 @@ pip install lerobot[groot]
 pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.6cxx11abiTRUE-cp310-cp310-linux_x86_64.whl
 
 # 必装
-pip install transformers
-pip install peft
+pip install transformers==4.57.3
+pip install peft==0.18.0
 
 # 推理环境安装
 pip3 install rospkg
@@ -24,7 +24,10 @@ pip3 install websockets
 pip3 install deprecated
 
 # eef action space
-conda install pinocchio
+# 注意：如果使用 miniconda（而非 miniforge3），需要先添加 conda-forge 频道
+# conda config --add channels conda-forge
+# conda config --set channel_priority strict
+conda install pinocchio -c conda-forge
 pip install PyQt5
 pip install PySide2
 (lerobot_groot_base) lab@lab [~/humanoid_groot/eval/IK_eef_eval] git:(KangKK/dev/delta_eef_pose_action) ✗ ➜  conda list | grep pinocchio [15:00:04]
