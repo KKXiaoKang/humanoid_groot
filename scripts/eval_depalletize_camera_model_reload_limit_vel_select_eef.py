@@ -2680,6 +2680,9 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
                 # 执行整个chunk
                 rospy.loginfo(f"Executing chunk of size {action_chunk.shape[0]} in sync mode")
                 
+                # 默认执行双手
+                arm_execution_mode = 'both'
+                
                 # 在执行chunk之前暂停，让用户查看chunk信息
                 if pause_before_chunk:
                     print("\n" + "="*80)
@@ -2744,11 +2747,29 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
                             print(f"   First action claw (2D): {action_chunk[0][14:16]}")
                             print(f"   Last action claw (2D): {action_chunk[-1][14:16]}")
                     print("="*80)
-                    user_input = input("Press Enter to execute this chunk, or 'q'+Enter to stop: ").strip().lower()
+                    
+                    # 选择手臂执行模式
+                    print("\n🤖 Arm Execution Mode Selection:")
+                    print("   [Enter] or [b] = Both arms (default)")
+                    print("   [l] = Left arm only (right arm holds current position)")
+                    print("   [r] = Right arm only (left arm holds current position)")
+                    print("   [q] = Stop inference")
+                    
+                    user_input = input("Select mode and press Enter: ").strip().lower()
+                    
                     if user_input == 'q':
                         print("\n[User] Stopping inference by user request")
                         FIRST_MODEL_INFERENCE = True
                         return True
+                    elif user_input == 'l':
+                        arm_execution_mode = 'left'
+                        print("✅ Left arm only mode selected - Right arm will hold current position\n")
+                    elif user_input == 'r':
+                        arm_execution_mode = 'right'
+                        print("✅ Right arm only mode selected - Left arm will hold current position\n")
+                    else:
+                        arm_execution_mode = 'both'
+                        print("✅ Both arms mode selected\n")
                     print("Continuing with chunk execution...\n")
                 
                 control_cmd_pose = ("Cmd_pose_z" in ACTION_COMPONENTS or "Cmd_pose_pitch" in ACTION_COMPONENTS)
@@ -2776,13 +2797,35 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
                 # 注意：FK计算和可视化更新会对每个action都执行，但日志打印可以控制频率
                 log_print_frequency = 10  # 每10个action打印一次日志
                 
+                # 获取当前机器人手臂状态（用于单手模式时保持另一只手不动）
+                current_arm_state_for_hold = None
+                if arm_execution_mode != 'both':
+                    try:
+                        obs_data_hold, _, _, _, _ = env.get_obs()
+                        current_arm_state_for_hold = obs_data_hold["state"][0][:14].copy()  # 14D手臂关节
+                        rospy.loginfo(f"[ARM_MODE] {arm_execution_mode.upper()} only mode: holding other arm at current position")
+                    except Exception as e:
+                        rospy.logwarn(f"[ARM_MODE] Failed to get current arm state: {e}, using both arms")
+                        arm_execution_mode = 'both'
+                
                 for action_idx, action_step in enumerate(action_chunk):
-                    env.exec_actions(actions=action_step,
+                    # 根据arm_execution_mode修改action
+                    action_to_execute = action_step.copy()
+                    
+                    if arm_execution_mode == 'left' and current_arm_state_for_hold is not None:
+                        # 只执行左手，右手保持不动
+                        # action格式: [left_arm(7), right_arm(7), claw(2), ...]
+                        action_to_execute[7:14] = current_arm_state_for_hold[7:14]
+                    elif arm_execution_mode == 'right' and current_arm_state_for_hold is not None:
+                        # 只执行右手，左手保持不动
+                        action_to_execute[0:7] = current_arm_state_for_hold[0:7]
+                    
+                    env.exec_actions(actions=action_to_execute,
                                      control_arm=control_arm,
                                      control_claw=control_claw,
                                      control_cmd_pose=control_cmd_pose)
                     step_counter += 1
-                    last_executed_action = action_step.copy()
+                    last_executed_action = action_to_execute.copy()  # 记录实际执行的action
                     
                     # ===== 实时跟踪：每个action都更新真实状态并计算差异 =====
                     # 对每个action都进行FK计算和可视化更新，确保实时反馈跟踪情况
