@@ -107,6 +107,25 @@ LOG_FREQ=100           # 每100步打印一次日志
 EVAL_FREQ=0            # 设置为0禁用评估
 NUM_WORKERS=8          # 数据加载器工作进程数（每个GPU）
 
+# ============================================================================
+# Delta EEF模式下的Reference Pose来源配置
+# ============================================================================
+# 当 action_space_type="Delta eef" 时，relative action是这样计算的：
+#   relative_action = absolute_action - reference_pose
+#
+# 这个参数控制 reference_pose 的来源：
+#   - "state": 使用 observation.state 作为 reference（推荐！）
+#             训练: state来自数据集（机器人录制时的实际状态）
+#             推理: state来自FK（机器人当前的实际状态）
+#             ✅ 训练和推理使用一致的reference来源！
+#
+#   - "action": 使用 action[0] 作为 reference（旧方式）
+#             训练: action[0]是指令位姿
+#             推理: state来自FK（实际位姿）
+#             ⚠️  训练和推理的reference来源不一致，可能导致跟踪误差累积！
+# ============================================================================
+RELATIVE_ACTION_REF_MODE="state"  # "state" (推荐) 或 "action" (旧方式)
+
 # 学习率配置
 # ============================================================================
 # 重要: LeRobot不会自动缩放学习率，需要手动根据GPU数量缩放
@@ -174,6 +193,23 @@ IMAGE_TRANSFORMS_CONFIG_PATH="config/image_transforms.json"
 # - random_order 参数说明:
 #   * False: 按照变换的默认顺序应用（brightness -> contrast -> saturation -> ...）
 #   * True: 随机打乱变换的应用顺序，增加数据增强的多样性
+
+# 打印Delta EEF配置信息
+echo ""
+echo "=========================================="
+echo "🔄 Delta EEF配置:"
+echo "   action_space_type: Delta eef"
+echo "   relative_action_reference_mode: ${RELATIVE_ACTION_REF_MODE}"
+if [ "$RELATIVE_ACTION_REF_MODE" = "state" ]; then
+    echo "   ✅ 使用 observation.state 作为 reference pose (推荐)"
+    echo "   ✅ 训练和推理使用一致的 reference 来源"
+else
+    echo "   ⚠️  使用 action[0] 作为 reference pose (旧方式)"
+    echo "   ⚠️  注意: 可能存在训练-推理不一致问题"
+fi
+echo "=========================================="
+echo ""
+
 accelerate launch \
   --multi_gpu \
   --num_processes=${NUM_GPUS} \
@@ -203,6 +239,7 @@ accelerate launch \
   --policy.max_state_dim=64 \
   --policy.max_action_dim=32 \
   --policy.action_space_type="Delta eef" \
+  --policy.relative_action_reference_mode="${RELATIVE_ACTION_REF_MODE}" \
   --policy.optimizer_lr=${SCALED_LR} \
   --policy.warmup_ratio=0.10 \
   --policy.chunk_size=32 \

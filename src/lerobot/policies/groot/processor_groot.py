@@ -184,6 +184,9 @@ def make_groot_pre_post_processors(
     # Get action space type from config (default to "Absolute joint" for backward compatibility)
     action_space_type = getattr(config, 'action_space_type', "Absolute joint")
     
+    # Get relative action reference mode from config (default to "state" for recommended behavior)
+    relative_action_reference_mode = getattr(config, 'relative_action_reference_mode', "state")
+    
     # Get horizon/dimension parameters from config
     # These should match the config used for the pretrained model
     # Default values match most GR00T configs (state_horizon=1, action_horizon=16)
@@ -261,6 +264,7 @@ def make_groot_pre_post_processors(
             stats=padded_stats,
             action_space_type=action_space_type,
             action_component_indices=action_component_indices,
+            relative_action_reference_mode=relative_action_reference_mode,  # Reference pose mode for Delta eef
             dataset_num_frames=dataset_num_frames,
             num_processes=num_processes,  # Pass num_processes for multi-GPU training
         ),
@@ -360,6 +364,11 @@ class GrootPackInputsStep(ProcessorStep):
     action_component_indices: dict[str, tuple[int, int]] | None = None  # e.g., {"left_eef_pos": (0, 3), ...}
     _relative_action_conversion_logged: bool = False  # Track if we've logged the conversion
     
+    # Reference pose mode for Delta eef (relative action) training
+    # - "state": Use observation.state as reference pose (RECOMMENDED)
+    # - "action": Use action[0] as reference pose (legacy behavior)
+    relative_action_reference_mode: str = "state"
+    
     # Dynamic normalization statistics for relative action position components
     # These are accumulated during training and saved to model config
     # Note: This field accepts a value in __init__ (from JSON config) but is ignored.
@@ -438,9 +447,12 @@ class GrootPackInputsStep(ProcessorStep):
         b, t, d = absolute_action.shape
         relative_action = absolute_action.clone()
         
-        # 使用 current_state 作为 reference pose（正确的做法）
-        # 这样训练和推理时的 reference 来源是一致的！
-        if current_state is not None:
+        # 根据 relative_action_reference_mode 选择 reference pose 来源
+        # - "state": 使用 observation.state 作为 reference（推荐，训练推理一致）
+        # - "action": 使用 action[0] 作为 reference（旧方式）
+        
+        if self.relative_action_reference_mode == "state" and current_state is not None:
+            # 模式1: 使用 observation.state 作为 reference pose（推荐）
             # current_state: (B, D) -> (B, 1, D)
             if current_state.dim() == 2:
                 ref_pose = current_state.unsqueeze(1)  # (B, 1, D)
@@ -456,24 +468,44 @@ class GrootPackInputsStep(ProcessorStep):
                     f"(action shape: {absolute_action.shape}, state shape: {current_state.shape})"
                 )
                 logger.info(
-                    f"   ✅ This is the CORRECT approach: state represents actual robot pose"
+                    f"   ✅ Mode: relative_action_reference_mode='state' (RECOMMENDED)"
                 )
                 logger.info(
                     f"   ✅ Training and inference use consistent reference (actual state, not action command)"
                 )
                 self._relative_action_conversion_logged = True
+        
+        elif self.relative_action_reference_mode == "action":
+            # 模式2: 使用 action[0] 作为 reference pose（旧方式）
+            ref_pose = absolute_action[:, 0:1, :]  # (B, 1, D)
+            
+            if not self._relative_action_conversion_logged:
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.info(
+                    f"🔄 [Delta EEF] Converting absolute EEF to relative actions using ACTION[0] as reference "
+                    f"(action shape: {absolute_action.shape})"
+                )
+                logger.info(
+                    f"   ⚠️  Mode: relative_action_reference_mode='action' (legacy)"
+                )
+                logger.info(
+                    f"   ⚠️  Note: This may cause train-inference mismatch if robot has tracking errors!"
+                )
+                self._relative_action_conversion_logged = True
+        
         else:
-            # Fallback: use action[0] as reference (legacy behavior, NOT RECOMMENDED)
+            # Fallback: state mode but no state provided
             ref_pose = absolute_action[:, 0:1, :]  # (B, 1, D)
             
             if not self._relative_action_conversion_logged:
                 import logging
                 logger = logging.getLogger(__name__)
                 logger.warning(
-                    f"⚠️  [Delta EEF] Falling back to action[0] as reference (NO STATE PROVIDED)"
+                    f"⚠️  [Delta EEF] relative_action_reference_mode='state' but NO STATE PROVIDED!"
                 )
                 logger.warning(
-                    f"   This may cause train-inference mismatch if robot has tracking errors!"
+                    f"   Falling back to action[0] as reference. This is NOT recommended."
                 )
                 self._relative_action_conversion_logged = True
         
@@ -993,6 +1025,7 @@ class GrootPackInputsStep(ProcessorStep):
             "embodiment_mapping": self.embodiment_mapping,
             "normalize_min_max": self.normalize_min_max,
             "action_space_type": self.action_space_type,
+            "relative_action_reference_mode": self.relative_action_reference_mode,  # Reference pose mode for Delta eef
             "freeze_stats_after_first_epoch": self.freeze_stats_after_first_epoch,
             "dataset_num_frames": self.dataset_num_frames,
             "num_processes": self.num_processes,

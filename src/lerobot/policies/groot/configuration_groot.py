@@ -123,6 +123,20 @@ class GrootConfig(PreTrainedConfig):
     
     # Action space type configuration (passed to action_head_cfg)
     action_space_type: str = field(default="Absolute joint", metadata={"help": "Action space type: 'Absolute joint', 'Absolute eef', or 'Delta eef'. This will be passed to action_head_cfg."})
+    
+    # Reference pose mode for Delta eef (relative action) training
+    # - "state": Use observation.state as reference pose (RECOMMENDED)
+    #            Ensures train-inference consistency: both use actual robot state
+    #            Training: state from dataset (actual robot state during recording)
+    #            Inference: state from FK (actual robot state)
+    # - "action": Use action[0] as reference pose (legacy behavior)
+    #            May cause train-inference mismatch if robot has tracking errors
+    #            Training: action[0] (commanded pose)
+    #            Inference: state from FK (actual robot state) - MISMATCH!
+    relative_action_reference_mode: str = field(
+        default="state", 
+        metadata={"help": "Reference pose source for Delta eef mode: 'state' (recommended, uses observation.state) or 'action' (legacy, uses action[0])"}
+    )
 
     def __post_init__(self):
         super().__post_init__()
@@ -132,6 +146,14 @@ class GrootConfig(PreTrainedConfig):
                 f"n_action_steps ({self.n_action_steps}) cannot exceed chunk_size ({self.chunk_size})"
             )
 
+        # Validate relative_action_reference_mode
+        valid_modes = ["state", "action"]
+        if self.relative_action_reference_mode not in valid_modes:
+            raise ValueError(
+                f"relative_action_reference_mode must be one of {valid_modes}, "
+                f"got '{self.relative_action_reference_mode}'"
+            )
+        
         # groot_repo_path is now optional since we ported the components
         # No validation needed
 
