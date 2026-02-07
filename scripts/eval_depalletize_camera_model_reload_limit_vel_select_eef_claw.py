@@ -11,8 +11,9 @@ import json
 from std_srvs.srv import Trigger, TriggerRequest, SetBool, SetBoolRequest
 
 # ROS可视化相关导入
+import rospy  # 需要在类定义之前导入，因为类型注解中使用了 rospy.Time
 from visualization_msgs.msg import Marker, MarkerArray
-from geometry_msgs.msg import Point, PoseStamped, Pose, Quaternion
+from geometry_msgs.msg import Point, PoseStamped, Pose, Quaternion, Vector3Stamped
 import tf2_ros
 # 注意：不导入tf2_geometry_msgs以避免PyKDL依赖问题（在conda环境中）
 # 我们使用自己实现的坐标变换函数，不需要do_transform_point
@@ -338,7 +339,9 @@ class EEFPoseVisualizer:
     2. Robot Reference State: 每次chunk推理的reference pose（黄色，仅Delta eef模式）
     3. Chunk Action EEF: 预测的action转换为EEF pose（蓝色=左手, 红色=右手）
     
-    所有pose都从robot base frame (waist_yaw_link) 转换到odom frame进行可视化
+    所有pose都从robot base frame (waist_yaw_link) 转换：
+    - Marker可视化：转换到odom frame
+    - PoseStamped话题：数据已在robot frame下，直接发布，frame_id设置为wrist_yaw_link
     """
     
     # 颜色定义 (RGBA)
@@ -352,17 +355,20 @@ class EEFPoseVisualizer:
     def __init__(self, 
                  robot_frame: str = "waist_yaw_link",
                  odom_frame: str = "odom",
-                 marker_topic: str = "/policy/eef_pose_markers"):
+                 marker_topic: str = "/policy/eef_pose_markers",
+                 target_frame: str = "wrist_yaw_link"):
         """
         初始化EEF可视化器
         
         Args:
             robot_frame: 机器人基座frame名称
-            odom_frame: 世界/odom frame名称
+            odom_frame: 世界/odom frame名称（用于可视化markers）
             marker_topic: MarkerArray发布的topic名称
+            target_frame: PoseStamped话题的目标frame名称（默认wrist_yaw_link）
         """
         self.robot_frame = robot_frame
         self.odom_frame = odom_frame
+        self.target_frame = target_frame
         
         # TF2 buffer和listener
         self.tf_buffer = tf2_ros.Buffer()
@@ -374,13 +380,28 @@ class EEFPoseVisualizer:
         # PoseStamped发布器（用于记录和rosbag录制）
         # Delta eef模式：6个话题（left/right分别发布）
         # Absolute eef模式：4个话题（left/right分别发布）
-        # 所有pose都转换到odom坐标系（frame_id = "odom"）
+        # 所有pose数据已经在robot frame（waist_yaw_link）下，直接发布，frame_id设置为target_frame（wrist_yaw_link）
         self.real_eef_pose_pub_left = rospy.Publisher("/policy/eef_pose/real_state_left", PoseStamped, queue_size=10)
         self.real_eef_pose_pub_right = rospy.Publisher("/policy/eef_pose/real_state_right", PoseStamped, queue_size=10)
         self.predicted_eef_pose_pub_left = rospy.Publisher("/policy/eef_pose/predicted_absolute_left", PoseStamped, queue_size=10)
         self.predicted_eef_pose_pub_right = rospy.Publisher("/policy/eef_pose/predicted_absolute_right", PoseStamped, queue_size=10)
         self.reference_eef_pose_pub_left = rospy.Publisher("/policy/eef_pose/reference_left", PoseStamped, queue_size=10)
         self.reference_eef_pose_pub_right = rospy.Publisher("/policy/eef_pose/reference_right", PoseStamped, queue_size=10)
+        # IK->FK round-trip验证话题（用于验证IK求解器的准确性）
+        self.ik_fk_roundtrip_pub_left = rospy.Publisher("/policy/eef_pose/ik_fk_roundtrip_left", PoseStamped, queue_size=10)
+        self.ik_fk_roundtrip_pub_right = rospy.Publisher("/policy/eef_pose/ik_fk_roundtrip_right", PoseStamped, queue_size=10)
+        
+        # 欧拉角话题发布器（使用rot6d_to_euler_zyx转换，便于在PlotJuggler中直接查看）
+        # Vector3Stamped格式：x=roll, y=pitch, z=yaw（单位：弧度）
+        # 每种类型的EEF pose都有对应的欧拉角话题
+        self.real_euler_pub_left = rospy.Publisher("/policy/eef_euler/real_state_left", Vector3Stamped, queue_size=10)
+        self.real_euler_pub_right = rospy.Publisher("/policy/eef_euler/real_state_right", Vector3Stamped, queue_size=10)
+        self.predicted_euler_pub_left = rospy.Publisher("/policy/eef_euler/predicted_absolute_left", Vector3Stamped, queue_size=10)
+        self.predicted_euler_pub_right = rospy.Publisher("/policy/eef_euler/predicted_absolute_right", Vector3Stamped, queue_size=10)
+        self.reference_euler_pub_left = rospy.Publisher("/policy/eef_euler/reference_left", Vector3Stamped, queue_size=10)
+        self.reference_euler_pub_right = rospy.Publisher("/policy/eef_euler/reference_right", Vector3Stamped, queue_size=10)
+        self.ik_fk_roundtrip_euler_pub_left = rospy.Publisher("/policy/eef_euler/ik_fk_roundtrip_left", Vector3Stamped, queue_size=10)
+        self.ik_fk_roundtrip_euler_pub_right = rospy.Publisher("/policy/eef_euler/ik_fk_roundtrip_right", Vector3Stamped, queue_size=10)
         
         # 累积的action轨迹markers（不清空，保留历史）
         self.action_markers_left = []   # 左手action轨迹
@@ -403,15 +424,23 @@ class EEFPoseVisualizer:
         
         rospy.loginfo(f"[EEFVisualizer] Initialized:")
         rospy.loginfo(f"   Robot frame: {robot_frame}")
-        rospy.loginfo(f"   Odom frame: {odom_frame}")
+        rospy.loginfo(f"   Odom frame: {odom_frame} (for visualization markers)")
+        rospy.loginfo(f"   Target frame: {target_frame} (for PoseStamped topics)")
         rospy.loginfo(f"   Marker topic: {marker_topic}")
-        rospy.loginfo(f"   PoseStamped topics (all in odom frame):")
+        rospy.loginfo(f"   PoseStamped topics (all in {target_frame} frame):")
         rospy.loginfo(f"     - /policy/eef_pose/real_state_left (FK计算的真实EEF pose - 左手)")
         rospy.loginfo(f"     - /policy/eef_pose/real_state_right (FK计算的真实EEF pose - 右手)")
         rospy.loginfo(f"     - /policy/eef_pose/predicted_absolute_left (预测的absolute eef - 左手)")
         rospy.loginfo(f"     - /policy/eef_pose/predicted_absolute_right (预测的absolute eef - 右手)")
         rospy.loginfo(f"     - /policy/eef_pose/reference_left (reference pose - 左手, Delta eef only)")
         rospy.loginfo(f"     - /policy/eef_pose/reference_right (reference pose - 右手, Delta eef only)")
+        rospy.loginfo(f"     - /policy/eef_pose/ik_fk_roundtrip_left (IK->FK round-trip验证 - 左手)")
+        rospy.loginfo(f"     - /policy/eef_pose/ik_fk_roundtrip_right (IK->FK round-trip验证 - 右手)")
+        rospy.loginfo(f"   Euler angle topics (Vector3Stamped: x=roll, y=pitch, z=yaw, 单位：弧度):")
+        rospy.loginfo(f"     - /policy/eef_euler/real_state_left, /policy/eef_euler/real_state_right")
+        rospy.loginfo(f"     - /policy/eef_euler/predicted_absolute_left, /policy/eef_euler/predicted_absolute_right")
+        rospy.loginfo(f"     - /policy/eef_euler/reference_left, /policy/eef_euler/reference_right")
+        rospy.loginfo(f"     - /policy/eef_euler/ik_fk_roundtrip_left, /policy/eef_euler/ik_fk_roundtrip_right")
     
     def _get_transform_to_odom(self) -> tuple:
         """
@@ -644,13 +673,14 @@ class EEFPoseVisualizer:
         
         Args:
             eef_pose_20d: 20D EEF pose [left_pos(3), left_rot6d(6), right_pos(3), right_rot6d(6), gripper(2)]
-            frame_id: 目标frame ID（如果为None，使用self.odom_frame）
+                        数据已经在robot frame（waist_yaw_link）坐标系下，直接使用
+            frame_id: 目标frame ID（如果为None，使用self.target_frame）
         
         Returns:
             tuple: (left_pose_stamped, right_pose_stamped)
         """
         if frame_id is None:
-            frame_id = self.odom_frame
+            frame_id = self.target_frame
         
         # 提取左右手的位置和旋转
         left_pos = eef_pose_20d[0:3]
@@ -658,25 +688,17 @@ class EEFPoseVisualizer:
         right_pos = eef_pose_20d[9:12]
         right_rot6d = eef_pose_20d[12:18]
         
-        # 转换到odom frame
-        trans, rot = self._get_transform_to_odom()
-        if trans is None:
-            return None, None
-        
-        left_pos_odom = self._transform_point_to_odom(left_pos, trans, rot)
-        right_pos_odom = self._transform_point_to_odom(right_pos, trans, rot)
-        
-        # 将6D旋转转换为四元数
+        # 将6D旋转转换为四元数（数据已经在robot frame下，不需要转换）
         left_quat = rot6d_to_quaternion_xyzw(left_rot6d)
         right_quat = rot6d_to_quaternion_xyzw(right_rot6d)
         
-        # 创建PoseStamped消息
+        # 创建PoseStamped消息（直接使用原始数据）
         left_pose_stamped = PoseStamped()
         left_pose_stamped.header.frame_id = frame_id
         left_pose_stamped.header.stamp = rospy.Time.now()
-        left_pose_stamped.pose.position.x = left_pos_odom[0]
-        left_pose_stamped.pose.position.y = left_pos_odom[1]
-        left_pose_stamped.pose.position.z = left_pos_odom[2]
+        left_pose_stamped.pose.position.x = left_pos[0]
+        left_pose_stamped.pose.position.y = left_pos[1]
+        left_pose_stamped.pose.position.z = left_pos[2]
         left_pose_stamped.pose.orientation.x = left_quat[0]
         left_pose_stamped.pose.orientation.y = left_quat[1]
         left_pose_stamped.pose.orientation.z = left_quat[2]
@@ -685,9 +707,9 @@ class EEFPoseVisualizer:
         right_pose_stamped = PoseStamped()
         right_pose_stamped.header.frame_id = frame_id
         right_pose_stamped.header.stamp = rospy.Time.now()
-        right_pose_stamped.pose.position.x = right_pos_odom[0]
-        right_pose_stamped.pose.position.y = right_pos_odom[1]
-        right_pose_stamped.pose.position.z = right_pos_odom[2]
+        right_pose_stamped.pose.position.x = right_pos[0]
+        right_pose_stamped.pose.position.y = right_pos[1]
+        right_pose_stamped.pose.position.z = right_pos[2]
         right_pose_stamped.pose.orientation.x = right_quat[0]
         right_pose_stamped.pose.orientation.y = right_quat[1]
         right_pose_stamped.pose.orientation.z = right_quat[2]
@@ -695,65 +717,188 @@ class EEFPoseVisualizer:
         
         return left_pose_stamped, right_pose_stamped
     
-    def publish_real_eef_pose(self, current_eef_pose: np.ndarray):
+    def _eef_pose_20d_to_euler_stamped(self, eef_pose_20d: np.ndarray, frame_id: str = None, timestamp: rospy.Time = None) -> tuple:
         """
-        发布FK计算的真实EEF pose（PoseStamped）
+        将20D EEF pose转换为左右手的欧拉角Vector3Stamped消息
+        
+        使用rot6d_to_euler_zyx转换6D旋转为欧拉角 (roll, pitch, yaw)
+        
+        Args:
+            eef_pose_20d: 20D EEF pose [left_pos(3), left_rot6d(6), right_pos(3), right_rot6d(6), gripper(2)]
+            frame_id: 目标frame ID（如果为None，使用self.target_frame）
+            timestamp: 时间戳（如果为None，使用当前时间）
+        
+        Returns:
+            tuple: (left_euler_stamped, right_euler_stamped)
+                   Vector3Stamped格式：x=roll, y=pitch, z=yaw（单位：弧度）
+        """
+        if frame_id is None:
+            frame_id = self.target_frame
+        if timestamp is None:
+            timestamp = rospy.Time.now()
+        
+        # 提取左右手的旋转（6D表示）
+        left_rot6d = eef_pose_20d[3:9]
+        right_rot6d = eef_pose_20d[12:18]
+        
+        # 将6D旋转转换为欧拉角 (roll, pitch, yaw)
+        left_euler = rot6d_to_euler_zyx(left_rot6d)   # 返回 [roll, pitch, yaw]
+        right_euler = rot6d_to_euler_zyx(right_rot6d)  # 返回 [roll, pitch, yaw]
+        
+        # 创建左手欧拉角消息
+        left_euler_stamped = Vector3Stamped()
+        left_euler_stamped.header.frame_id = frame_id
+        left_euler_stamped.header.stamp = timestamp
+        left_euler_stamped.vector.x = left_euler[0]   # roll
+        left_euler_stamped.vector.y = left_euler[1]   # pitch
+        left_euler_stamped.vector.z = left_euler[2]   # yaw
+        
+        # 创建右手欧拉角消息
+        right_euler_stamped = Vector3Stamped()
+        right_euler_stamped.header.frame_id = frame_id
+        right_euler_stamped.header.stamp = timestamp
+        right_euler_stamped.vector.x = right_euler[0]  # roll
+        right_euler_stamped.vector.y = right_euler[1]  # pitch
+        right_euler_stamped.vector.z = right_euler[2]  # yaw
+        
+        return left_euler_stamped, right_euler_stamped
+    
+    def publish_real_eef_pose(self, current_eef_pose: np.ndarray, timestamp: rospy.Time = None):
+        """
+        发布FK计算的真实EEF pose（PoseStamped）和对应的欧拉角（Vector3Stamped）
         
         Args:
             current_eef_pose: 20D EEF pose（robot frame下）
+            timestamp: 可选的时间戳。如果为None，使用当前时间
         """
+        # 使用相同的时间戳
+        if timestamp is None:
+            timestamp = rospy.Time.now()
+        
+        # 发布PoseStamped
         left_pose, right_pose = self._eef_pose_20d_to_pose_stamped(current_eef_pose)
         if left_pose is not None and right_pose is not None:
-            # 使用相同的时间戳，frame_id是odom坐标系
-            current_time = rospy.Time.now()
-            left_pose.header.stamp = current_time
-            right_pose.header.stamp = current_time
-            # frame_id已经是odom坐标系（在_eef_pose_20d_to_pose_stamped中转换）
-            left_pose.header.frame_id = self.odom_frame
-            right_pose.header.frame_id = self.odom_frame
+            left_pose.header.stamp = timestamp
+            right_pose.header.stamp = timestamp
+            # frame_id设置为target_frame（数据已在robot frame下，直接使用）
+            left_pose.header.frame_id = self.target_frame
+            right_pose.header.frame_id = self.target_frame
             # 发布到独立的left/right topic
             self.real_eef_pose_pub_left.publish(left_pose)
             self.real_eef_pose_pub_right.publish(right_pose)
+        
+        # 发布欧拉角（使用相同的时间戳）
+        left_euler, right_euler = self._eef_pose_20d_to_euler_stamped(current_eef_pose, timestamp=timestamp)
+        self.real_euler_pub_left.publish(left_euler)
+        self.real_euler_pub_right.publish(right_euler)
     
-    def publish_predicted_eef_pose(self, predicted_eef_pose: np.ndarray):
+    def publish_predicted_eef_pose(self, predicted_eef_pose: np.ndarray, timestamp: rospy.Time = None):
         """
-        发布预测的absolute EEF pose（PoseStamped）
+        发布预测的absolute EEF pose（PoseStamped）和对应的欧拉角（Vector3Stamped）
         
         Args:
             predicted_eef_pose: 20D EEF pose（robot frame下，已经是absolute）
+            timestamp: 可选的时间戳。如果为None，使用当前时间
         """
+        # 使用相同的时间戳
+        if timestamp is None:
+            timestamp = rospy.Time.now()
+        
+        # 发布PoseStamped
         left_pose, right_pose = self._eef_pose_20d_to_pose_stamped(predicted_eef_pose)
         if left_pose is not None and right_pose is not None:
-            # 使用相同的时间戳，frame_id是odom坐标系
-            current_time = rospy.Time.now()
-            left_pose.header.stamp = current_time
-            right_pose.header.stamp = current_time
-            # frame_id已经是odom坐标系（在_eef_pose_20d_to_pose_stamped中转换）
-            left_pose.header.frame_id = self.odom_frame
-            right_pose.header.frame_id = self.odom_frame
+            left_pose.header.stamp = timestamp
+            right_pose.header.stamp = timestamp
+            # frame_id设置为target_frame（数据已在robot frame下，直接使用）
+            left_pose.header.frame_id = self.target_frame
+            right_pose.header.frame_id = self.target_frame
             # 发布到独立的left/right topic
             self.predicted_eef_pose_pub_left.publish(left_pose)
             self.predicted_eef_pose_pub_right.publish(right_pose)
+        
+        # 发布欧拉角（使用相同的时间戳）
+        left_euler, right_euler = self._eef_pose_20d_to_euler_stamped(predicted_eef_pose, timestamp=timestamp)
+        self.predicted_euler_pub_left.publish(left_euler)
+        self.predicted_euler_pub_right.publish(right_euler)
     
-    def publish_reference_eef_pose(self, reference_eef_pose: np.ndarray):
+    def publish_reference_eef_pose(self, reference_eef_pose: np.ndarray, timestamp: rospy.Time = None):
         """
-        发布reference EEF pose（PoseStamped，仅Delta eef模式）
+        发布reference EEF pose（PoseStamped，仅Delta eef模式）和对应的欧拉角（Vector3Stamped）
         
         Args:
             reference_eef_pose: 20D EEF pose（robot frame下）
+            timestamp: 可选的时间戳。如果为None，使用当前时间
         """
+        # 使用相同的时间戳
+        if timestamp is None:
+            timestamp = rospy.Time.now()
+        
+        # 发布PoseStamped
         left_pose, right_pose = self._eef_pose_20d_to_pose_stamped(reference_eef_pose)
         if left_pose is not None and right_pose is not None:
-            # 使用相同的时间戳，frame_id是odom坐标系
-            current_time = rospy.Time.now()
-            left_pose.header.stamp = current_time
-            right_pose.header.stamp = current_time
-            # frame_id已经是odom坐标系（在_eef_pose_20d_to_pose_stamped中转换）
-            left_pose.header.frame_id = self.odom_frame
-            right_pose.header.frame_id = self.odom_frame
+            left_pose.header.stamp = timestamp
+            right_pose.header.stamp = timestamp
+            # frame_id设置为target_frame（数据已在robot frame下，直接使用）
+            left_pose.header.frame_id = self.target_frame
+            right_pose.header.frame_id = self.target_frame
             # 发布到独立的left/right topic
             self.reference_eef_pose_pub_left.publish(left_pose)
             self.reference_eef_pose_pub_right.publish(right_pose)
+        
+        # 发布欧拉角（使用相同的时间戳）
+        left_euler, right_euler = self._eef_pose_20d_to_euler_stamped(reference_eef_pose, timestamp=timestamp)
+        self.reference_euler_pub_left.publish(left_euler)
+        self.reference_euler_pub_right.publish(right_euler)
+    
+    def publish_ik_fk_roundtrip_eef_pose(self, joint_action: np.ndarray, gripper_state: np.ndarray, fk_getter, timestamp: rospy.Time = None):
+        """
+        发布IK->FK round-trip验证的EEF pose（PoseStamped）和对应的欧拉角（Vector3Stamped）
+        
+        用于验证IK求解器的准确性：将预测的EEF pose通过IK转换为joint space后，
+        再通过FK转换回EEF pose，与原始预测的pose进行对比。
+        
+        Args:
+            joint_action: 16D joint action [left_arm(7) + right_arm(7) + claw(2)]
+            gripper_state: 2D gripper state（用于构建完整的20D EEF pose）
+            fk_getter: PinocchioFK实例，用于执行forward kinematics
+            timestamp: 可选的时间戳。如果为None，使用当前时间
+        """
+        try:
+            # 使用相同的时间戳
+            if timestamp is None:
+                timestamp = rospy.Time.now()
+            
+            # 提取arm joint positions（前14维）
+            arm_joint_pos = joint_action[:14]
+            
+            # 使用FK计算EEF pose
+            left_eef_pose, right_eef_pose = fk_getter(arm_joint_pos)
+            
+            # 组合成20D EEF pose: left_eef(9) + right_eef(9) + gripper(2)
+            roundtrip_eef_pose = np.concatenate([
+                left_eef_pose,   # (9,)
+                right_eef_pose,  # (9,)
+                gripper_state     # (2,)
+            ]).astype(np.float32)
+            
+            # 发布PoseStamped
+            left_pose, right_pose = self._eef_pose_20d_to_pose_stamped(roundtrip_eef_pose)
+            if left_pose is not None and right_pose is not None:
+                left_pose.header.stamp = timestamp
+                right_pose.header.stamp = timestamp
+                # frame_id设置为target_frame（数据已在robot frame下，直接使用）
+                left_pose.header.frame_id = self.target_frame
+                right_pose.header.frame_id = self.target_frame
+                # 发布到独立的left/right topic
+                self.ik_fk_roundtrip_pub_left.publish(left_pose)
+                self.ik_fk_roundtrip_pub_right.publish(right_pose)
+            
+            # 发布欧拉角（使用相同的时间戳）
+            left_euler, right_euler = self._eef_pose_20d_to_euler_stamped(roundtrip_eef_pose, timestamp=timestamp)
+            self.ik_fk_roundtrip_euler_pub_left.publish(left_euler)
+            self.ik_fk_roundtrip_euler_pub_right.publish(right_euler)
+        except Exception as e:
+            rospy.logwarn_throttle(5.0, f"[EEFVisualizer] Failed to publish IK->FK roundtrip pose: {e}")
     
     def visualize_real_state(self, current_eef_pose: np.ndarray, update_only: bool = False):
         """
@@ -1149,7 +1294,7 @@ from pathlib import Path
 import torch
 import time
 import argparse
-import rospy
+# rospy 已在文件开头导入
 from std_msgs.msg import Float64MultiArray
 from kuavo_humanoid_sdk.kuavo_strategy_pytree.common.robot_sdk import RobotSDK
 from kuavo_msgs.srv import (changeArmCtrlMode, changeArmCtrlModeRequest)
@@ -1338,26 +1483,157 @@ def direct_to_wbc(control_mode):
         rospy.logerr("服务调用失败: %s", e)
 
 
-def replay(lerobot_dataset_path, episode, control_arm=True, control_claw=True):
+def replay(lerobot_dataset_path, episode, control_arm=True, control_claw=True, ik_model_type='60', 
+           claw_lock_threshold=50.0, claw_lock_count_threshold=5, claw_locked_value=90.0):
     """
     直接replay数据集里的轨迹（depalletize任务）
+    
+    支持两种action格式：
+    1. 16维：joint space [left_arm(7) + right_arm(7) + claw(2)]
+    2. 20维：EEF space [left_eef(9) + right_eef(9) + claw(2)]
+       如果是20维，会自动转换为16维joint space（使用IK）后再执行
+    
+    Args:
+        lerobot_dataset_path: 数据集路径
+        episode: episode索引
+        control_arm: 是否控制手臂
+        control_claw: 是否控制夹爪
+        ik_model_type: IK求解器使用的机器人型号 ('45', '46', '60')，仅在20维action时使用
+        claw_lock_threshold: 夹爪锁定阈值（默认50.0）。如果设置为float('inf')，则禁用锁机制
+        claw_lock_count_threshold: 连续多少次达到阈值后锁定（默认5）
+        claw_locked_value: 锁定时的夹爪值（默认90.0）
     """
-    repo_id = 0
+    repo_id = 'local'  # 使用'local'作为repo_id，因为数据集在本地
 
     dataset = LeRobotDataset(repo_id=repo_id, root=lerobot_dataset_path, episodes=[episode])
+    
+    # 获取指定episode的frame范围
+    # 注意：dataset.meta.episodes包含所有episodes的元数据，即使创建时指定了episodes=[episode]
+    # 所以应该使用dataset.meta.episodes[episode]来获取指定episode的元数据
+    if episode >= len(dataset.meta.episodes):
+        rospy.logerr(f"[REPLAY] Episode {episode} out of range. Available episodes: 0-{len(dataset.meta.episodes)-1}")
+        return
+    
+    ep_info = dataset.meta.episodes[episode]  # 使用传入的episode参数作为索引
+    ep_start_idx = ep_info["dataset_from_index"]
+    ep_end_idx = ep_info["dataset_to_index"]
+    ep_num_frames = ep_end_idx - ep_start_idx
+    
+    rospy.loginfo(f"[REPLAY] Episode {episode} frame range: {ep_start_idx} to {ep_end_idx} (exclusive)")
+    rospy.loginfo(f"[REPLAY] Episode {episode} total frames: {ep_num_frames}")
+    
+    # 获取整个数据集的actions（因为需要访问指定索引范围）
+    # 注意：需要先加载整个hf_dataset才能访问指定索引
+    dataset._ensure_hf_dataset_loaded()
     actions = dataset.hf_dataset.select_columns("action")
-    env = GrabBoxMpcEnv()
+    
+    # 创建环境，传入锁机制参数（如果claw_lock_threshold为inf，则禁用锁机制）
+    env = GrabBoxMpcEnv(
+        claw_lock_threshold=claw_lock_threshold,
+        claw_lock_count_threshold=claw_lock_count_threshold,
+        claw_locked_value=claw_locked_value
+    )
     env.obs_buffer.wait_buffer_ready()
     time.sleep(1)
+    
+    # 重置夹爪锁定状态（确保replay开始时状态干净）
+    env.reset_claw_lock()
+    rospy.loginfo("[REPLAY] ✅ Claw lock state reset (ensuring clean state for replay)")
+    
+    # 检测action维度（使用episode的第一个frame）
+    first_action = actions[ep_start_idx]["action"]
+    if isinstance(first_action, torch.Tensor):
+        action_dim = first_action.shape[0] if first_action.dim() > 0 else len(first_action)
+        first_action_np = first_action.cpu().numpy()
+    else:
+        action_dim = len(first_action) if hasattr(first_action, '__len__') else 1
+        first_action_np = np.array(first_action)
+    
+    is_eef_mode = (action_dim == 20)
+    
+    rospy.loginfo(f"[REPLAY] Starting dataset replay:")
+    rospy.loginfo(f"   Dataset path: {lerobot_dataset_path}")
+    rospy.loginfo(f"   Episode: {episode}")
+    rospy.loginfo(f"   Episode frame range: [{ep_start_idx}, {ep_end_idx})")
+    rospy.loginfo(f"   Episode frames: {ep_num_frames}")
+    rospy.loginfo(f"   Action dimension: {action_dim}")
+    if is_eef_mode:
+        rospy.loginfo(f"   ✅ EEF mode detected (20D) - will convert to joint space (16D) using IK")
+        rospy.loginfo(f"   IK model type: {ik_model_type}")
+    else:
+        rospy.loginfo(f"   Joint space mode (16D) - direct execution")
+    
+    # 统计信息
+    ik_failures_left = 0
+    ik_failures_right = 0
+    total_frames = ep_num_frames
 
-    for idx in range(dataset.num_frames):
+    # 只遍历指定episode的frame范围
+    for frame_offset in range(ep_num_frames):
+        idx = ep_start_idx + frame_offset  # 全局索引
         action = actions[idx]["action"]
-        action = np.expand_dims(action, axis=0)
+        
+        # 转换为numpy数组
+        if isinstance(action, torch.Tensor):
+            action_np = action.cpu().numpy()
+        else:
+            action_np = np.array(action)
+        
+        # 如果是20维EEF action，转换为16维joint action
+        if is_eef_mode and len(action_np) == 20:
+            try:
+                joint_action = convert_eef_action_to_joint_action(action_np, model_type=ik_model_type)
+                
+                # 检查IK是否成功（如果返回全零，可能是IK失败）
+                if np.allclose(joint_action[:7], 0) and not np.allclose(action_np[0:3], 0):
+                    ik_failures_left += 1
+                    if ik_failures_left <= 5:  # 只打印前5次失败
+                        rospy.logwarn(f"[REPLAY] Episode {episode}, Frame {frame_offset} (global {idx}): Left arm IK may have failed (returned zeros)")
+                if np.allclose(joint_action[7:14], 0) and not np.allclose(action_np[9:12], 0):
+                    ik_failures_right += 1
+                    if ik_failures_right <= 5:  # 只打印前5次失败
+                        rospy.logwarn(f"[REPLAY] Episode {episode}, Frame {frame_offset} (global {idx}): Right arm IK may have failed (returned zeros)")
+                
+                action_to_execute = joint_action
+            except Exception as e:
+                rospy.logerr(f"[REPLAY] Episode {episode}, Frame {frame_offset} (global {idx}): Failed to convert EEF action to joint action: {e}")
+                # 跳过这个action
+                continue
+        else:
+            # 16维joint action，直接使用
+            action_to_execute = action_np
+        
+        # 确保action是2D数组 (1, action_dim)
+        if action_to_execute.ndim == 1:
+            action_to_execute = np.expand_dims(action_to_execute, axis=0)
+        
+        # 验证action维度
+        if action_to_execute.shape[1] != 16:
+            rospy.logwarn(f"[REPLAY] Episode {episode}, Frame {frame_offset} (global {idx}): Unexpected action dimension {action_to_execute.shape[1]}, expected 16. Skipping.")
+            continue
 
-        env.exec_actions(actions=action,
+        env.exec_actions(actions=action_to_execute,
                          control_arm=control_arm,
                          control_claw=control_claw,
                          )
+        
+        # 按照10Hz频率执行（每个action之间等待0.1秒，匹配数据集的时间间隔）
+        # 注意：第一个frame不需要等待（因为还没有执行过action）
+        if frame_offset > 0:
+            time.sleep(0.2)  # 10Hz = 0.1秒间隔
+        
+        # 打印进度（每100帧，显示episode内的frame索引）
+        if (frame_offset + 1) % 100 == 0 or frame_offset == ep_num_frames - 1:
+            rospy.loginfo(f"[REPLAY] Episode {episode} Progress: {frame_offset + 1}/{ep_num_frames} frames ({100.0 * (frame_offset + 1) / ep_num_frames:.1f}%)")
+    
+    # 打印最终统计信息
+    rospy.loginfo(f"[REPLAY] ✅ Replay completed!")
+    rospy.loginfo(f"   Episode: {episode}")
+    rospy.loginfo(f"   Episode frames: {ep_num_frames} (global indices: {ep_start_idx} to {ep_end_idx})")
+    if is_eef_mode:
+        rospy.loginfo(f"   IK failures - Left arm: {ik_failures_left}, Right arm: {ik_failures_right}")
+        if ik_failures_left > 0 or ik_failures_right > 0:
+            rospy.logwarn(f"   ⚠️  Some IK solutions failed. Check if EEF poses are within robot workspace.")
 
 def publish_joint_positions(action_chunk,
                             joint_pub,
@@ -2345,7 +2621,7 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
                                     rospy.loginfo(f"   - Yellow spheres: Reference pose (Delta eef)")
                                 rospy.loginfo(f"   - Blue spheres: Left arm action trajectory")
                                 rospy.loginfo(f"   - Red spheres: Right arm action trajectory")
-                                rospy.loginfo(f"[VIS] 📡 PoseStamped topics enabled for rosbag recording (all in odom frame):")
+                                rospy.loginfo(f"[VIS] 📡 PoseStamped topics enabled for rosbag recording (all in wrist_yaw_link frame):")
                                 rospy.loginfo(f"   - /policy/eef_pose/real_state_left (FK计算的真实EEF pose - 左手)")
                                 rospy.loginfo(f"   - /policy/eef_pose/real_state_right (FK计算的真实EEF pose - 右手)")
                                 rospy.loginfo(f"   - /policy/eef_pose/predicted_absolute_left (预测的absolute eef - 左手)")
@@ -2353,6 +2629,8 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
                                 if is_relative_action_mode:
                                     rospy.loginfo(f"   - /policy/eef_pose/reference_left (reference pose - 左手, Delta eef only)")
                                     rospy.loginfo(f"   - /policy/eef_pose/reference_right (reference pose - 右手, Delta eef only)")
+                                rospy.loginfo(f"   - /policy/eef_pose/ik_fk_roundtrip_left (IK->FK round-trip验证 - 左手)")
+                                rospy.loginfo(f"   - /policy/eef_pose/ik_fk_roundtrip_right (IK->FK round-trip验证 - 右手)")
                         except Exception as e:
                             rospy.logwarn_throttle(5.0, f"[VIS] ⚠️  EEF visualization failed: {e}")
 
@@ -2493,6 +2771,22 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
                             joint_action_chunk_list.append(joint_action)
                         action_chunk = np.array(joint_action_chunk_list)  # (chunk_size, 16)
                         rospy.loginfo(f"   ✅ Converted action_chunk to joint space: {action_chunk.shape}")
+                        
+                        # 发布chunk第一个action的IK->FK round-trip验证pose（用于记录chunk开始时的round-trip）
+                        if eef_visualizer is not None and fk_getter is not None and action_chunk.shape[0] > 0:
+                            try:
+                                first_joint_action = action_chunk[0]
+                                if len(first_joint_action) >= 16:
+                                    gripper_state_roundtrip = first_joint_action[14:16].copy()
+                                else:
+                                    gripper_state_roundtrip = np.array([0.0, 0.0], dtype=np.float32)
+                                eef_visualizer.publish_ik_fk_roundtrip_eef_pose(
+                                    joint_action=first_joint_action,
+                                    gripper_state=gripper_state_roundtrip,
+                                    fk_getter=fk_getter
+                                )
+                            except Exception as e:
+                                rospy.logwarn_throttle(5.0, f"[IK_FK_ROUNDTRIP] Failed to publish chunk first action roundtrip pose: {e}")
                     # 如果不是EEF模式，original_eef_action_chunk保持为None（已经在上面初始化）
                     
                     # 确定 arm 和 claw 维度（基于转换后的 action_chunk）
@@ -2799,10 +3093,22 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
                     if step_counter == 0:
                         rospy.loginfo(f"[INFERENCE] ✅ Converted EEF actions (20D) to joint actions (16D) using IK")
                         rospy.loginfo(f"[INFERENCE]   Action chunk shape: {action_chunk.shape}")
-                
-                # 日志打印频率：每N个action打印一次差异信息（避免日志过多）
-                # 注意：FK计算和可视化更新会对每个action都执行，但日志打印可以控制频率
-                log_print_frequency = 10  # 每10个action打印一次日志
+                    
+                    # 发布chunk第一个action的IK->FK round-trip验证pose（用于记录chunk开始时的round-trip）
+                    if eef_visualizer is not None and fk_getter is not None and action_chunk.shape[0] > 0:
+                        try:
+                            first_joint_action = action_chunk[0]
+                            if len(first_joint_action) >= 16:
+                                gripper_state_roundtrip = first_joint_action[14:16].copy()
+                            else:
+                                gripper_state_roundtrip = np.array([0.0, 0.0], dtype=np.float32)
+                            eef_visualizer.publish_ik_fk_roundtrip_eef_pose(
+                                joint_action=first_joint_action,
+                                gripper_state=gripper_state_roundtrip,
+                                fk_getter=fk_getter
+                            )
+                        except Exception as e:
+                            rospy.logwarn_throttle(5.0, f"[IK_FK_ROUNDTRIP] Failed to publish chunk first action roundtrip pose: {e}")
                 
                 # 获取当前机器人手臂状态（用于单手模式时保持另一只手不动）
                 current_arm_state_for_hold = None
@@ -2843,11 +3149,17 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
                     step_counter += 1
                     last_executed_action = action_to_execute.copy()  # 记录实际执行的action
                     
-                    # ===== 实时跟踪：每个action都更新真实状态并计算差异 =====
-                    # 对每个action都进行FK计算和可视化更新，确保实时反馈跟踪情况
+                    # ===== 统一发布所有EEF pose话题（使用相同时间戳，确保时间轴连续） =====
+                    # 在每次env.exec_actions后，使用相同的时间戳发布所有相关话题：
+                    # 1. real_state: 从当前机器人状态FK计算
+                    # 2. predicted_absolute: 对应的预测EEF pose
+                    # 3. ik_fk_roundtrip: 从执行的joint action FK计算
                     if eef_visualizer is not None and is_eef_mode and fk_getter is not None:
                         try:
-                            # 获取当前机器人状态
+                            # 获取统一的时间戳（在获取状态之前，确保所有话题使用相同时间戳）
+                            unified_timestamp = rospy.Time.now()
+                            
+                            # 1. 获取当前机器人状态并计算real_state
                             obs_data_temp, _, _, robot_obs_temp, _ = env.get_obs()
                             state_raw_temp = obs_data_temp["state"]
                             current_state_np_temp = state_raw_temp[0]
@@ -2901,32 +3213,34 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
                             # 更新真实状态的marker（每个action都更新）
                             eef_visualizer.visualize_real_state(current_real_eef_pose)
                             
-                            # 发布真实EEF pose的PoseStamped（用于rosbag录制）
-                            eef_visualizer.publish_real_eef_pose(current_real_eef_pose)
+                            # 2. 计算IK->FK round-trip pose（从执行的joint action）
+                            if len(action_to_execute) >= 16:
+                                gripper_state_roundtrip = action_to_execute[14:16].copy()
+                            else:
+                                gripper_state_roundtrip = np.array([0.0, 0.0], dtype=np.float32)
                             
-                            # 计算预测和实际的差异（如果有对应的预测action）
+                            # 3. 找到对应的预测EEF pose（如果有）
+                            predicted_eef_pose = None
                             if original_eef_action_chunk is not None and original_eef_action_chunk.shape[1] == 20:
-                                # 找到当前action对应的预测EEF pose
-                                # 注意：由于resample和stride，索引映射可能不准确，这里使用线性映射
                                 if len(original_eef_action_chunk) > 0:
                                     # 计算在original_eef_action_chunk中的对应索引
                                     pred_idx = min(int(action_idx * len(original_eef_action_chunk) / len(action_chunk)), 
                                                   len(original_eef_action_chunk) - 1)
                                     predicted_eef_pose = original_eef_action_chunk[pred_idx]
-                                    
-                                    # 发布预测的absolute eef pose的PoseStamped（用于rosbag录制）
-                                    eef_visualizer.publish_predicted_eef_pose(predicted_eef_pose)
-                                    
-                                    # 计算差异（每个action都计算）
-                                    error_dict = eef_visualizer.compute_tracking_error(
-                                        predicted_eef_pose, current_real_eef_pose
-                                    )
-                                    
-                                    # 打印差异信息（控制频率，避免日志过多）
-                                    if action_idx % log_print_frequency == 0 or action_idx == len(action_chunk) - 1:
-                                        rospy.loginfo(f"[TRACKING] Action {action_idx}/{len(action_chunk)-1}:")
-                                        rospy.loginfo(f"   Left arm error: {error_dict['left_pos_error_cm']:.2f} cm, {error_dict['left_rot_error_deg']:.2f} deg")
-                                        rospy.loginfo(f"   Right arm error: {error_dict['right_pos_error_cm']:.2f} cm, {error_dict['right_rot_error_deg']:.2f} deg")
+                            
+                            # 使用统一的时间戳发布所有话题（确保时间轴连续）
+                            # 发布顺序：real_state -> predicted_absolute -> ik_fk_roundtrip
+                            eef_visualizer.publish_real_eef_pose(current_real_eef_pose, timestamp=unified_timestamp)
+                            
+                            if predicted_eef_pose is not None:
+                                eef_visualizer.publish_predicted_eef_pose(predicted_eef_pose, timestamp=unified_timestamp)
+                            
+                            eef_visualizer.publish_ik_fk_roundtrip_eef_pose(
+                                joint_action=action_to_execute,
+                                gripper_state=gripper_state_roundtrip,
+                                fk_getter=fk_getter,
+                                timestamp=unified_timestamp
+                            )
                         except Exception as e:
                             rospy.logwarn_throttle(5.0, f"[TRACKING] Failed to update real state tracking: {e}")
                     
@@ -3268,7 +3582,11 @@ if __name__ == '__main__':
     parser.add_argument('--model-type', type=str, default='groot', choices=['groot', 'act', 'dp'],
                         help='Type of model to use (now only groot is supported, act/dp are deprecated)')
     parser.add_argument('--eval', action='store_true', help='Evaluate the model in real-time environment')
-    parser.add_argument('--replay', action='store_true', help='Replay the model')
+    parser.add_argument('--replay', action='store_true', help='Replay dataset trajectories')
+    parser.add_argument('--replay-dataset-path', type=str, default=None,
+                        help='Path to the dataset for replay mode. If not provided, uses default path.')
+    parser.add_argument('--replay-episode', type=int, default=0,
+                        help='Episode index to replay (0-based). Default: 0.')
     parser.add_argument('--action_chunk_size', type=int, default=20, help='Number of action steps')
     parser.add_argument('--enable_gui', action='store_true',
                         help='Enable GUI windows for camera display (default: disabled)')
@@ -3458,9 +3776,37 @@ if __name__ == '__main__':
              lock_right_arm=args.lock_right_arm,
              right_arm_lock_json_path=args.right_arm_lock_json_path)
     elif args.replay:
-        print("Replaying the model")
-        lerobot_dataset_path = '/home/lab/kuavo-manip/lerobot_data/vel_wrend_box_613'
-        replay(lerobot_dataset_path, episode=0, control_arm=True, control_claw=True)
+        print("Replaying dataset trajectories")
+        # 使用用户指定的数据集路径，如果没有指定则使用默认路径
+        if args.replay_dataset_path is not None:
+            lerobot_dataset_path = args.replay_dataset_path
+        else:
+            # 默认数据集路径
+            lerobot_dataset_path = '/home/lab/humanoid_groot/lerobot_data/v3_0_dataset/desk_clean/0205_pick_desp_crossX_demo01-filtered'
+        
+        print(f"📦 Dataset path: {lerobot_dataset_path}")
+        print(f"📊 Episode: {args.replay_episode}")
+        print(f"🤖 IK model type: {args.ik_model_type}")
+        if args.disable_claw_lock:
+            print(f"🔒 Claw lock mechanism: DISABLED (--disable-claw-lock is set)")
+            # 如果禁用锁机制，将threshold设置为无穷大，永远不会触发锁定
+            replay_claw_lock_threshold = float('inf')
+            replay_claw_lock_count_threshold = args.claw_lock_count_threshold
+            replay_claw_locked_value = args.claw_locked_value
+        else:
+            print(f"🔒 Claw lock mechanism: threshold={args.claw_lock_threshold}, count_threshold={args.claw_lock_count_threshold}, locked_value={args.claw_locked_value}")
+            replay_claw_lock_threshold = args.claw_lock_threshold
+            replay_claw_lock_count_threshold = args.claw_lock_count_threshold
+            replay_claw_locked_value = args.claw_locked_value
+        
+        replay(lerobot_dataset_path, 
+               episode=args.replay_episode, 
+               control_arm=True, 
+               control_claw=True, 
+               ik_model_type=args.ik_model_type,
+               claw_lock_threshold=replay_claw_lock_threshold,
+               claw_lock_count_threshold=replay_claw_lock_count_threshold,
+               claw_locked_value=replay_claw_locked_value)
     else:
         print("Please specify either --eval or --replay")
         exit(1)

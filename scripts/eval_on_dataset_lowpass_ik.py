@@ -901,13 +901,17 @@ def eval_on_dataset(ckpt_path,
             right_euler_gt = np.zeros((all_gt_actions.shape[0], 3))  # (num_frames, 3)
             
             for i in range(all_gt_actions.shape[0]):
-                # 左手欧拉角
+                # 左手欧拉角（弧度制）
                 left_euler_gt[i] = rot6d_to_euler_zyx(left_rot6d_gt[i])
                 
-                # 右手欧拉角
+                # 右手欧拉角（弧度制）
                 right_euler_gt[i] = rot6d_to_euler_zyx(right_rot6d_gt[i])
             
-            # 可视化ground truth欧拉角的每个元素
+            # 将欧拉角从弧度制转换为角度制（用于可视化）
+            left_euler_gt = np.rad2deg(left_euler_gt)  # (num_frames, 3)
+            right_euler_gt = np.rad2deg(right_euler_gt)  # (num_frames, 3)
+            
+            # 可视化ground truth欧拉角的每个元素（角度制）
             euler_names = ['roll', 'pitch', 'yaw']
             for elem_idx, elem_name in enumerate(euler_names):
                 # 左手欧拉角（ground truth）
@@ -1361,13 +1365,17 @@ def eval_on_dataset(ckpt_path,
                 right_euler_chunk = np.zeros((pred_chunk.shape[0], 3))  # (chunk_size, 3)
                 
                 for i in range(pred_chunk.shape[0]):
-                    # 左手欧拉角
+                    # 左手欧拉角（弧度制）
                     left_euler_chunk[i] = rot6d_to_euler_zyx(left_rot6d_chunk[i])
                     
-                    # 右手欧拉角
+                    # 右手欧拉角（弧度制）
                     right_euler_chunk[i] = rot6d_to_euler_zyx(right_rot6d_chunk[i])
                 
-                # 可视化欧拉角的每个元素 (roll, pitch, yaw)
+                # 将欧拉角从弧度制转换为角度制（用于可视化）
+                left_euler_chunk = np.rad2deg(left_euler_chunk)  # (chunk_size, 3)
+                right_euler_chunk = np.rad2deg(right_euler_chunk)  # (chunk_size, 3)
+                
+                # 可视化欧拉角的每个元素 (roll, pitch, yaw)（角度制）
                 euler_names = ['roll', 'pitch', 'yaw']
                 for elem_idx, elem_name in enumerate(euler_names):
                     # 左手欧拉角
