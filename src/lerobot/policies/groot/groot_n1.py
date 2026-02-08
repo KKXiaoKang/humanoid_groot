@@ -252,27 +252,49 @@ class GR00TN15(PreTrainedModel):
         action_space_type = action_head_cfg_dict.get("action_space_type", "Absolute joint")
         action_head_cfg_dict["action_space_type"] = action_space_type
         
+        # Get manipulation_mode from config (default to "bimanual" for backward compatibility)
+        manipulation_mode = action_head_cfg_dict.get("manipulation_mode", "bimanual")
+        action_head_cfg_dict["manipulation_mode"] = manipulation_mode
+        is_single_arm = manipulation_mode in ["single_left_arm", "single_right_arm"]
+        is_left_arm_only = manipulation_mode == "single_left_arm"
+        
         # Save pretrained action_dim for compatibility (pretrained model uses 32D)
         pretrained_action_dim = action_head_cfg_dict.get("action_dim", 32)
         
         if use_multi_action_heads:
             split_arm_heads = action_head_cfg_dict.get("split_arm_heads", False)
             if split_arm_heads:
-                # Auto-configure dimensions based on action_space_type if not explicitly set
-                if "action_left_arm_dim" not in action_head_cfg_dict:
-                    if action_space_type in ["Delta eef", "Absolute eef"]:
-                        action_head_cfg_dict["action_left_arm_dim"] = 9
-                    else:
-                        action_head_cfg_dict["action_left_arm_dim"] = 7
-                
-                if "action_right_arm_dim" not in action_head_cfg_dict:
-                    if action_space_type in ["Delta eef", "Absolute eef"]:
-                        action_head_cfg_dict["action_right_arm_dim"] = 9
-                    else:
-                        action_head_cfg_dict["action_right_arm_dim"] = 7
-                
-                if "action_claw_dim" not in action_head_cfg_dict:
-                    action_head_cfg_dict["action_claw_dim"] = 2
+                # Auto-configure dimensions based on action_space_type and manipulation_mode
+                if is_single_arm:
+                    # Single-arm mode: only one arm + one gripper
+                    if is_left_arm_only:
+                        if "action_left_arm_dim" not in action_head_cfg_dict:
+                            action_head_cfg_dict["action_left_arm_dim"] = 9 if action_space_type in ["Delta eef", "Absolute eef"] else 7
+                        if "action_right_arm_dim" not in action_head_cfg_dict:
+                            action_head_cfg_dict["action_right_arm_dim"] = 0  # No right arm
+                    else:  # single_right_arm
+                        if "action_left_arm_dim" not in action_head_cfg_dict:
+                            action_head_cfg_dict["action_left_arm_dim"] = 0  # No left arm
+                        if "action_right_arm_dim" not in action_head_cfg_dict:
+                            action_head_cfg_dict["action_right_arm_dim"] = 9 if action_space_type in ["Delta eef", "Absolute eef"] else 7
+                    if "action_claw_dim" not in action_head_cfg_dict:
+                        action_head_cfg_dict["action_claw_dim"] = 1  # Only one gripper
+                else:
+                    # Bimanual mode: both arms + two grippers
+                    if "action_left_arm_dim" not in action_head_cfg_dict:
+                        if action_space_type in ["Delta eef", "Absolute eef"]:
+                            action_head_cfg_dict["action_left_arm_dim"] = 9
+                        else:
+                            action_head_cfg_dict["action_left_arm_dim"] = 7
+                    
+                    if "action_right_arm_dim" not in action_head_cfg_dict:
+                        if action_space_type in ["Delta eef", "Absolute eef"]:
+                            action_head_cfg_dict["action_right_arm_dim"] = 9
+                        else:
+                            action_head_cfg_dict["action_right_arm_dim"] = 7
+                    
+                    if "action_claw_dim" not in action_head_cfg_dict:
+                        action_head_cfg_dict["action_claw_dim"] = 2
                 
                 # Get the configured dimensions
                 action_left_arm_dim = action_head_cfg_dict["action_left_arm_dim"]
@@ -284,7 +306,13 @@ class GR00TN15(PreTrainedModel):
                 action_head_cfg_dict["action_arm_dim"] = action_left_arm_dim + action_right_arm_dim
                 # Ensure split_arm_heads is set in the dict
                 action_head_cfg_dict["split_arm_heads"] = True
-                print(f"✅ Split arm heads enabled: left_arm({action_left_arm_dim}D) + right_arm({action_right_arm_dim}D) + claw({action_claw_dim}D) = {actual_action_dim}D")
+                
+                if is_single_arm:
+                    active_arm = "left_arm" if is_left_arm_only else "right_arm"
+                    active_dim = action_left_arm_dim if is_left_arm_only else action_right_arm_dim
+                    print(f"✅ Single-arm mode ({manipulation_mode}): {active_arm}({active_dim}D) + claw({action_claw_dim}D) = {actual_action_dim}D")
+                else:
+                    print(f"✅ Split arm heads enabled: left_arm({action_left_arm_dim}D) + right_arm({action_right_arm_dim}D) + claw({action_claw_dim}D) = {actual_action_dim}D")
             else:
                 # Single arm head
                 action_arm_dim = action_head_cfg_dict.get("action_arm_dim", 14)
@@ -500,6 +528,12 @@ class GR00TN15(PreTrainedModel):
         if action_space_type and "action_head_cfg" in config_dict:
             if "action_space_type" not in config_dict["action_head_cfg"]:
                 config_dict["action_head_cfg"]["action_space_type"] = action_space_type
+        
+        # Override manipulation_mode from kwargs if provided (for GrootConfig compatibility)
+        manipulation_mode = kwargs.pop("manipulation_mode", None)
+        if manipulation_mode and "action_head_cfg" in config_dict:
+            if "manipulation_mode" not in config_dict["action_head_cfg"]:
+                config_dict["action_head_cfg"]["manipulation_mode"] = manipulation_mode
         
         # Create GR00TN15Config from the loaded dict
         config = GR00TN15Config(**config_dict)

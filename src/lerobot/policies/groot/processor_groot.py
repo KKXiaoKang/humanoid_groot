@@ -184,6 +184,9 @@ def make_groot_pre_post_processors(
     # Get action space type from config (default to "Absolute joint" for backward compatibility)
     action_space_type = getattr(config, 'action_space_type', "Absolute joint")
     
+    # Get manipulation mode from config (default to "bimanual" for backward compatibility)
+    manipulation_mode = getattr(config, 'manipulation_mode', "bimanual")
+    
     # Get relative action reference mode from config (default to "state" for recommended behavior)
     relative_action_reference_mode = getattr(config, 'relative_action_reference_mode', "state")
     
@@ -216,28 +219,53 @@ def make_groot_pre_post_processors(
     
     # Setup partial normalization for eef action spaces
     action_component_indices = None
+    is_single_arm = manipulation_mode in ["single_left_arm", "single_right_arm"]
+    is_left_arm_only = manipulation_mode == "single_left_arm"
+    is_right_arm_only = manipulation_mode == "single_right_arm"
     
     if action_space_type in ["Delta eef", "Absolute eef"]:
-        # For absolute eef pose (20D):
-        # - 3维左手 eef position (x, y, z) -> indices 0-2
-        # - 6维左手 eef 6D 旋转表示 [R11, R21, R31, R12, R22, R32] -> indices 3-8
-        # - 3维右手 eef position (x, y, z) -> indices 9-11
-        # - 6维右手 eef 6D 旋转表示 [R11, R21, R31, R12, R22, R32] -> indices 12-17
-        # - 1维左夹爪开合程度 -> indices 18
-        # - 1维右夹爪开合程度 -> indices 19
-        action_component_indices = {
-            "left_eef_pos": (0, 3),
-            "left_eef_rot6d": (3, 9),
-            "right_eef_pos": (9, 12),
-            "right_eef_rot6d": (12, 18),
-            "left_gripper": (18, 19),
-            "right_gripper": (19, 20),
-        }
-        print(f"✅ Partial normalization enabled for action space: {action_space_type}")
-        print(f"   Components: {list(action_component_indices.keys())}")
-        print(f"   6D rotation components (left_eef_rot6d, right_eef_rot6d) will use IDENTITY normalization")
+        if is_single_arm:
+            # Single-arm mode (10D):
+            # - 3维 eef position (x, y, z) -> indices 0-2
+            # - 6维 eef 6D 旋转表示 [R11, R21, R31, R12, R22, R32] -> indices 3-8
+            # - 1维夹爪开合程度 -> index 9
+            if is_left_arm_only:
+                action_component_indices = {
+                    "left_eef_pos": (0, 3),
+                    "left_eef_rot6d": (3, 9),
+                    "left_gripper": (9, 10),
+                }
+                print(f"✅ Single LEFT arm EEF mode enabled (10D): {action_space_type}")
+            else:  # is_right_arm_only
+                action_component_indices = {
+                    "right_eef_pos": (0, 3),
+                    "right_eef_rot6d": (3, 9),
+                    "right_gripper": (9, 10),
+                }
+                print(f"✅ Single RIGHT arm EEF mode enabled (10D): {action_space_type}")
+            print(f"   Components: {list(action_component_indices.keys())}")
+            print(f"   6D rotation component will use IDENTITY normalization")
+        else:
+            # Bimanual mode - For absolute eef pose (20D):
+            # - 3维左手 eef position (x, y, z) -> indices 0-2
+            # - 6维左手 eef 6D 旋转表示 [R11, R21, R31, R12, R22, R32] -> indices 3-8
+            # - 3维右手 eef position (x, y, z) -> indices 9-11
+            # - 6维右手 eef 6D 旋转表示 [R11, R21, R31, R12, R22, R32] -> indices 12-17
+            # - 1维左夹爪开合程度 -> indices 18
+            # - 1维右夹爪开合程度 -> indices 19
+            action_component_indices = {
+                "left_eef_pos": (0, 3),
+                "left_eef_rot6d": (3, 9),
+                "right_eef_pos": (9, 12),
+                "right_eef_rot6d": (12, 18),
+                "left_gripper": (18, 19),
+                "right_gripper": (19, 20),
+            }
+            print(f"✅ Bimanual EEF mode enabled (20D): {action_space_type}")
+            print(f"   Components: {list(action_component_indices.keys())}")
+            print(f"   6D rotation components (left_eef_rot6d, right_eef_rot6d) will use IDENTITY normalization")
     else:
-        print(f"📊 Using standard normalization for action space: {action_space_type}")
+        print(f"📊 Using standard normalization for action space: {action_space_type} ({manipulation_mode} mode)")
 
     # Determine env action dimension from config (simple, object-like PolicyFeature)
     try:

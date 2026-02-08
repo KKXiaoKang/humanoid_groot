@@ -137,6 +137,21 @@ class GrootConfig(PreTrainedConfig):
         default="state", 
         metadata={"help": "Reference pose source for Delta eef mode: 'state' (recommended, uses observation.state) or 'action' (legacy, uses action[0])"}
     )
+    
+    # Manipulation mode: controls single-arm vs bimanual operation
+    # - "bimanual": Both arms (left + right) with 2 grippers (default, 20D for eef, 16D for joint)
+    #   - EEF: left_eef(9D) + right_eef(9D) + left_gripper(1D) + right_gripper(1D) = 20D
+    #   - Joint: left_arm(7D) + right_arm(7D) + left_gripper(1D) + right_gripper(1D) = 16D
+    # - "single_left_arm": Only left arm with 1 gripper (10D for eef, 8D for joint)
+    #   - EEF: left_eef(9D) + left_gripper(1D) = 10D
+    #   - Joint: left_arm(7D) + left_gripper(1D) = 8D
+    # - "single_right_arm": Only right arm with 1 gripper (10D for eef, 8D for joint)
+    #   - EEF: right_eef(9D) + right_gripper(1D) = 10D
+    #   - Joint: right_arm(7D) + right_gripper(1D) = 8D
+    manipulation_mode: str = field(
+        default="bimanual",
+        metadata={"help": "Manipulation mode: 'bimanual' (both arms), 'single_left_arm' (left only), or 'single_right_arm' (right only)"}
+    )
 
     def __post_init__(self):
         super().__post_init__()
@@ -152,6 +167,14 @@ class GrootConfig(PreTrainedConfig):
             raise ValueError(
                 f"relative_action_reference_mode must be one of {valid_modes}, "
                 f"got '{self.relative_action_reference_mode}'"
+            )
+        
+        # Validate manipulation_mode
+        valid_manipulation_modes = ["bimanual", "single_left_arm", "single_right_arm"]
+        if self.manipulation_mode not in valid_manipulation_modes:
+            raise ValueError(
+                f"manipulation_mode must be one of {valid_manipulation_modes}, "
+                f"got '{self.manipulation_mode}'"
             )
         
         # groot_repo_path is now optional since we ported the components

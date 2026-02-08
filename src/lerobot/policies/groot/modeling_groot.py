@@ -95,7 +95,8 @@ class GrootPolicy(PreTrainedPolicy):
         # Handle Flash Attention compatibility issues
         self._handle_flash_attention_compatibility()
 
-        # Pass action_space_type to from_pretrained so it can be set before action_head is created
+        # Pass action_space_type and manipulation_mode to from_pretrained 
+        # so they can be set before action_head is created
         model = GR00TN15.from_pretrained(
             pretrained_model_name_or_path=self.config.base_model_path,
             tune_llm=self.config.tune_llm,
@@ -104,6 +105,7 @@ class GrootPolicy(PreTrainedPolicy):
             tune_diffusion_model=self.config.tune_diffusion_model,
             rtc_processor=rtc_processor,
             action_space_type=getattr(self.config, 'action_space_type', None),
+            manipulation_mode=getattr(self.config, 'manipulation_mode', None),
         )
 
         model.compute_dtype = "bfloat16" if self.config.use_bf16 else model.compute_dtype

@@ -332,6 +332,12 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
     # Action space type configuration
     action_space_type: str = field(default="Absolute joint", metadata={"help": "Action space type: 'Absolute joint', 'Absolute eef', or 'Delta eef'"})
     
+    # Manipulation mode: controls single-arm vs bimanual operation
+    # - "bimanual": Both arms (default, 20D for eef, 16D for joint)
+    # - "single_left_arm": Only left arm (10D for eef, 8D for joint)
+    # - "single_right_arm": Only right arm (10D for eef, 8D for joint)
+    manipulation_mode: str = field(default="bimanual", metadata={"help": "Manipulation mode: 'bimanual', 'single_left_arm', or 'single_right_arm'"})
+    
     # RGB-only mode: disable state encoder for pure vision-language policy
     use_state_encoder: bool = field(default=True, metadata={"help": "Whether to use state encoder. If False, model relies only on RGB observation and language instruction (RGB-only mode). Recommended for relative action spaces."})
 
@@ -340,7 +346,20 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
         for key, value in kwargs.items():
             setattr(self, key, value)
         
-        # Auto-configure dimensions based on action_space_type
+        # Validate manipulation_mode
+        valid_manipulation_modes = ["bimanual", "single_left_arm", "single_right_arm"]
+        if self.manipulation_mode not in valid_manipulation_modes:
+            raise ValueError(
+                f"manipulation_mode must be one of {valid_manipulation_modes}, "
+                f"got '{self.manipulation_mode}'"
+            )
+        
+        # Helper flags for single-arm mode
+        is_single_arm = self.manipulation_mode in ["single_left_arm", "single_right_arm"]
+        is_left_arm_only = self.manipulation_mode == "single_left_arm"
+        is_right_arm_only = self.manipulation_mode == "single_right_arm"
+        
+        # Auto-configure dimensions based on action_space_type and manipulation_mode
         # Note: This happens before validation, so we can set defaults based on action_space_type
         # First, set arm dimensions based on action_space_type (regardless of multi-head configuration)
         # This ensures dimensions are correct even if multi-head is enabled later
@@ -349,57 +368,109 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
         arm_dim_explicit = 'action_arm_dim' in kwargs
         
         if self.action_space_type in ["Delta eef", "Absolute eef"]:
-            # For eef action space (20D):
-            # - left_arm: 9D (3D pos + 6D rot)
-            # - right_arm: 9D (3D pos + 6D rot)
-            # - claw: 2D (left + right gripper)
-            if not left_arm_explicit:
-                self.action_left_arm_dim = 9
-            if not right_arm_explicit:
-                self.action_right_arm_dim = 9
-            # claw_dim is always 2 for both spaces
-            if 'action_claw_dim' not in kwargs:
-                self.action_claw_dim = 2
+            # For eef action space:
+            # - Single arm: 10D (9D eef + 1D gripper)
+            # - Bimanual: 20D (9D + 9D + 2D grippers)
+            if is_single_arm:
+                # Single arm mode: only one arm (9D) + one gripper (1D) = 10D
+                if is_left_arm_only:
+                    if not left_arm_explicit:
+                        self.action_left_arm_dim = 9
+                    if not right_arm_explicit:
+                        self.action_right_arm_dim = 0  # No right arm
+                else:  # is_right_arm_only
+                    if not left_arm_explicit:
+                        self.action_left_arm_dim = 0  # No left arm
+                    if not right_arm_explicit:
+                        self.action_right_arm_dim = 9
+                if 'action_claw_dim' not in kwargs:
+                    self.action_claw_dim = 1  # Only one gripper
+            else:
+                # Bimanual mode: both arms (9D + 9D) + two grippers (2D) = 20D
+                if not left_arm_explicit:
+                    self.action_left_arm_dim = 9
+                if not right_arm_explicit:
+                    self.action_right_arm_dim = 9
+                if 'action_claw_dim' not in kwargs:
+                    self.action_claw_dim = 2
+            
             # Update action_arm_dim to match left + right (important for validation)
             if not arm_dim_explicit:
                 self.action_arm_dim = self.action_left_arm_dim + self.action_right_arm_dim
-            print(f"🎯 Auto-configured for {self.action_space_type} action space:")
-            print(f"   left_arm={self.action_left_arm_dim}D, right_arm={self.action_right_arm_dim}D, claw={self.action_claw_dim}D")
+            
+            print(f"🎯 Auto-configured for {self.action_space_type} action space ({self.manipulation_mode} mode):")
+            if is_single_arm:
+                active_arm = "left_arm" if is_left_arm_only else "right_arm"
+                active_dim = self.action_left_arm_dim if is_left_arm_only else self.action_right_arm_dim
+                print(f"   {active_arm}={active_dim}D, claw={self.action_claw_dim}D (single-arm mode)")
+            else:
+                print(f"   left_arm={self.action_left_arm_dim}D, right_arm={self.action_right_arm_dim}D, claw={self.action_claw_dim}D")
+                
         elif self.action_space_type == "Absolute joint":
-            # For joint action space (default):
-            # - left_arm: 7D (joints)
-            # - right_arm: 7D (joints)
-            # - claw: 2D (left + right gripper)
-            if not left_arm_explicit:
-                self.action_left_arm_dim = 7
-            if not right_arm_explicit:
-                self.action_right_arm_dim = 7
-            if 'action_claw_dim' not in kwargs:
-                self.action_claw_dim = 2
+            # For joint action space:
+            # - Single arm: 8D (7D joints + 1D gripper)
+            # - Bimanual: 16D (7D + 7D + 2D grippers)
+            if is_single_arm:
+                # Single arm mode: only one arm (7D) + one gripper (1D) = 8D
+                if is_left_arm_only:
+                    if not left_arm_explicit:
+                        self.action_left_arm_dim = 7
+                    if not right_arm_explicit:
+                        self.action_right_arm_dim = 0  # No right arm
+                else:  # is_right_arm_only
+                    if not left_arm_explicit:
+                        self.action_left_arm_dim = 0  # No left arm
+                    if not right_arm_explicit:
+                        self.action_right_arm_dim = 7
+                if 'action_claw_dim' not in kwargs:
+                    self.action_claw_dim = 1  # Only one gripper
+            else:
+                # Bimanual mode: both arms (7D + 7D) + two grippers (2D) = 16D
+                if not left_arm_explicit:
+                    self.action_left_arm_dim = 7
+                if not right_arm_explicit:
+                    self.action_right_arm_dim = 7
+                if 'action_claw_dim' not in kwargs:
+                    self.action_claw_dim = 2
+            
             # Update action_arm_dim to match left + right (important for validation)
             if not arm_dim_explicit:
                 self.action_arm_dim = self.action_left_arm_dim + self.action_right_arm_dim
+            
             # Only print if using multi-head to avoid duplicate messages
             if self.use_multi_action_heads and self.split_arm_heads:
-                print(f"🎯 Auto-configured for {self.action_space_type} action space:")
-                print(f"   left_arm={self.action_left_arm_dim}D, right_arm={self.action_right_arm_dim}D, claw={self.action_claw_dim}D")
+                print(f"🎯 Auto-configured for {self.action_space_type} action space ({self.manipulation_mode} mode):")
+                if is_single_arm:
+                    active_arm = "left_arm" if is_left_arm_only else "right_arm"
+                    active_dim = self.action_left_arm_dim if is_left_arm_only else self.action_right_arm_dim
+                    print(f"   {active_arm}={active_dim}D, claw={self.action_claw_dim}D (single-arm mode)")
+                else:
+                    print(f"   left_arm={self.action_left_arm_dim}D, right_arm={self.action_right_arm_dim}D, claw={self.action_claw_dim}D")
         
-        # Auto-update action_dim based on action_space_type (even if not using multi-head)
+        # Auto-update action_dim based on action_space_type and manipulation_mode
         # This ensures action_dim is correctly set regardless of multi-head configuration
         if 'action_dim' not in kwargs:
             if self.action_space_type in ["Delta eef", "Absolute eef"]:
-                # EEF action space: 20D (9+9+2)
-                self.action_dim = 20
+                if is_single_arm:
+                    # Single arm EEF: 10D (9+1)
+                    self.action_dim = 10
+                else:
+                    # Bimanual EEF: 20D (9+9+2)
+                    self.action_dim = 20
             elif self.action_space_type == "Absolute joint":
-                # Joint action space: 16D (7+7+2)
-                self.action_dim = 16
+                if is_single_arm:
+                    # Single arm joint: 8D (7+1)
+                    self.action_dim = 8
+                else:
+                    # Bimanual joint: 16D (7+7+2)
+                    self.action_dim = 16
             # If action_space_type is not set or is other value, keep config.action_dim (may be None)
         
         # Validate multi-head configuration
         if self.use_multi_action_heads:
             if self.split_arm_heads:
                 # When splitting arms, validate left + right = total arm dim
-                # Note: action_arm_dim should be set to left+right in groot_n1.py
+                # Note: For single-arm mode, one of them will be 0
                 expected_arm_dim = self.action_left_arm_dim + self.action_right_arm_dim
                 if self.action_arm_dim != expected_arm_dim:
                     raise ValueError(
@@ -452,15 +523,25 @@ class FlowmatchingActionHead(nn.Module):
         encoder_action_dim = config.pretrained_action_dim if config.pretrained_action_dim is not None else config.action_dim
         self.encoder_action_dim = encoder_action_dim
         
-        # Calculate actual_action_dim based on action_space_type
-        # This ensures it matches the actual data dimension (20D for eef, 16D for joint)
-        # Priority: action_space_type > multi-head configuration > config.action_dim
+        # Calculate actual_action_dim based on action_space_type and manipulation_mode
+        # This ensures it matches the actual data dimension
+        # Priority: manipulation_mode + action_space_type > multi-head configuration > config.action_dim
+        is_single_arm = config.manipulation_mode in ["single_left_arm", "single_right_arm"]
+        
         if config.action_space_type in ["Delta eef", "Absolute eef"]:
-            # EEF action space: 20D (9+9+2)
-            actual_action_dim = 20
+            if is_single_arm:
+                # Single arm EEF: 10D (9+1)
+                actual_action_dim = 10
+            else:
+                # Bimanual EEF: 20D (9+9+2)
+                actual_action_dim = 20
         elif config.action_space_type == "Absolute joint":
-            # Joint action space: 16D (7+7+2)
-            actual_action_dim = 16
+            if is_single_arm:
+                # Single arm joint: 8D (7+1)
+                actual_action_dim = 8
+            else:
+                # Bimanual joint: 16D (7+7+2)
+                actual_action_dim = 16
         elif config.use_multi_action_heads:
             # Fallback to multi-head configuration if action_space_type is not set
             if config.split_arm_heads:
@@ -472,10 +553,13 @@ class FlowmatchingActionHead(nn.Module):
             actual_action_dim = config.action_dim
         
         self.actual_action_dim = actual_action_dim  # Actual action dimension from data
+        self.is_single_arm = is_single_arm  # Store for later use
+        self.is_left_arm_only = config.manipulation_mode == "single_left_arm"
+        self.is_right_arm_only = config.manipulation_mode == "single_right_arm"
         
         # Print actual_action_dim for verification
         if config.action_space_type in ["Delta eef", "Absolute eef", "Absolute joint"]:
-            print(f"✅ actual_action_dim={self.actual_action_dim}D (based on action_space_type='{config.action_space_type}')")
+            print(f"✅ actual_action_dim={self.actual_action_dim}D (based on action_space_type='{config.action_space_type}', manipulation_mode='{config.manipulation_mode}')")
 
         # State encoder (optional, can be disabled for RGB-only mode)
         if config.use_state_encoder:
@@ -499,8 +583,33 @@ class FlowmatchingActionHead(nn.Module):
         # Multi-head action prediction
         if config.use_multi_action_heads:
             if config.split_arm_heads:
-                # Split arm into left and right
-                if config.use_shared_arm_features:
+                # Check if single-arm mode
+                if is_single_arm:
+                    # Single-arm mode: only create decoder for the active arm
+                    self.shared_arm_decoder = None  # Not used in single-arm mode
+                    
+                    if self.is_left_arm_only:
+                        # Only left arm decoder
+                        self.action_left_arm_decoder = CategorySpecificMLP(
+                            num_categories=config.max_num_embodiments,
+                            input_dim=self.hidden_size,
+                            hidden_dim=self.hidden_size,
+                            output_dim=config.action_left_arm_dim,
+                        )
+                        self.action_right_arm_decoder = None
+                        print(f"🦾 Single-arm mode: LEFT arm only (no right arm decoder)")
+                    else:  # is_right_arm_only
+                        # Only right arm decoder
+                        self.action_left_arm_decoder = None
+                        self.action_right_arm_decoder = CategorySpecificMLP(
+                            num_categories=config.max_num_embodiments,
+                            input_dim=self.hidden_size,
+                            hidden_dim=self.hidden_size,
+                            output_dim=config.action_right_arm_dim,
+                        )
+                        print(f"🦾 Single-arm mode: RIGHT arm only (no left arm decoder)")
+                elif config.use_shared_arm_features:
+                    # Bimanual mode with shared features
                     # 使用共享底层特征的decoder，提升左右手协调性
                     self.shared_arm_decoder = SharedBottomArmDecoder(
                         num_categories=config.max_num_embodiments,
@@ -523,7 +632,7 @@ class FlowmatchingActionHead(nn.Module):
                         print(f"   ⚠️  This is similar to 'single MLP then split'")
                         print(f"   💡 Enable cross-attention for better coordination!")
                 else:
-                    # 完全独立的decoder（原始实现）
+                    # Bimanual mode with independent decoders（原始实现）
                     self.action_left_arm_decoder = CategorySpecificMLP(
                         num_categories=config.max_num_embodiments,
                         input_dim=self.hidden_size,
@@ -560,17 +669,17 @@ class FlowmatchingActionHead(nn.Module):
             
             if config.split_arm_heads:
                 total_dim = config.action_left_arm_dim + config.action_right_arm_dim + config.action_claw_dim
-                print(f"📊 Multi-head action: left_arm({config.action_left_arm_dim}D, indices 0-{config.action_left_arm_dim-1}) + "
-                      f"right_arm({config.action_right_arm_dim}D, indices {config.action_left_arm_dim}-{config.action_left_arm_dim + config.action_right_arm_dim-1}) + "
-                      f"claw({config.action_claw_dim}D, indices {config.action_arm_dim}-{config.action_arm_dim + config.action_claw_dim-1}) = {total_dim}D")
-                # Note: actual_action_dim will be set after this print, so we calculate it here for display
-                if config.action_space_type in ["Delta eef", "Absolute eef"]:
-                    expected_actual_dim = 20
-                elif config.action_space_type == "Absolute joint":
-                    expected_actual_dim = 16
+                if is_single_arm:
+                    # Single-arm mode print
+                    active_arm = "left_arm" if self.is_left_arm_only else "right_arm"
+                    active_dim = config.action_left_arm_dim if self.is_left_arm_only else config.action_right_arm_dim
+                    print(f"📊 Single-arm action: {active_arm}({active_dim}D) + claw({config.action_claw_dim}D) = {total_dim}D")
                 else:
-                    expected_actual_dim = total_dim
-                print(f"   action_arm_dim={config.action_arm_dim} (left+right), actual_action_dim={expected_actual_dim} (from action_space_type={config.action_space_type})")
+                    # Bimanual mode print
+                    print(f"📊 Multi-head action: left_arm({config.action_left_arm_dim}D, indices 0-{config.action_left_arm_dim-1}) + "
+                          f"right_arm({config.action_right_arm_dim}D, indices {config.action_left_arm_dim}-{config.action_left_arm_dim + config.action_right_arm_dim-1}) + "
+                          f"claw({config.action_claw_dim}D, indices {config.action_arm_dim}-{config.action_arm_dim + config.action_claw_dim-1}) = {total_dim}D")
+                print(f"   actual_action_dim={self.actual_action_dim} (from action_space_type={config.action_space_type}, manipulation_mode={config.manipulation_mode})")
             else:
                 print(f"📊 Multi-head action: arm({config.action_arm_dim}D) + claw({config.action_claw_dim}D) = {config.action_arm_dim + config.action_claw_dim}D")
         else:
@@ -588,12 +697,28 @@ class FlowmatchingActionHead(nn.Module):
         # Learnable loss weights (参考 https://arxiv.org/pdf/1705.07115)
         if config.use_learnable_loss_weights and config.use_multi_action_heads:
             if config.split_arm_heads:
-                self.task_log_sigma = nn.ParameterDict({
-                    "left_arm": nn.Parameter(torch.zeros(())),    # log(σ_left_arm)
-                    "right_arm": nn.Parameter(torch.zeros(())),   # log(σ_right_arm)
-                    "claw": nn.Parameter(torch.zeros(())),        # log(σ_claw)
-                })
-                print(f"🎯 Learnable loss weights enabled: left_arm, right_arm, claw")
+                if is_single_arm:
+                    # Single-arm mode: only one arm + claw
+                    if self.is_left_arm_only:
+                        self.task_log_sigma = nn.ParameterDict({
+                            "left_arm": nn.Parameter(torch.zeros(())),    # log(σ_left_arm)
+                            "claw": nn.Parameter(torch.zeros(())),        # log(σ_claw)
+                        })
+                        print(f"🎯 Learnable loss weights enabled: left_arm, claw (single-arm mode)")
+                    else:  # is_right_arm_only
+                        self.task_log_sigma = nn.ParameterDict({
+                            "right_arm": nn.Parameter(torch.zeros(())),   # log(σ_right_arm)
+                            "claw": nn.Parameter(torch.zeros(())),        # log(σ_claw)
+                        })
+                        print(f"🎯 Learnable loss weights enabled: right_arm, claw (single-arm mode)")
+                else:
+                    # Bimanual mode: both arms + claw
+                    self.task_log_sigma = nn.ParameterDict({
+                        "left_arm": nn.Parameter(torch.zeros(())),    # log(σ_left_arm)
+                        "right_arm": nn.Parameter(torch.zeros(())),   # log(σ_right_arm)
+                        "claw": nn.Parameter(torch.zeros(())),        # log(σ_claw)
+                    })
+                    print(f"🎯 Learnable loss weights enabled: left_arm, right_arm, claw")
             else:
                 self.task_log_sigma = nn.ParameterDict({
                     "arm": nn.Parameter(torch.zeros(())),    # log(σ_arm)
@@ -858,104 +983,206 @@ class FlowmatchingActionHead(nn.Module):
         # Multi-head action prediction
         if self.config.use_multi_action_heads:
             if self.config.split_arm_heads:
-                # Split arm into left and right
-                if self.config.use_shared_arm_features and hasattr(self, 'shared_arm_decoder') and self.shared_arm_decoder is not None:
-                    # 使用共享底层特征的decoder
-                    pred_left_arm, pred_right_arm = self.shared_arm_decoder(model_output_actions, embodiment_id)
+                # Check for single-arm mode vs bimanual mode
+                if self.is_single_arm:
+                    # Single-arm mode: only one arm + claw
+                    pred_claw = self.action_claw_decoder(model_output_actions, embodiment_id)
+                    
+                    if self.is_left_arm_only:
+                        # Left arm only
+                        pred_left_arm = self.action_left_arm_decoder(model_output_actions, embodiment_id)
+                        pred_actions = torch.cat([pred_left_arm, pred_claw], dim=-1)  # (B, T, arm_dim + claw_dim)
+                        
+                        # Split ground truth velocity: [left_arm(9D/7D), claw(1D)]
+                        velocity_arm = velocity[:, :, :self.config.action_left_arm_dim]  # (B, T, action_left_arm_dim)
+                        velocity_claw = velocity[:, :, self.config.action_left_arm_dim:]  # (B, T, action_claw_dim)
+                        
+                        # Compute loss
+                        action_mask = action_input.action_mask[:, :, :self.actual_action_dim]
+                        action_mask_arm = action_mask[:, :, :self.config.action_left_arm_dim]
+                        action_mask_claw = action_mask[:, :, self.config.action_left_arm_dim:]
+                        
+                        loss_arm = F.mse_loss(pred_left_arm, velocity_arm, reduction="none") * action_mask_arm
+                        loss_claw = F.mse_loss(pred_claw, velocity_claw, reduction="none") * action_mask_claw
+                        
+                        # Compute final loss
+                        if self.config.use_learnable_loss_weights and self.task_log_sigma is not None:
+                            loss_arm_mean = loss_arm.sum() / action_mask_arm.sum()
+                            loss_claw_mean = loss_claw.sum() / action_mask_claw.sum()
+                            
+                            s_arm = self.task_log_sigma["left_arm"]
+                            s_claw = self.task_log_sigma["claw"]
+                            precision_arm = torch.exp(-2.0 * s_arm)
+                            precision_claw = torch.exp(-2.0 * s_claw)
+                            
+                            loss = precision_arm * loss_arm_mean + precision_claw * loss_claw_mean + s_arm + s_claw
+                            
+                            output_dict = {
+                                "loss": loss,
+                                "left_arm_loss": loss_arm_mean.item(),
+                                "claw_loss": loss_claw_mean.item(),
+                                "sigma_left_arm": torch.exp(s_arm).item(),
+                                "sigma_claw": torch.exp(s_claw).item(),
+                                "weight_left_arm": precision_arm.item(),
+                                "weight_claw": precision_claw.item(),
+                            }
+                        else:
+                            loss_arm_mean = loss_arm.sum() / action_mask_arm.sum()
+                            loss_claw_mean = loss_claw.sum() / action_mask_claw.sum()
+                            loss = self.config.left_arm_loss_weight * loss_arm_mean + self.config.claw_loss_weight * loss_claw_mean
+                            
+                            output_dict = {
+                                "loss": loss,
+                                "left_arm_loss": loss_arm_mean.item(),
+                                "claw_loss": loss_claw_mean.item(),
+                            }
+                    else:  # is_right_arm_only
+                        # Right arm only
+                        pred_right_arm = self.action_right_arm_decoder(model_output_actions, embodiment_id)
+                        pred_actions = torch.cat([pred_right_arm, pred_claw], dim=-1)  # (B, T, arm_dim + claw_dim)
+                        
+                        # Split ground truth velocity: [right_arm(9D/7D), claw(1D)]
+                        velocity_arm = velocity[:, :, :self.config.action_right_arm_dim]  # (B, T, action_right_arm_dim)
+                        velocity_claw = velocity[:, :, self.config.action_right_arm_dim:]  # (B, T, action_claw_dim)
+                        
+                        # Compute loss
+                        action_mask = action_input.action_mask[:, :, :self.actual_action_dim]
+                        action_mask_arm = action_mask[:, :, :self.config.action_right_arm_dim]
+                        action_mask_claw = action_mask[:, :, self.config.action_right_arm_dim:]
+                        
+                        loss_arm = F.mse_loss(pred_right_arm, velocity_arm, reduction="none") * action_mask_arm
+                        loss_claw = F.mse_loss(pred_claw, velocity_claw, reduction="none") * action_mask_claw
+                        
+                        # Compute final loss
+                        if self.config.use_learnable_loss_weights and self.task_log_sigma is not None:
+                            loss_arm_mean = loss_arm.sum() / action_mask_arm.sum()
+                            loss_claw_mean = loss_claw.sum() / action_mask_claw.sum()
+                            
+                            s_arm = self.task_log_sigma["right_arm"]
+                            s_claw = self.task_log_sigma["claw"]
+                            precision_arm = torch.exp(-2.0 * s_arm)
+                            precision_claw = torch.exp(-2.0 * s_claw)
+                            
+                            loss = precision_arm * loss_arm_mean + precision_claw * loss_claw_mean + s_arm + s_claw
+                            
+                            output_dict = {
+                                "loss": loss,
+                                "right_arm_loss": loss_arm_mean.item(),
+                                "claw_loss": loss_claw_mean.item(),
+                                "sigma_right_arm": torch.exp(s_arm).item(),
+                                "sigma_claw": torch.exp(s_claw).item(),
+                                "weight_right_arm": precision_arm.item(),
+                                "weight_claw": precision_claw.item(),
+                            }
+                        else:
+                            loss_arm_mean = loss_arm.sum() / action_mask_arm.sum()
+                            loss_claw_mean = loss_claw.sum() / action_mask_claw.sum()
+                            loss = self.config.right_arm_loss_weight * loss_arm_mean + self.config.claw_loss_weight * loss_claw_mean
+                            
+                            output_dict = {
+                                "loss": loss,
+                                "right_arm_loss": loss_arm_mean.item(),
+                                "claw_loss": loss_claw_mean.item(),
+                            }
                 else:
-                    # 使用独立的decoder
-                    pred_left_arm = self.action_left_arm_decoder(model_output_actions, embodiment_id)
-                    pred_right_arm = self.action_right_arm_decoder(model_output_actions, embodiment_id)
-                pred_claw = self.action_claw_decoder(model_output_actions, embodiment_id)
-                pred_actions = torch.cat([pred_left_arm, pred_right_arm, pred_claw], dim=-1)  # (B, T, action_dim)
-                
-                # Split ground truth velocity into corresponding parts
-                # velocity shape: (B, T, actual_action_dim)
-                # Structure depends on action space:
-                #   - Joint space (16D): [left_arm(0-6, 7D), right_arm(7-13, 7D), claw(14-15, 2D)]
-                #   - EEF space (20D): [left_arm(0-8, 9D: 3D pos + 6D rot), right_arm(9-17, 9D: 3D pos + 6D rot), claw(18-19, 2D)]
-                velocity_left_arm = velocity[:, :, :self.config.action_left_arm_dim]  # (B, T, action_left_arm_dim)
-                velocity_right_arm = velocity[:, :, self.config.action_left_arm_dim:self.config.action_left_arm_dim + self.config.action_right_arm_dim]  # (B, T, action_right_arm_dim)
-                velocity_claw = velocity[:, :, self.config.action_arm_dim:]  # (B, T, action_claw_dim)
-                
-                # Compute loss for each head
-                # action_mask shape: (B, T, encoder_action_dim), extract only actual_action_dim
-                action_mask = action_input.action_mask[:, :, :self.actual_action_dim]  # (B, T, actual_action_dim)
-                # Split mask for left_arm, right_arm and claw (same structure as velocity)
-                action_mask_left_arm = action_mask[:, :, :self.config.action_left_arm_dim]  # (B, T, action_left_arm_dim)
-                action_mask_right_arm = action_mask[:, :, self.config.action_left_arm_dim:self.config.action_left_arm_dim + self.config.action_right_arm_dim]  # (B, T, action_right_arm_dim)
-                action_mask_claw = action_mask[:, :, self.config.action_arm_dim:]  # (B, T, action_claw_dim)
-                
-                loss_left_arm = F.mse_loss(pred_left_arm, velocity_left_arm, reduction="none") * action_mask_left_arm
-                loss_right_arm = F.mse_loss(pred_right_arm, velocity_right_arm, reduction="none") * action_mask_right_arm
-                loss_claw = F.mse_loss(pred_claw, velocity_claw, reduction="none") * action_mask_claw
-                
-                # 协调性损失：鼓励左右手动作的协调性（可选）
-                coordination_loss = None
-                if self.config.arm_coordination_loss_weight > 0:
-                    # 计算左右手速度的差异，鼓励它们在某些维度上保持同步
-                    # 这里使用速度差的L2范数作为协调性损失
-                    # 注意：不是完全同步，而是鼓励协调（比如拉箱子时左右手应该同步）
-                    left_arm_magnitude = torch.norm(pred_left_arm, dim=-1, keepdim=True)  # (B, T, 1)
-                    right_arm_magnitude = torch.norm(pred_right_arm, dim=-1, keepdim=True)  # (B, T, 1)
-                    # 鼓励左右手的速度幅度相似（但不完全相同）
-                    coordination_loss = F.mse_loss(left_arm_magnitude, right_arm_magnitude, reduction="none")
-                    # 只对有效的动作维度计算
-                    valid_mask = (action_mask_left_arm.sum(dim=-1, keepdim=True) > 0) & (action_mask_right_arm.sum(dim=-1, keepdim=True) > 0)
-                    coordination_loss = (coordination_loss * valid_mask).sum() / (valid_mask.sum() + 1e-8)
-                
-                # Use learnable weights or fixed weights
-                if self.config.use_learnable_loss_weights and self.task_log_sigma is not None:
-                    loss_left_arm_mean = loss_left_arm.sum() / action_mask_left_arm.sum()
-                    loss_right_arm_mean = loss_right_arm.sum() / action_mask_right_arm.sum()
-                    loss_claw_mean = loss_claw.sum() / action_mask_claw.sum()
+                    # Bimanual mode: split arm into left and right
+                    if self.config.use_shared_arm_features and hasattr(self, 'shared_arm_decoder') and self.shared_arm_decoder is not None:
+                        # 使用共享底层特征的decoder
+                        pred_left_arm, pred_right_arm = self.shared_arm_decoder(model_output_actions, embodiment_id)
+                    else:
+                        # 使用独立的decoder
+                        pred_left_arm = self.action_left_arm_decoder(model_output_actions, embodiment_id)
+                        pred_right_arm = self.action_right_arm_decoder(model_output_actions, embodiment_id)
+                    pred_claw = self.action_claw_decoder(model_output_actions, embodiment_id)
+                    pred_actions = torch.cat([pred_left_arm, pred_right_arm, pred_claw], dim=-1)  # (B, T, action_dim)
                     
-                    s_left_arm = self.task_log_sigma["left_arm"]
-                    s_right_arm = self.task_log_sigma["right_arm"]
-                    s_claw = self.task_log_sigma["claw"]
-                    precision_left_arm = torch.exp(-2.0 * s_left_arm)
-                    precision_right_arm = torch.exp(-2.0 * s_right_arm)
-                    precision_claw = torch.exp(-2.0 * s_claw)
+                    # Split ground truth velocity into corresponding parts
+                    # velocity shape: (B, T, actual_action_dim)
+                    # Structure depends on action space:
+                    #   - Joint space (16D): [left_arm(0-6, 7D), right_arm(7-13, 7D), claw(14-15, 2D)]
+                    #   - EEF space (20D): [left_arm(0-8, 9D: 3D pos + 6D rot), right_arm(9-17, 9D: 3D pos + 6D rot), claw(18-19, 2D)]
+                    velocity_left_arm = velocity[:, :, :self.config.action_left_arm_dim]  # (B, T, action_left_arm_dim)
+                    velocity_right_arm = velocity[:, :, self.config.action_left_arm_dim:self.config.action_left_arm_dim + self.config.action_right_arm_dim]  # (B, T, action_right_arm_dim)
+                    velocity_claw = velocity[:, :, self.config.action_arm_dim:]  # (B, T, action_claw_dim)
                     
-                    loss = precision_left_arm * loss_left_arm_mean + precision_right_arm * loss_right_arm_mean + precision_claw * loss_claw_mean + s_left_arm + s_right_arm + s_claw
+                    # Compute loss for each head
+                    # action_mask shape: (B, T, encoder_action_dim), extract only actual_action_dim
+                    action_mask = action_input.action_mask[:, :, :self.actual_action_dim]  # (B, T, actual_action_dim)
+                    # Split mask for left_arm, right_arm and claw (same structure as velocity)
+                    action_mask_left_arm = action_mask[:, :, :self.config.action_left_arm_dim]  # (B, T, action_left_arm_dim)
+                    action_mask_right_arm = action_mask[:, :, self.config.action_left_arm_dim:self.config.action_left_arm_dim + self.config.action_right_arm_dim]  # (B, T, action_right_arm_dim)
+                    action_mask_claw = action_mask[:, :, self.config.action_arm_dim:]  # (B, T, action_claw_dim)
                     
-                    # 添加协调性损失
-                    if coordination_loss is not None:
-                        loss = loss + self.config.arm_coordination_loss_weight * coordination_loss
+                    loss_left_arm = F.mse_loss(pred_left_arm, velocity_left_arm, reduction="none") * action_mask_left_arm
+                    loss_right_arm = F.mse_loss(pred_right_arm, velocity_right_arm, reduction="none") * action_mask_right_arm
+                    loss_claw = F.mse_loss(pred_claw, velocity_claw, reduction="none") * action_mask_claw
                     
-                    output_dict = {
-                        "loss": loss,
-                        "left_arm_loss": loss_left_arm_mean.item(),
-                        "right_arm_loss": loss_right_arm_mean.item(),
-                        "claw_loss": loss_claw_mean.item(),
-                        "sigma_left_arm": torch.exp(s_left_arm).item(),
-                        "sigma_right_arm": torch.exp(s_right_arm).item(),
-                        "sigma_claw": torch.exp(s_claw).item(),
-                        "weight_left_arm": precision_left_arm.item(),
-                        "weight_right_arm": precision_right_arm.item(),
-                        "weight_claw": precision_claw.item(),
-                    }
-                    if coordination_loss is not None:
-                        output_dict["arm_coordination_loss"] = coordination_loss.item()
-                else:
-                    # Use fixed weights
-                    loss_left_arm_mean = loss_left_arm.sum() / action_mask_left_arm.sum()
-                    loss_right_arm_mean = loss_right_arm.sum() / action_mask_right_arm.sum()
-                    loss_claw_mean = loss_claw.sum() / action_mask_claw.sum()
-                    loss = self.config.left_arm_loss_weight * loss_left_arm_mean + self.config.right_arm_loss_weight * loss_right_arm_mean + self.config.claw_loss_weight * loss_claw_mean
+                    # 协调性损失：鼓励左右手动作的协调性（可选）
+                    coordination_loss = None
+                    if self.config.arm_coordination_loss_weight > 0:
+                        # 计算左右手速度的差异，鼓励它们在某些维度上保持同步
+                        # 这里使用速度差的L2范数作为协调性损失
+                        # 注意：不是完全同步，而是鼓励协调（比如拉箱子时左右手应该同步）
+                        left_arm_magnitude = torch.norm(pred_left_arm, dim=-1, keepdim=True)  # (B, T, 1)
+                        right_arm_magnitude = torch.norm(pred_right_arm, dim=-1, keepdim=True)  # (B, T, 1)
+                        # 鼓励左右手的速度幅度相似（但不完全相同）
+                        coordination_loss = F.mse_loss(left_arm_magnitude, right_arm_magnitude, reduction="none")
+                        # 只对有效的动作维度计算
+                        valid_mask = (action_mask_left_arm.sum(dim=-1, keepdim=True) > 0) & (action_mask_right_arm.sum(dim=-1, keepdim=True) > 0)
+                        coordination_loss = (coordination_loss * valid_mask).sum() / (valid_mask.sum() + 1e-8)
                     
-                    # 添加协调性损失
-                    if coordination_loss is not None:
-                        loss = loss + self.config.arm_coordination_loss_weight * coordination_loss
-                    
-                    output_dict = {
-                        "loss": loss,
-                        "left_arm_loss": loss_left_arm_mean.item(),
-                        "right_arm_loss": loss_right_arm_mean.item(),
-                        "claw_loss": loss_claw_mean.item(),
-                    }
-                    if coordination_loss is not None:
-                        output_dict["arm_coordination_loss"] = coordination_loss.item()
+                    # Use learnable weights or fixed weights
+                    if self.config.use_learnable_loss_weights and self.task_log_sigma is not None:
+                        loss_left_arm_mean = loss_left_arm.sum() / action_mask_left_arm.sum()
+                        loss_right_arm_mean = loss_right_arm.sum() / action_mask_right_arm.sum()
+                        loss_claw_mean = loss_claw.sum() / action_mask_claw.sum()
+                        
+                        s_left_arm = self.task_log_sigma["left_arm"]
+                        s_right_arm = self.task_log_sigma["right_arm"]
+                        s_claw = self.task_log_sigma["claw"]
+                        precision_left_arm = torch.exp(-2.0 * s_left_arm)
+                        precision_right_arm = torch.exp(-2.0 * s_right_arm)
+                        precision_claw = torch.exp(-2.0 * s_claw)
+                        
+                        loss = precision_left_arm * loss_left_arm_mean + precision_right_arm * loss_right_arm_mean + precision_claw * loss_claw_mean + s_left_arm + s_right_arm + s_claw
+                        
+                        # 添加协调性损失
+                        if coordination_loss is not None:
+                            loss = loss + self.config.arm_coordination_loss_weight * coordination_loss
+                        
+                        output_dict = {
+                            "loss": loss,
+                            "left_arm_loss": loss_left_arm_mean.item(),
+                            "right_arm_loss": loss_right_arm_mean.item(),
+                            "claw_loss": loss_claw_mean.item(),
+                            "sigma_left_arm": torch.exp(s_left_arm).item(),
+                            "sigma_right_arm": torch.exp(s_right_arm).item(),
+                            "sigma_claw": torch.exp(s_claw).item(),
+                            "weight_left_arm": precision_left_arm.item(),
+                            "weight_right_arm": precision_right_arm.item(),
+                            "weight_claw": precision_claw.item(),
+                        }
+                        if coordination_loss is not None:
+                            output_dict["arm_coordination_loss"] = coordination_loss.item()
+                    else:
+                        # Use fixed weights
+                        loss_left_arm_mean = loss_left_arm.sum() / action_mask_left_arm.sum()
+                        loss_right_arm_mean = loss_right_arm.sum() / action_mask_right_arm.sum()
+                        loss_claw_mean = loss_claw.sum() / action_mask_claw.sum()
+                        loss = self.config.left_arm_loss_weight * loss_left_arm_mean + self.config.right_arm_loss_weight * loss_right_arm_mean + self.config.claw_loss_weight * loss_claw_mean
+                        
+                        # 添加协调性损失
+                        if coordination_loss is not None:
+                            loss = loss + self.config.arm_coordination_loss_weight * coordination_loss
+                        
+                        output_dict = {
+                            "loss": loss,
+                            "left_arm_loss": loss_left_arm_mean.item(),
+                            "right_arm_loss": loss_right_arm_mean.item(),
+                            "claw_loss": loss_claw_mean.item(),
+                        }
+                        if coordination_loss is not None:
+                            output_dict["arm_coordination_loss"] = coordination_loss.item()
             else:
                 # Single arm head (original behavior)
                 pred_arm = self.action_arm_decoder(model_output_actions, embodiment_id)
@@ -1143,16 +1370,25 @@ class FlowmatchingActionHead(nn.Module):
 
             if self.config.use_multi_action_heads:
                 if self.config.split_arm_heads:
-                    # Split arm into left and right
-                    if self.config.use_shared_arm_features and hasattr(self, 'shared_arm_decoder') and self.shared_arm_decoder is not None:
-                        # 使用共享底层特征的decoder
-                        pred_left_arm, pred_right_arm = self.shared_arm_decoder(model_output_actions, embodiment_id)
-                    else:
-                        # 使用独立的decoder
-                        pred_left_arm = self.action_left_arm_decoder(model_output_actions, embodiment_id)
-                        pred_right_arm = self.action_right_arm_decoder(model_output_actions, embodiment_id)
                     pred_claw = self.action_claw_decoder(model_output_actions, embodiment_id)
-                    pred_velocity = torch.cat([pred_left_arm, pred_right_arm, pred_claw], dim=-1)  # (B, T, action_dim)
+                    
+                    if self.is_single_arm:
+                        # Single-arm mode: only one arm + claw
+                        if self.is_left_arm_only:
+                            pred_arm = self.action_left_arm_decoder(model_output_actions, embodiment_id)
+                        else:  # is_right_arm_only
+                            pred_arm = self.action_right_arm_decoder(model_output_actions, embodiment_id)
+                        pred_velocity = torch.cat([pred_arm, pred_claw], dim=-1)  # (B, T, arm_dim + claw_dim)
+                    else:
+                        # Bimanual mode: split arm into left and right
+                        if self.config.use_shared_arm_features and hasattr(self, 'shared_arm_decoder') and self.shared_arm_decoder is not None:
+                            # 使用共享底层特征的decoder
+                            pred_left_arm, pred_right_arm = self.shared_arm_decoder(model_output_actions, embodiment_id)
+                        else:
+                            # 使用独立的decoder
+                            pred_left_arm = self.action_left_arm_decoder(model_output_actions, embodiment_id)
+                            pred_right_arm = self.action_right_arm_decoder(model_output_actions, embodiment_id)
+                        pred_velocity = torch.cat([pred_left_arm, pred_right_arm, pred_claw], dim=-1)  # (B, T, action_dim)
                 else:
                     # Single arm head
                     pred_arm = self.action_arm_decoder(model_output_actions, embodiment_id)

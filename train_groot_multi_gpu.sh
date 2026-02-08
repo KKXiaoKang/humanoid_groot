@@ -126,6 +126,24 @@ NUM_WORKERS=8          # 数据加载器工作进程数（每个GPU）
 # ============================================================================
 RELATIVE_ACTION_REF_MODE="state"  # "state" (推荐) 或 "action" (旧方式)
 
+# ============================================================================
+# 操作模式配置（单手/双手）
+# ============================================================================
+# manipulation_mode 控制机器人的操作模式：
+#   - "bimanual": 双手操作（默认）
+#                 EEF模式: 20D (9D左手 + 9D右手 + 2D夹爪)
+#                 Joint模式: 16D (7D左臂 + 7D右臂 + 2D夹爪)
+#
+#   - "single_left_arm": 仅左手操作
+#                 EEF模式: 10D (9D左手 + 1D夹爪)
+#                 Joint模式: 8D (7D左臂 + 1D夹爪)
+#
+#   - "single_right_arm": 仅右手操作
+#                 EEF模式: 10D (9D右手 + 1D夹爪)
+#                 Joint模式: 8D (7D右臂 + 1D夹爪)
+# ============================================================================
+MANIPULATION_MODE="bimanual"  # "bimanual", "single_left_arm", 或 "single_right_arm"
+
 # 学习率配置
 # ============================================================================
 # 重要: LeRobot不会自动缩放学习率，需要手动根据GPU数量缩放
@@ -194,11 +212,20 @@ IMAGE_TRANSFORMS_CONFIG_PATH="config/image_transforms.json"
 #   * False: 按照变换的默认顺序应用（brightness -> contrast -> saturation -> ...）
 #   * True: 随机打乱变换的应用顺序，增加数据增强的多样性
 
-# 打印Delta EEF配置信息
+# 打印配置信息
 echo ""
 echo "=========================================="
-echo "🔄 Delta EEF配置:"
+echo "🔄 动作空间配置:"
 echo "   action_space_type: Delta eef"
+echo "   manipulation_mode: ${MANIPULATION_MODE}"
+if [ "$MANIPULATION_MODE" = "bimanual" ]; then
+    echo "   🤲 双手操作模式 (20D: 9+9+2)"
+elif [ "$MANIPULATION_MODE" = "single_left_arm" ]; then
+    echo "   🦾 单手操作模式 - 仅左手 (10D: 9+1)"
+elif [ "$MANIPULATION_MODE" = "single_right_arm" ]; then
+    echo "   🦾 单手操作模式 - 仅右手 (10D: 9+1)"
+fi
+echo ""
 echo "   relative_action_reference_mode: ${RELATIVE_ACTION_REF_MODE}"
 if [ "$RELATIVE_ACTION_REF_MODE" = "state" ]; then
     echo "   ✅ 使用 observation.state 作为 reference pose (推荐)"
@@ -239,6 +266,7 @@ accelerate launch \
   --policy.max_state_dim=64 \
   --policy.max_action_dim=32 \
   --policy.action_space_type="Delta eef" \
+  --policy.manipulation_mode="${MANIPULATION_MODE}" \
   --policy.relative_action_reference_mode="${RELATIVE_ACTION_REF_MODE}" \
   --policy.optimizer_lr=${SCALED_LR} \
   --policy.warmup_ratio=0.10 \
