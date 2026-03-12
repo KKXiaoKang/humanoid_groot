@@ -67,6 +67,39 @@ class PI05Config(PreTrainedConfig):
     compile_mode: str = "max-autotune"  # Torch compile mode
     device: str | None = None  # Device to use for the model (None = auto-detect)
 
+    # ============================================================================
+    # π*0.6 RECAP Value Function 配置
+    # ============================================================================
+    # 训练模式:
+    #   "policy" - 标准策略训练 (flow matching + action MSE loss)
+    #   "value_function" - 仅训练 Value Function (MSE loss on target_value)
+    training_mode: str = "policy"
+    # 是否启用 Value Function（用于 RECAP 训练）
+    enable_value_function: bool = False
+    # Value Function 使用的 Gemma 变体（较小的模型，默认 gemma_300m ≈ 270M 参数）
+    value_function_variant: str = "gemma_300m"
+    # 是否与策略网络共享 SigLIP 视觉编码器
+    value_function_share_vision_encoder: bool = True
+    # Value Head MLP 的 dropout 率
+    value_head_dropout: float = 0.1
+    # Value Function 的学习率（通常与策略网络不同）
+    value_function_lr: float = 1e-4
+    # Value Function 的权重衰减
+    value_function_weight_decay: float = 0.01
+
+    # Advantage 计算配置
+    # Advantage 计算的 N-step lookahead（None=预训练模式使用整个 episode, 50=微调模式）
+    advantage_n_steps: int | None = None
+    # 正优势数据的目标比例（预训练: 0.3, 微调: 0.4）
+    advantage_positive_ratio: float = 0.3
+    # Advantage conditioning 的 dropout 比例（用于 CFG 训练）
+    advantage_conditioning_dropout: float = 0.3
+
+    # 是否启用 advantage conditioning（策略网络条件化在 advantage indicator 上）
+    enable_advantage_conditioning: bool = False
+    # 推理时的 CFG beta 系数（β > 1 锐化分布，偏向高 advantage 动作）
+    cfg_beta: float = 1.5
+
     # Optimizer settings: see openpi `AdamW`
     optimizer_lr: float = 2.5e-5  # see openpi `CosineDecaySchedule: peak_lr`
     optimizer_betas: tuple[float, float] = (0.9, 0.95)
@@ -101,6 +134,28 @@ class PI05Config(PreTrainedConfig):
         if self.dtype not in ["bfloat16", "float32"]:
             raise ValueError(f"Invalid dtype: {self.dtype}")
 
+        if self.training_mode not in ["policy", "value_function"]:
+            raise ValueError(
+                f"Invalid training_mode: {self.training_mode}. Must be 'policy' or 'value_function'"
+            )
+
+        # 如果 training_mode 是 value_function，自动启用 enable_value_function
+        if self.training_mode == "value_function":
+            self.enable_value_function = True
+
+        # Validate Value Function configuration
+        if self.enable_value_function:
+            if self.value_function_variant not in ["gemma_300m", "gemma_2b"]:
+                raise ValueError(f"Invalid value_function_variant: {self.value_function_variant}")
+            if not 0.0 <= self.advantage_positive_ratio <= 1.0:
+                raise ValueError(
+                    f"advantage_positive_ratio must be in [0, 1], got {self.advantage_positive_ratio}"
+                )
+            if not 0.0 <= self.advantage_conditioning_dropout <= 1.0:
+                raise ValueError(
+                    f"advantage_conditioning_dropout must be in [0, 1], got {self.advantage_conditioning_dropout}"
+                )
+
     def validate_features(self) -> None:
         """Validate and set up input/output features."""
         for i in range(self.empty_cameras):
@@ -126,18 +181,24 @@ class PI05Config(PreTrainedConfig):
             self.output_features["action"] = action_feature
 
     def get_optimizer_preset(self) -> AdamWConfig:
+        # Value Function 训练模式使用独立的学习率
+        lr = self.value_function_lr if self.training_mode == "value_function" else self.optimizer_lr
         return AdamWConfig(
-            lr=self.optimizer_lr,
+            lr=lr,
             betas=self.optimizer_betas,
             eps=self.optimizer_eps,
-            weight_decay=self.optimizer_weight_decay,
+            weight_decay=self.optimizer_weight_decay if self.training_mode != "value_function"
+            else self.value_function_weight_decay,
             grad_clip_norm=self.optimizer_grad_clip_norm,
         )
 
     def get_scheduler_preset(self):
+        # Value Function 训练模式使用独立的学习率
+        peak_lr = self.value_function_lr if self.training_mode == "value_function" else self.optimizer_lr
+        decay_lr = peak_lr * 0.1 if self.training_mode == "value_function" else self.scheduler_decay_lr
         return CosineDecayWithWarmupSchedulerConfig(
-            peak_lr=self.optimizer_lr,
-            decay_lr=self.scheduler_decay_lr,
+            peak_lr=peak_lr,
+            decay_lr=decay_lr,
             num_warmup_steps=self.scheduler_warmup_steps,
             num_decay_steps=self.scheduler_decay_steps,
         )

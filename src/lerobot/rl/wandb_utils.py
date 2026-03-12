@@ -28,12 +28,17 @@ from lerobot.utils.constants import PRETRAINED_MODEL_DIR
 
 def cfg_to_group(cfg: TrainPipelineConfig, return_list: bool = False) -> list[str] | str:
     """Return a group name for logging. Optionally returns group name as list."""
+    MAX_TAG_LENGTH = 64  # wandb tag 最大长度限制
+
     lst = [
         f"policy:{cfg.policy.type}",
         f"seed:{cfg.seed}",
     ]
     if cfg.dataset is not None:
-        lst.append(f"dataset:{cfg.dataset.repo_id}")
+        dataset_tag = f"dataset:{cfg.dataset.repo_id}"
+        if len(dataset_tag) > MAX_TAG_LENGTH:
+            dataset_tag = dataset_tag[: MAX_TAG_LENGTH - 3] + "..."
+        lst.append(dataset_tag)
     if cfg.env is not None:
         lst.append(f"env:{cfg.env.type}")
     return lst if return_list else "-".join(lst)

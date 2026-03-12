@@ -49,6 +49,17 @@ from lerobot.utils.constants import (
     OPENPI_ATTENTION_MASK_VALUE,
 )
 
+# π*0.6 RECAP Value Function 相关导入（延迟导入，仅在启用时使用）
+_value_function_available = True
+try:
+    from lerobot.policies.pi05.value_function import (
+        AdvantageComputer,
+        AdvantageConditioningEmbedding,
+        ValueFunctionPytorch,
+    )
+except ImportError:
+    _value_function_available = False
+
 
 def get_safe_dtype(target_dtype, device_type):
     """Get a safe dtype for the given device type."""
@@ -536,9 +547,22 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             from transformers.models.siglip import check
 
             if not check.check_whether_transformers_replace_is_installed_correctly():
-                raise ValueError(msg)
+                if getattr(config, 'training_mode', 'policy') == 'value_function':
+                    logging.warning(
+                        "Value Function 训练模式: transformers SigLIP check 未通过，"
+                        "但策略网络已冻结，跳过此检查继续执行..."
+                    )
+                else:
+                    raise ValueError(msg)
         except ImportError:
-            raise ValueError(msg) from None
+            if getattr(config, 'training_mode', 'policy') == 'value_function':
+                logging.warning(
+                    "Value Function 训练模式: transformers SigLIP check 模块不可用 "
+                    "(需要安装自定义 transformers 分支)，"
+                    "但策略网络已冻结，跳过此检查继续执行..."
+                )
+            else:
+                raise ValueError(msg) from None
 
     def gradient_checkpointing_enable(self):
         """Enable gradient checkpointing for memory optimization."""
@@ -821,7 +845,13 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
 
 class PI05Policy(PreTrainedPolicy):
-    """PI05 Policy for LeRobot."""
+    """PI05 Policy for LeRobot.
+
+    支持 π*0.6 RECAP 扩展:
+    - Value Function: 独立的 VLA 模型，预测状态价值 V(s)
+    - Advantage Conditioning: 策略条件化在 advantage indicator 上
+    - CFG (Classifier-Free Guidance): 推理时通过 CFG 锐化策略分布
+    """
 
     config_class = PI05Config
     name = "pi05"
@@ -838,7 +868,7 @@ class PI05Policy(PreTrainedPolicy):
         config.validate_features()
         self.config = config
 
-        # Initialize the core PI05 model
+        # Initialize the core PI05 model (策略网络)
         self.model = PI05Pytorch(config)
 
         # Enable gradient checkpointing if requested
@@ -846,6 +876,59 @@ class PI05Policy(PreTrainedPolicy):
             self.model.gradient_checkpointing_enable()
 
         self.model.to(config.device)
+
+        # ============================================================
+        # π*0.6 RECAP: 初始化 Value Function 和 Advantage 组件
+        # ============================================================
+        # 在 value_function 训练模式下，冻结策略网络以节省内存
+        if config.training_mode == "value_function":
+            logging.info("Value Function 训练模式: 冻结策略网络参数")
+            for param in self.model.parameters():
+                param.requires_grad = False
+
+        self.value_function = None
+        self.advantage_computer = None
+        self.advantage_embedding = None
+
+        if config.enable_value_function and _value_function_available:
+            logging.info("初始化 π*0.6 RECAP Value Function...")
+
+            # 创建 Value Function 模型
+            policy_paligemma = (
+                self.model.paligemma_with_expert.paligemma
+                if config.value_function_share_vision_encoder
+                else None
+            )
+            self.value_function = ValueFunctionPytorch(
+                vlm_variant=config.value_function_variant,
+                image_resolution=config.image_resolution,
+                precision=config.dtype,
+                value_head_dropout=config.value_head_dropout,
+                gradient_checkpointing=config.gradient_checkpointing,
+                share_vision_encoder=config.value_function_share_vision_encoder,
+                policy_paligemma=policy_paligemma,
+            )
+            self.value_function.to(config.device)
+
+            # 创建 Advantage 计算器
+            self.advantage_computer = AdvantageComputer(
+                n_steps=config.advantage_n_steps,
+                positive_advantage_ratio=config.advantage_positive_ratio,
+                advantage_dropout=config.advantage_conditioning_dropout,
+            )
+
+            # 创建 Advantage Conditioning 嵌入（如果启用 advantage conditioning）
+            if config.enable_advantage_conditioning:
+                action_expert_config = get_gemma_config(config.action_expert_variant)
+                self.advantage_embedding = AdvantageConditioningEmbedding(
+                    embed_dim=action_expert_config.width,
+                )
+                self.advantage_embedding.to(config.device)
+
+            logging.info(
+                f"Value Function 已初始化: variant={config.value_function_variant}, "
+                f"share_vision={config.value_function_share_vision_encoder}"
+            )
 
         self.reset()
 
@@ -941,7 +1024,10 @@ class PI05Policy(PreTrainedPolicy):
                 print(f"Remapped {remap_count} state dict keys")
 
             # Load the remapped state dict into the model
-            missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=strict)
+            # Use strict=False when value function is enabled, since value_function.*
+            # keys won't be in a standard PI05 checkpoint
+            effective_strict = strict and not getattr(config, 'enable_value_function', False)
+            missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=effective_strict)
 
             if missing_keys:
                 print(f"Missing keys when loading state dict: {len(missing_keys)} keys")
@@ -1026,7 +1112,34 @@ class PI05Policy(PreTrainedPolicy):
         return fixed_state_dict
 
     def get_optim_params(self) -> dict:
-        return self.parameters()
+        """获取优化参数。
+
+        根据 training_mode 返回不同的参数:
+        - "policy": 返回策略网络参数
+        - "value_function": 返回 Value Function + Advantage Embedding 参数
+        """
+        if self.config.training_mode == "value_function":
+            return self.get_value_function_optim_params()
+        return self.model.parameters()
+
+    def get_value_function_optim_params(self):
+        """获取 Value Function 的优化参数（独立于策略网络）。
+
+        Value Function 独立训练，需要单独的优化器。
+
+        Returns:
+            params: Value Function 的可训练参数
+        Raises:
+            RuntimeError: 如果 Value Function 未启用
+        """
+        if self.value_function is None:
+            raise RuntimeError(
+                "Value Function 未启用。请设置 config.enable_value_function=True"
+            )
+        params = list(self.value_function.parameters())
+        if self.advantage_embedding is not None:
+            params += list(self.advantage_embedding.parameters())
+        return params
 
     def reset(self):
         """Reset internal state - called when environment resets."""
@@ -1138,8 +1251,16 @@ class PI05Policy(PreTrainedPolicy):
         return actions
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
-        """Run the batch through the model and compute the loss for training."""
+        """Run the batch through the model and compute the loss for training.
 
+        根据 training_mode 自动切换:
+        - "policy": 标准 flow matching 训练 (action MSE loss)
+        - "value_function": 仅训练 Value Function (MSE loss on target_value)
+        """
+        if self.config.training_mode == "value_function":
+            return self.forward_value(batch)
+
+        # 标准策略训练模式
         # Prepare inputs
         images, img_masks = self._preprocess_images(batch)
         tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
@@ -1161,3 +1282,126 @@ class PI05Policy(PreTrainedPolicy):
         }
 
         return loss, loss_dict
+
+    # ================================================================
+    # π*0.6 RECAP: Value Function 训练和 Advantage 计算方法
+    # ================================================================
+
+    def forward_value(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
+        """Value Function 前向传播，计算 MSE 损失。
+
+        用于独立训练 Value Function。
+
+        训练公式:
+            V^π(o_t, ℓ) ← argmin_V E[(V(o_t, ℓ) - target_value)²]
+
+        Args:
+            batch: 包含以下键的字典:
+                - 图像特征键 (observation.images.*)
+                - OBS_LANGUAGE_TOKENS: 语言 token
+                - OBS_LANGUAGE_ATTENTION_MASK: 语言注意力掩码
+                - "target_value": (B,) 目标值（累积奖励 Return）
+
+        Returns:
+            loss: MSE 损失标量
+            loss_dict: 包含损失详情的字典
+        """
+        if self.value_function is None:
+            raise RuntimeError(
+                "Value Function 未启用。请设置 config.enable_value_function=True"
+            )
+
+        # Prepare inputs
+        images, img_masks = self._preprocess_images(batch)
+        tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
+        target_values = batch["target_value"]  # (B, 1) 或 (B,) 目标累积奖励
+
+        # 确保 target_values 形状为 (B,)
+        if target_values.ndim > 1:
+            target_values = target_values.squeeze(-1)
+
+        # 确保在正确的设备上
+        device = next(self.value_function.parameters()).device
+        target_values = target_values.to(device=device, dtype=torch.float32)
+
+        # Compute value loss
+        value_loss, predicted_values = self.value_function.compute_value_loss(
+            images, img_masks, tokens, masks, target_values
+        )
+
+        loss_dict = {
+            "loss": value_loss.item(),  # 主损失键，用于训练循环日志
+            "value_loss": value_loss.item(),
+            "predicted_value_mean": predicted_values.mean().item(),
+            "predicted_value_std": predicted_values.std().item(),
+            "target_value_mean": target_values.mean().item(),
+        }
+
+        return value_loss, loss_dict
+
+    @torch.no_grad()
+    def predict_value(self, batch: dict[str, Tensor]) -> Tensor:
+        """使用 Value Function 预测状态价值 V(s, ℓ)。
+
+        Args:
+            batch: 包含图像和语言 token 的字典
+
+        Returns:
+            values: (B,) 预测的状态价值
+        """
+        if self.value_function is None:
+            raise RuntimeError(
+                "Value Function 未启用。请设置 config.enable_value_function=True"
+            )
+
+        self.value_function.eval()
+        images, img_masks = self._preprocess_images(batch)
+        tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
+        values = self.value_function(images, img_masks, tokens, masks)
+        return values
+
+    @torch.no_grad()
+    def compute_advantages(
+        self,
+        rewards: Tensor,
+        predicted_values: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        """计算 Advantage 并二值化。
+
+        Advantage 计算公式:
+            A(o_t, a_t, ℓ) = Return_t - V^π(o_t, ℓ)
+
+        二值化:
+            I_t = 1 if A > ε_ℓ, 0 otherwise
+
+        Args:
+            rewards: (B, T) 或 (B,) 奖励
+            predicted_values: (B, T) 或 (B,) Value Function 预测值
+
+        Returns:
+            advantages: 连续 Advantage 值
+            advantage_indicators: 二值化的 Advantage 指标 I_t ∈ {0, 1}
+        """
+        if self.advantage_computer is None:
+            raise RuntimeError(
+                "Advantage Computer 未初始化。请设置 config.enable_value_function=True"
+            )
+
+        # 计算 Return（如果输入是 rewards 序列）
+        if rewards.ndim >= 2:
+            returns = AdvantageComputer.compute_episode_returns(
+                rewards,
+                n_steps=self.config.advantage_n_steps,
+                values=predicted_values if self.config.advantage_n_steps is not None else None,
+            )
+        else:
+            returns = rewards  # 已经是 Return
+
+        # 计算连续 Advantage
+        advantages = self.advantage_computer.compute_advantages(returns, predicted_values)
+
+        # 计算阈值并二值化
+        self.advantage_computer.compute_threshold(advantages)
+        advantage_indicators = self.advantage_computer.binarize_advantages(advantages)
+
+        return advantages, advantage_indicators

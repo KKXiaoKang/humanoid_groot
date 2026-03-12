@@ -158,7 +158,11 @@ def _extract_complementary_data(batch: dict[str, Any]) -> dict[str, Any]:
     """
     Extract complementary data from a batch dictionary.
 
-    This includes padding flags, task description, and indices.
+    This includes padding flags, task description, indices, and any extra
+    dataset-specific fields (e.g., reward, target_value for Value Function training).
+
+    Keys that are already handled by batch_to_transition (observation.*, action,
+    next.reward, next.done, next.truncated, info) are excluded.
 
     Args:
         batch: The batch dictionary.
@@ -166,12 +170,22 @@ def _extract_complementary_data(batch: dict[str, Any]) -> dict[str, Any]:
     Returns:
         A dictionary with the extracted complementary data.
     """
-    pad_keys = {k: v for k, v in batch.items() if "_is_pad" in k}
-    task_key = {"task": batch["task"]} if "task" in batch else {}
-    index_key = {"index": batch["index"]} if "index" in batch else {}
-    task_index_key = {"task_index": batch["task_index"]} if "task_index" in batch else {}
+    # Keys that are already handled by batch_to_transition directly
+    _HANDLED_KEYS = {ACTION, REWARD, DONE, TRUNCATED, "info"}
 
-    return {**pad_keys, **task_key, **index_key, **task_index_key}
+    complementary = {}
+    for k, v in batch.items():
+        # Skip observation keys (handled separately)
+        if k.startswith(OBS_PREFIX):
+            continue
+        # Skip keys already extracted as top-level transition fields
+        if k in _HANDLED_KEYS:
+            continue
+        # Include everything else: _is_pad, task, index, task_index,
+        # and extra dataset fields like reward, target_value, episode_index, etc.
+        complementary[k] = v
+
+    return complementary
 
 
 def create_transition(
