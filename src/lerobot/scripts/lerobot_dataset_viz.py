@@ -171,6 +171,8 @@ def visualize_dataset(
 
             if REWARD in batch:
                 rr.log(REWARD, rr.Scalars(batch[REWARD][i].item()))
+            elif "reward" in batch:
+                rr.log("reward", rr.Scalars(batch["reward"][i].item()))
 
             if "next.success" in batch:
                 rr.log("next.success", rr.Scalars(batch["next.success"][i].item()))
