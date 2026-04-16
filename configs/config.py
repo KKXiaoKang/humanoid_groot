@@ -76,9 +76,10 @@ elif TASK_DATA_MODE == "VR":
 """
 # 默认action组件配置（depalletizer任务通常不需要cmd_pose）
 # ACTION_COMPONENTS = ["Left_arm", "Right_arm", "Left_claw", "Right_claw"]
-ACTION_COMPONENTS = ["Left_arm", "Right_arm", \
+ACTION_COMPONENTS = ["Left_arm", "Right_arm", 
                      "Left_claw", "Right_claw"]
-                     # "Left_claw", "Right_claw", "Cmd_pose_z", "Cmd_pose_pitch"]
+# ACTION_COMPONENTS = ["Left_arm", "Left_claw"]  # 单手机器人配置（只有左手）
+#                      # "Cmd_pose_z", "Cmd_pose_pitch"]
 
 # 验证：如果action包含cmd_pose，state必须包含com组件
 if ("Cmd_pose_z" in ACTION_COMPONENTS or "Cmd_pose_pitch" in ACTION_COMPONENTS):
@@ -107,7 +108,20 @@ if ("Cmd_pose_z" in ACTION_COMPONENTS or "Cmd_pose_pitch" in ACTION_COMPONENTS):
 # 默认相机组件配置（根据数据集实际情况调整）
 # 如果数据集中没有cam_chest，则只配置: ["cam_head", "cam_left", "cam_right"]
 CAMERA_COMPONENTS = ["cam_head", "cam_left", "cam_right"]  # 默认3相机配置（无chest）
+# CAMERA_COMPONENTS = ["cam_head", "cam_left"]  # 单手机器人配置（只有head和left相机）
+# CAMERA_COMPONENTS = ["cam_head", "cam_left_wrist", "cam_right_wrist"]  # head + 左右腕相机
 # CAMERA_COMPONENTS = ["cam_head", "cam_chest", "cam_left", "cam_right"]  # 完整4相机配置
+
+"""
+    当前控制模式：VR模式
+    * 使用 /joint_cmd 作为 action, kuavo_arm_traj和joint_cmd有偏差
+    * "NO_FAST_MODE"
+
+    当前控制模式：各类快速模式
+    * 使用 /kuavo_arm_traj作为action默认，此时 /kuavo_arm_traj和/joint_cmd是高度对齐的
+    * "FAST_MODE"
+"""
+CONTROL_COMMAND_MODE = "FAST_MODE"
 
 def euler_to_rotation_matrix_first_two_cols(roll, pitch, yaw):
     """
@@ -142,6 +156,8 @@ CAMERA_COMPONENT_DEFINITIONS = {
     "cam_chest": "chest_image",
     "cam_left": "left_shoulder_image",
     "cam_right": "right_shoulder_image",
+    "cam_left_wrist": "left_wrist_image",
+    "cam_right_wrist": "right_wrist_image",
 }
 
 # 相机名称到新key格式的映射（向后兼容）
@@ -150,15 +166,24 @@ CAMERA_KEY_MAPPING = {
     "chest_image": "cam_chest",
     "left_shoulder_image": "cam_left",
     "right_shoulder_image": "cam_right",
+    "left_wrist_image": "cam_left_wrist",
+    "right_wrist_image": "cam_right_wrist",
 }
 
-def get_camera_names(camera_components=None):
+# 数据集中图像尺寸（CHW），用于构建 LeRobot dataset features
+CAMERA_IMAGE_SHAPE = (3, 480, 640)
+
+# 用于跟踪是否已经打印过相机配置信息
+_camera_config_printed = False
+
+def get_camera_names(camera_components=None, print_config=True):
     """
     根据camera_components返回对应的相机名称列表
     
     Args:
         camera_components: 相机组件列表，如果为None则使用全局CAMERA_COMPONENTS配置
                          可选值: ["cam_head", "cam_chest", "cam_left", "cam_right"] 的组合
+        print_config: 是否打印配置信息（默认True，但只打印一次）
         
     Returns:
         list: 相机名称列表 (例如: ["image", "left_shoulder_image", "right_shoulder_image"])
@@ -169,6 +194,8 @@ def get_camera_names(camera_components=None):
       - ["cam_head", "cam_chest", "cam_left", "cam_right"]: 4相机 (完整配置)
       - ["cam_head"]: 单相机 (image)
     """
+    global _camera_config_printed
+    
     # 如果没有指定camera_components，使用全局配置
     if camera_components is None:
         camera_components = CAMERA_COMPONENTS
@@ -183,15 +210,20 @@ def get_camera_names(camera_components=None):
         if component in CAMERA_COMPONENT_DEFINITIONS:
             camera_names.append(CAMERA_COMPONENT_DEFINITIONS[component])
         else:
-            print(f"⚠️  Warning: Unknown camera component '{component}'. Available components: {list(CAMERA_COMPONENT_DEFINITIONS.keys())}")
+            if not _camera_config_printed:
+                print(f"⚠️  Warning: Unknown camera component '{component}'. Available components: {list(CAMERA_COMPONENT_DEFINITIONS.keys())}")
     
-    # 打印配置信息
-    if len(camera_names) > 0:
-        pass
-        # print(f"📷 Camera configuration: {camera_components} -> {len(camera_names)} cameras [{', '.join(camera_names)}]")
-    else:
-        # print(f"⚠️  Warning: No valid camera components selected. Using default single camera configuration.")
-        # 如果没有任何有效组件，返回默认的单相机配置
+    # 打印配置信息（只打印一次）
+    if print_config and not _camera_config_printed:
+        if len(camera_names) > 0:
+            print(f"📷 Camera configuration: {camera_components} -> {len(camera_names)} cameras [{', '.join(camera_names)}]")
+        else:
+            print(f"⚠️  Warning: No valid camera components selected. Using default single camera configuration.")
+            # 如果没有任何有效组件，返回默认的单相机配置
+            camera_names = [CAMERA_COMPONENT_DEFINITIONS["cam_head"]]
+        _camera_config_printed = True
+    elif len(camera_names) == 0:
+        # 如果没有任何有效组件，返回默认的单相机配置（但不打印）
         camera_names = [CAMERA_COMPONENT_DEFINITIONS["cam_head"]]
     
     return camera_names
@@ -520,17 +552,39 @@ def process_jointCmd(msg, data_dict, name, ts=None):
 
 def process_JointState(msg, data_dict, name, ts=None):
     """
-        deg2rad 手臂关节归一化
+    NO_FAST_MODE: /joint_cmd 的 joint_q 已是弧度，取 arm_begin~arm_end 共 14 维手臂关节。
+    FAST_MODE: /kuavo_arm_traj 的 position 为角度，需 deg2rad 后使用。
     """
-    joint_q = np.deg2rad(msg.position)  # Convert degrees to radians
-    
-    if ts is None:
-        ts = msg.header.stamp.to_sec()
+    if CONTROL_COMMAND_MODE == "FAST_MODE":
+        joint_q = np.deg2rad(msg.position)  # Convert degrees to radians
 
-    data_dict[name]['data'].append(list(joint_q))
-    data_dict[name]['ts'].append(ts)
+        if ts is None:
+            ts = msg.header.stamp.to_sec()
 
-    # print(f"JointState data: {joint_q}, Timestamp: {ts}")
+        data_dict[name]['data'].append(list(joint_q))
+        data_dict[name]['ts'].append(ts)
+    elif CONTROL_COMMAND_MODE == "NO_FAST_MODE":
+        # /joint_cmd 消息的 joint_q 为弧度，取手臂 14 维：5_wheel 索引 [4:18]，4_pro 索引 [12:26]
+        if ROBOT_VERSION == "5_wheel":
+            arm_begin = 4
+            arm_end = 17
+        elif ROBOT_VERSION == "4_pro":
+            arm_begin = 12
+            arm_end = 25
+        else:
+            arm_begin = 4
+            arm_end = 17
+            print(f"⚠️  Unknown ROBOT_VERSION '{ROBOT_VERSION}', using 5_wheel arm indices [4:18]")
+        if ts is None:
+            ts = msg.header.stamp.to_sec()
+        
+        # print(f"process_JointState --- 当前控制模式为{CONTROL_COMMAND_MODE} 使用/joint_cmd作为action")
+        data = msg.joint_q
+        data = list(data[arm_begin:arm_end + 1])
+        data_dict[name]['data'].append(data)
+        data_dict[name]['ts'].append(ts)
+    else:
+        raise ValueError(f"Invalid CONTROL_COMMAND_MODE: {CONTROL_COMMAND_MODE}")
 
 def process_Twist(msg, data_dict, name, ts=None):
     data = [
@@ -624,12 +678,19 @@ def process_lejuClawState(msg, data_dict, name, ts=None):
     Returns:
         2D向量: [left_claw_position, right_claw_position]
     """
+    # FIXME: 当前0205测试多机一致性时，将这批数据当中的左右手夹爪 state/command的索引互换一下，因为硬件can地址反了
+    fix_claw_index = False
+
     # 提取左右夹爪位置
     # msg.data.position[0] - 左夹爪状态
     # msg.data.position[1] - 右夹爪状态
     if len(msg.data.position) >= 2:
-        left_claw_state = msg.data.position[0]
-        right_claw_state = msg.data.position[1]
+        if not fix_claw_index:
+            left_claw_state = msg.data.position[0]
+            right_claw_state = msg.data.position[1]
+        else:
+            left_claw_state = msg.data.position[1]
+            right_claw_state = msg.data.position[0]
     else:
         # 如果数据不足，用零填充
         left_claw_state = 0.0
@@ -656,12 +717,19 @@ def process_lejuClawCommand(msg, data_dict, name, ts=None):
     Returns:
         2D向量: [left_claw_position, right_claw_position]
     """
+    # FIXME: 当前0205测试多机一致性时，将这批数据当中的左右手夹爪 state/command的索引互换一下，因为硬件can地址反了
+    fix_claw_index = False
+    
     # 提取左右夹爪位置
     # msg.data.position[0] - 左夹爪命令
     # msg.data.position[1] - 右夹爪命令
     if len(msg.data.position) >= 2:
-        left_claw_cmd = msg.data.position[0]
-        right_claw_cmd = msg.data.position[1]
+        if not fix_claw_index:
+            left_claw_cmd = msg.data.position[0]
+            right_claw_cmd = msg.data.position[1]
+        else:
+            left_claw_cmd = msg.data.position[1]
+            right_claw_cmd = msg.data.position[0]
     else:
         # 如果数据不足，用零填充
         left_claw_cmd = 0.0
@@ -727,6 +795,8 @@ def get_topic_info(action_mode="delta", task_data_mode="strategy", camera_compon
         "chest_image": "/chest_cam/color/image_raw",
         "left_shoulder_image": "/left_cam/color/image_raw",
         "right_shoulder_image": "/right_cam/color/image_raw",
+        "left_wrist_image": "/left_wrist_cam/color/image_raw",
+        "right_wrist_image": "/right_wrist_cam/color/image_raw",
     }
     
     # 统一转换为大写进行比较，支持大小写不敏感
@@ -744,7 +814,15 @@ def get_topic_info(action_mode="delta", task_data_mode="strategy", camera_compon
                 "shape": None,
             }
     
-    if task_data_mode_upper == "VR":
+    if task_data_mode_upper == "STRATEGY":
+        if CONTROL_COMMAND_MODE == "NO_FAST_MODE":
+            action_topic = "/joint_cmd"
+        elif CONTROL_COMMAND_MODE == "FAST_MODE":
+            action_topic = "/kuavo_arm_traj"
+        else:
+            raise ValueError(f"Invalid CONTROL_COMMAND_MODE: {CONTROL_COMMAND_MODE}")
+        
+        print(f"get_topic_info -- 前控制模式为{CONTROL_COMMAND_MODE} 使用{action_topic}作为action")
         print(f" =================== Set camera topic based on CAMERA_COMPONENTS: {CAMERA_COMPONENTS} ==================")
         return {
                     # ----------------------------------------- image ----------------------------------------------------- #
@@ -794,74 +872,7 @@ def get_topic_info(action_mode="delta", task_data_mode="strategy", camera_compon
 
                     # ----------------------------------------- action ----------------------------------------------------- #
                     "action_arm": {  # 手臂关节位置
-                        "topic": "/kuavo_arm_traj",
-                        "msg_process_fn": process_JointState,
-                        "shape": (14,),
-                    },
-
-                    "action_claw": {  # 夹爪命令
-                        "topic": "/leju_claw_command",
-                        "msg_process_fn": process_lejuClawCommand,
-                        "shape": (2,),
-                    },
-                    
-                    "action_cmd_pose": {  # cmd_pose命令 (z位置和pitch角度)
-                        "topic": "/cmd_pose",
-                        "msg_process_fn": process_cmd_pose,
-                        "shape": (2,),
-                    }
-        }
-    elif task_data_mode_upper == "STRATEGY":
-        print(f" =================== Set camera topic based on CAMERA_COMPONENTS: {CAMERA_COMPONENTS} ==================")
-        return {
-                    # ----------------------------------------- image ----------------------------------------------------- #
-                    # 根据CAMERA_COMPONENTS动态生成的相机配置
-                    **base_topic_config,
-
-                    # ----------------------------------------- obs ----------------------------------------------------- #
-                    # 手臂关节状态
-                    "dof_state": {
-                        "topic": "/sensors_data_raw",
-                        "msg_process_fn": process_sensorsData,
-                        "shape": None,
-                    },
-                    # 手臂关节速度
-                    "dof_state_vel": {
-                        "topic": "/sensors_data_raw",
-                        "msg_process_fn": process_sensorsData_vel,
-                        "shape": None,
-                    },
-                    
-                    # imu
-                    "ang_vel": {
-                        "topic": "/state_estimate/imu_data_filtered/angularVel",
-                        "msg_process_fn": process_MultiArray,
-                        "shape": None,
-                    },
-
-                    "lin_acc": {
-                        "topic": "/state_estimate/imu_data_filtered/linearAccel",
-                        "msg_process_fn": process_MultiArray,
-                        "shape": None,
-                    },
-
-                    # 夹爪状态
-                    "claw_state": {
-                        "topic": "/leju_claw_state",
-                        "msg_process_fn": process_lejuClawState,
-                        "shape": (2,),
-                    },
-                    
-                    # 质心z位置和pitch角度（从/humanoid_wbc_observation获取）
-                    "com_z_pitch": {
-                        "topic": "/humanoid_wbc_observation",
-                        "msg_process_fn": process_wbc_observation_z_pitch,
-                        "shape": (2,),
-                    },
-
-                    # ----------------------------------------- action ----------------------------------------------------- #
-                    "action_arm": {  # 手臂关节位置
-                        "topic": "/mm_kuavo_arm_traj",
+                        "topic": action_topic,
                         "msg_process_fn": process_JointState,
                         "shape": (14,),
                     },

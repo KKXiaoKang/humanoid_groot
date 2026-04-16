@@ -1296,8 +1296,9 @@ import time
 import argparse
 # rospy 已在文件开头导入
 from std_msgs.msg import Float64MultiArray
-from kuavo_humanoid_sdk.kuavo_strategy_pytree.common.robot_sdk import RobotSDK
+# from kuavo_humanoid_sdk.kuavo_strategy_pytree.common.robot_sdk import RobotSDK
 from kuavo_msgs.srv import (changeArmCtrlMode, changeArmCtrlModeRequest)
+from kuavo_msgs.msg import robotHeadMotionData
 
 # Default MODEL_ACTION_DT - can be overridden by command line argument
 # This represents the time interval between predicted actions during training
@@ -1533,7 +1534,7 @@ def replay(lerobot_dataset_path, episode, control_arm=True, control_claw=True, i
         claw_lock_count_threshold=claw_lock_count_threshold,
         claw_locked_value=claw_locked_value
     )
-    env.obs_buffer.wait_buffer_ready()
+    # env.obs_buffer.wait_buffer_ready()
     time.sleep(1)
     
     # 重置夹爪锁定状态（确保replay开始时状态干净）
@@ -1568,63 +1569,62 @@ def replay(lerobot_dataset_path, episode, control_arm=True, control_claw=True, i
     ik_failures_right = 0
     total_frames = ep_num_frames
 
-    # 只遍历指定episode的frame范围
+    SOURCE_DT = 0.1  # 数据集采集频率 10Hz
+    CONTROL_FREQ = 100.0  # 目标控制频率
+    CONTROL_DT = 1.0 / CONTROL_FREQ
+
+    # 先把整个episode的action全部提取并转换为16D joint space
+    all_joint_actions = []
     for frame_offset in range(ep_num_frames):
-        idx = ep_start_idx + frame_offset  # 全局索引
+        idx = ep_start_idx + frame_offset
         action = actions[idx]["action"]
-        
-        # 转换为numpy数组
-        if isinstance(action, torch.Tensor):
-            action_np = action.cpu().numpy()
-        else:
-            action_np = np.array(action)
-        
-        # 如果是20维EEF action，转换为16维joint action
+        action_np = action.cpu().numpy() if isinstance(action, torch.Tensor) else np.array(action)
+
         if is_eef_mode and len(action_np) == 20:
             try:
                 joint_action = convert_eef_action_to_joint_action(action_np, model_type=ik_model_type)
-                
-                # 检查IK是否成功（如果返回全零，可能是IK失败）
                 if np.allclose(joint_action[:7], 0) and not np.allclose(action_np[0:3], 0):
                     ik_failures_left += 1
-                    if ik_failures_left <= 5:  # 只打印前5次失败
-                        rospy.logwarn(f"[REPLAY] Episode {episode}, Frame {frame_offset} (global {idx}): Left arm IK may have failed (returned zeros)")
                 if np.allclose(joint_action[7:14], 0) and not np.allclose(action_np[9:12], 0):
                     ik_failures_right += 1
-                    if ik_failures_right <= 5:  # 只打印前5次失败
-                        rospy.logwarn(f"[REPLAY] Episode {episode}, Frame {frame_offset} (global {idx}): Right arm IK may have failed (returned zeros)")
-                
-                action_to_execute = joint_action
+                all_joint_actions.append(joint_action)
             except Exception as e:
-                rospy.logerr(f"[REPLAY] Episode {episode}, Frame {frame_offset} (global {idx}): Failed to convert EEF action to joint action: {e}")
-                # 跳过这个action
+                rospy.logerr(f"[REPLAY] Frame {frame_offset}: EEF->Joint conversion failed: {e}, using previous")
+                if all_joint_actions:
+                    all_joint_actions.append(all_joint_actions[-1].copy())
                 continue
         else:
-            # 16维joint action，直接使用
-            action_to_execute = action_np
-        
-        # 确保action是2D数组 (1, action_dim)
-        if action_to_execute.ndim == 1:
-            action_to_execute = np.expand_dims(action_to_execute, axis=0)
-        
-        # 验证action维度
-        if action_to_execute.shape[1] != 16:
-            rospy.logwarn(f"[REPLAY] Episode {episode}, Frame {frame_offset} (global {idx}): Unexpected action dimension {action_to_execute.shape[1]}, expected 16. Skipping.")
-            continue
+            all_joint_actions.append(action_np)
 
-        env.exec_actions(actions=action_to_execute,
-                         control_arm=control_arm,
-                         control_claw=control_claw,
-                         )
-        
-        # 按照10Hz频率执行（每个action之间等待0.1秒，匹配数据集的时间间隔）
-        # 注意：第一个frame不需要等待（因为还没有执行过action）
-        if frame_offset > 0:
-            time.sleep(0.2)  # 10Hz = 0.1秒间隔
-        
-        # 打印进度（每100帧，显示episode内的frame索引）
-        if (frame_offset + 1) % 100 == 0 or frame_offset == ep_num_frames - 1:
-            rospy.loginfo(f"[REPLAY] Episode {episode} Progress: {frame_offset + 1}/{ep_num_frames} frames ({100.0 * (frame_offset + 1) / ep_num_frames:.1f}%)")
+    if len(all_joint_actions) == 0:
+        rospy.logerr("[REPLAY] No valid actions found!")
+        return
+
+    action_chunk = np.array(all_joint_actions)  # (N, 16)
+    rospy.loginfo(f"[REPLAY] Loaded {action_chunk.shape[0]} actions, now interpolating to {CONTROL_FREQ}Hz...")
+
+    # 插值：arm关节线性插值，claw做zero-order hold（与实时推理一致）
+    resampled = resample_chunk_with_claw_hold(
+        action_chunk,
+        previous_action=None,
+        control_frequency=CONTROL_FREQ,
+        source_dt=SOURCE_DT,
+        arm_dims=slice(0, 14),
+        claw_dims=slice(14, 16),
+    )
+    rospy.loginfo(f"[REPLAY] Interpolated: {action_chunk.shape[0]} @ {1/SOURCE_DT:.0f}Hz -> {resampled.shape[0]} @ {CONTROL_FREQ:.0f}Hz")
+
+    # 逐帧发布（100Hz）
+    for i in range(resampled.shape[0]):
+        env.exec_actions(
+            actions=resampled[i],
+            control_arm=control_arm,
+            control_claw=control_claw,
+        )
+        time.sleep(CONTROL_DT)
+
+        if (i + 1) % 1000 == 0 or i == resampled.shape[0] - 1:
+            rospy.loginfo(f"[REPLAY] Progress: {i + 1}/{resampled.shape[0]} steps ({100.0 * (i + 1) / resampled.shape[0]:.1f}%)")
     
     # 打印最终统计信息
     rospy.loginfo(f"[REPLAY] ✅ Replay completed!")
@@ -2079,6 +2079,8 @@ def load_model_and_env(ckpt_path, model_type, action_chunk_size=50, enable_gui=F
         if PINOCCHIO_AVAILABLE:
             # URDF路径（需要根据实际情况调整）
             urdf_path = "/home/lab/kuavo-manip/lerobot_datasets/utils/biped_s60_only_arm.urdf"
+            # # FIXME
+            # urdf_path = "/home/lab/kuavo-manip/lerobot_datasets/utils/biped_s45_only_arm.urdf"
             if os.path.exists(urdf_path):
                 try:
                     fk_getter = PinocchioFK(
@@ -2271,7 +2273,7 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
     
     # ---------- 2. 模型推理（实时模式） ----------------------
     # Real-time environment evaluation loop
-    robot_sdk.control.set_external_control_arm_mode()
+    srv_change_arm_ctrl_mode(2)  
     time.sleep(1)
     resampled_action_queue: deque[np.ndarray] = deque()
     last_executed_action: Optional[np.ndarray] = None
@@ -2283,18 +2285,27 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
         #     rospy.loginfo("Loading and replaying initial trajectory from bag file (first inference only)...")
         #     # FIXME:第一帧的位置4pro和5wheel不一样，需要处理
         if ROBOT_VERSION == "4_pro":
-            load_and_replay_init_trajectory(
-                bag_path=init_traj_bag_path,
-                env=env,
-                control_arm=control_arm,
-                control_claw=control_claw
-            )
-            rospy.logwarn(f"Initial trajectory bag file not found: {init_traj_bag_path}")
-            rospy.loginfo("4_pro robot Initial trajectory replay completed. Starting model inference...")
-            time.sleep(1.0)
+            # cur_dir = os.path.dirname(os.path.abspath(__file__))
+            # final_reset_arm(
+            #     json_path=os.path.join(cur_dir, 'utils/start_arm_traj_claw_isaac_sim_4pro.json'), 
+            #     env=env,
+            #     control_arm=control_arm,
+            #     control_claw=control_claw
+            # )
+            pass
+            # load_and_replay_init_trajectory(
+            #     bag_path=init_traj_bag_path,
+            #     env=env,
+            #     control_arm=control_arm,
+            #     control_claw=control_claw
+            # )
+            # rospy.logwarn(f"Initial trajectory bag file not found: {init_traj_bag_path}")
+            # rospy.loginfo("4_pro robot Initial trajectory replay completed. Starting model inference...")
+            # time.sleep(3.0)
         elif ROBOT_VERSION == "5_wheel":
             cur_dir = os.path.dirname(os.path.abspath(__file__))
             final_reset_arm(
+                # json_path=os.path.join(cur_dir, 'utils/real_pick_claw_s62_init_joint_q.json'), 
                 json_path=os.path.join(cur_dir, 'utils/start_arm_traj_claw.json'), 
                 env=env,
                 control_arm=control_arm,
@@ -2519,11 +2530,41 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
                     single_action = pred_actions[:, i, :]
                     # 使用 postprocessor 进行反归一化
                     processed_action = postprocessor(single_action)
+                    if i == 0 and step_counter == 0:
+                        rospy.loginfo(
+                            f"[DEBUG_UNNORM] Input to postprocessor[18:20]={single_action[0, 18:20].tolist()}, "
+                            f"Output[18:20]={processed_action[0, 18:20].tolist()}, "
+                            f"in_dtype={single_action.dtype}, out_dtype={processed_action.dtype}"
+                        )
+                        pp_step = postprocessor.steps[0]
+                        rospy.loginfo(
+                            f"[DEBUG_UNNORM] PostprocessorStep: normalize_min_max={pp_step.normalize_min_max}, "
+                            f"stats_present={pp_step.stats is not None}, "
+                            f"action_space_type={getattr(pp_step, 'action_space_type', 'N/A')}, "
+                            f"action_component_indices={getattr(pp_step, 'action_component_indices', None) is not None}"
+                        )
+                        if pp_step.stats is not None:
+                            import torch as _t
+                            a_stats = pp_step.stats.get("action", {})
+                            if a_stats:
+                                _min = _t.as_tensor(a_stats.get("min", []))
+                                _max = _t.as_tensor(a_stats.get("max", []))
+                                if _min.numel() >= 20:
+                                    rospy.loginfo(f"[DEBUG_UNNORM] stats.action.min[18:20]={_min[18:20].tolist()}, max[18:20]={_max[18:20].tolist()}")
+                                else:
+                                    rospy.loginfo(f"[DEBUG_UNNORM] stats.action.min has {_min.numel()} elements (expected >=20)")
                     processed_actions.append(processed_action)
                 
                 # 堆叠回 (B, chunk_size, action_dim)，然后转换为 numpy
                 pred_actions_unnorm = torch.stack(processed_actions, dim=1)  # (B, chunk_size, action_dim)
                 action_chunk = pred_actions_unnorm[0].cpu().numpy()  # (chunk_size, action_dim)
+                
+                # DEBUG: 检查 postprocessor 输出的夹爪值是否已经反归一化
+                if action_chunk.shape[1] == 20:
+                    rospy.loginfo(
+                        f"[DEBUG_CLAW] After postprocessor: claw[18:20] = {action_chunk[0, 18:20]} "
+                        f"(should be ~[0-50, 0-25] if unnormalized, or ~[-1,1] if still normalized)"
+                    )
                 
                 # 对于 relative action mode (Delta eef)，需要将 relative action 转换为 absolute pose
                 # 注意：reference pose 已经在上面准备 observation 时计算好了（使用相同的 get_obs 数据）
@@ -2656,6 +2697,7 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
                             original_eef_action_chunk = action_chunk.copy()
                         
                         rospy.loginfo(f"   EEF mode detected: Converting action_chunk from 20D EEF space to 16D joint space")
+                        rospy.loginfo(f"   [DEBUG_CLAW] Before EEF->Joint: eef_action_chunk[0][18:20] = {action_chunk[0, 18:20]}")
                         # 将整个 action_chunk 转换为 joint space
                         joint_action_chunk_list = []
                         for eef_action in action_chunk:
@@ -2664,6 +2706,7 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
                         action_chunk = np.array(joint_action_chunk_list)  # (chunk_size, 16)
                         action_dim_from_chunk = 16  # 更新 action_dim
                         rospy.loginfo(f"   ✅ Converted action_chunk to joint space: {action_chunk.shape}")
+                        rospy.loginfo(f"   [DEBUG_CLAW] After EEF->Joint: joint_action_chunk[0][14:16] = {action_chunk[0, 14:16]}")
                     
                     # 现在确定 arm 和 claw 维度（基于转换后的 action_chunk）
                     action_dim = action_dim_from_chunk
@@ -2765,12 +2808,14 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
                             original_eef_action_chunk = action_chunk.copy()
                         
                         rospy.loginfo(f"   EEF mode: Converting action_chunk from 20D EEF space to 16D joint space")
+                        rospy.loginfo(f"   [DEBUG_CLAW] Before EEF->Joint (non-first): eef_chunk[0][18:20] = {action_chunk[0, 18:20]}")
                         joint_action_chunk_list = []
                         for eef_action in action_chunk:
                             joint_action = convert_eef_action_to_joint_action(eef_action, model_type=ik_model_type)
                             joint_action_chunk_list.append(joint_action)
                         action_chunk = np.array(joint_action_chunk_list)  # (chunk_size, 16)
                         rospy.loginfo(f"   ✅ Converted action_chunk to joint space: {action_chunk.shape}")
+                        rospy.loginfo(f"   [DEBUG_CLAW] After EEF->Joint (non-first): joint_chunk[0][14:16] = {action_chunk[0, 14:16]}")
                         
                         # 发布chunk第一个action的IK->FK round-trip验证pose（用于记录chunk开始时的round-trip）
                         if eef_visualizer is not None and fk_getter is not None and action_chunk.shape[0] > 0:
@@ -3142,6 +3187,12 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
                             else:
                                 rospy.logwarn_throttle(5.0, f"[LOCK_RIGHT_ARM] Expected 7 values, got {len(right_arm_lock_values)}. Skipping lock.")
                     
+                    if control_claw and len(action_to_execute) >= 16:
+                        rospy.loginfo_throttle(
+                            0.5,
+                            "[CLAW_CMD] left=%.4f right=%.4f (传入 env.exec_actions；若未 --disable-claw-lock，实发可能经 _apply_claw_lock 调整)"
+                            % (float(action_to_execute[14]), float(action_to_execute[15])),
+                        )
                     env.exec_actions(actions=action_to_execute,
                                      control_arm=control_arm,
                                      control_claw=control_claw,
@@ -3525,7 +3576,7 @@ def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chun
                 # 第一次推理开始时使用bag文件，后续推理开始时跳过bag文件（在run_inference_loop中处理）
                 rospy.loginfo("Resetting arm position using JSON file...")
                 final_reset_arm(
-                    json_path=os.path.join(cur_dir, 'utils/initial_arm_traj_claw.json'), 
+                    json_path=os.path.join(cur_dir, 'utils/start_arm_traj_claw.json'), 
                     env=env,
                     control_arm=control_arm,
                     control_claw=control_claw
@@ -3561,14 +3612,44 @@ def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chun
     if enable_gui:
         cv2.destroyAllWindows()
 
+def srv_change_arm_ctrl_mode(mode: int)->bool:
+    try:
+        # robot_type: 0=双足, 1=轮臂
+        # robot_type = rospy.get_param('/robot_type', 0)
+        # service_name = '/wheel_arm_change_arm_ctrl_mode' if robot_type == 1 else '/change_arm_ctrl_mode'
+        service_name = '/change_arm_ctrl_mode'
+        rospy.wait_for_service(service_name, timeout=2.0)
+        change_arm_ctrl_mode_srv = rospy.ServiceProxy(service_name, changeArmCtrlMode)
+        req = changeArmCtrlModeRequest()
+        req.control_mode = mode
+        resp = change_arm_ctrl_mode_srv(req)
+        return resp.result
+    except rospy.ServiceException as e:
+        rospy.logerr(f"Service call failed: {e}")
+    except Exception as e:
+        rospy.logerr(f"[Error] change arm ctrl mode: {e}")
+    return False
 
-
+def pub_control_robot_head(yaw:float, pitch:float)->bool:
+    pub_ctrl_robot_head = rospy.Publisher('/robot_head_motion_data', robotHeadMotionData, queue_size=10)
+    try :
+        msg = robotHeadMotionData()
+        msg.joint_data = [yaw, pitch]
+        pub_ctrl_robot_head.publish(msg)
+        print(f"publish robot head: {msg}")
+        return True
+    except Exception as e:
+        rospy.logerr(f"[Error] publish robot head: {e}")
+        return False
 
 if __name__ == '__main__':
     # 机器人低头
-    robot_sdk = RobotSDK()
-    robot_sdk.control.control_head(0, np.deg2rad(20))
-    robot_sdk.control.set_external_control_arm_mode()  # 切换手臂到外部控制模式
+    rospy.init_node('eval_depalletize_camera_model_reload_limit_vel_select_eef_claw', anonymous=True)
+
+    print("头部复位到 [0, 20] 度...")
+    pub_control_robot_head(0, 20)
+    time.sleep(0.5)
+    srv_change_arm_ctrl_mode(2)    # 切换手臂到外部控制模式
     print(" ==== 机器人头部俯仰调节角度: 20 成功 ==== ")
     print(" ==== 切换手臂到外部控制模式成功 ==== ")
     
@@ -3619,7 +3700,7 @@ if __name__ == '__main__':
                              'Note: This reduces the number of executed actions but does not change velocity limits.')
     parser.add_argument('--disable-claw-lock', action='store_true',
                         help='Disable claw lock mechanism completely. If set, claw will never be locked regardless of values.')
-    parser.add_argument('--claw-lock-threshold', type=float, default=50.0,
+    parser.add_argument('--claw-lock-threshold', type=float, default=30.0,
                         help='Claw value threshold to trigger lock mechanism. If claw command exceeds this value '
                              'continuously, it will trigger locking. Default: 50.0. Ignored if --disable-claw-lock is set.')
     parser.add_argument('--claw-lock-count-threshold', type=int, default=1,

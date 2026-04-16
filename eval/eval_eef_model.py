@@ -446,6 +446,24 @@ class RTCDemoConfig:
         },
     )
 
+    # Claw lock configuration
+    disable_claw_lock: bool = field(
+        default=False,
+        metadata={"help": "Disable claw lock mechanism completely. If set, claw will never be locked."},
+    )
+    claw_lock_threshold: float = field(
+        default=50.0,
+        metadata={"help": "Claw value threshold to trigger lock. Default: 50.0."},
+    )
+    claw_lock_count_threshold: int = field(
+        default=5,
+        metadata={"help": "Consecutive high claw values required to lock. Default: 5."},
+    )
+    claw_locked_value: float = field(
+        default=90.0,
+        metadata={"help": "Claw value when locked (fully closed). Default: 90.0."},
+    )
+
 
 def is_image_key(k: str) -> bool:
     return k.startswith(OBS_IMAGES)
@@ -1001,7 +1019,8 @@ def get_actions(
                     device=postprocessed_actions.device,
                 )
 
-                episode_state.last_executed_action = postprocessed_resampled[-get_actions_threshold].clone()
+                bridge_idx = max(len(postprocessed_resampled) - get_actions_threshold, 0) if get_actions_threshold > 0 else len(postprocessed_resampled) - 1
+                episode_state.last_executed_action = postprocessed_resampled[bridge_idx].clone()
                 action_queue.merge(
                     original_actions, postprocessed_resampled, new_delay, action_index_before_inference
                 )
@@ -1277,7 +1296,17 @@ def demo_cli(cfg: RTCDemoConfig):
     signal_handler = ProcessSignalHandler(use_threads=True, display_pid=False)
     shutdown_event = signal_handler.shutdown_event
 
-    env = GrabBoxMpcEnv()
+    claw_lock_threshold = float('inf') if cfg.disable_claw_lock else cfg.claw_lock_threshold
+    env = GrabBoxMpcEnv(
+        claw_lock_threshold=claw_lock_threshold,
+        claw_lock_count_threshold=cfg.claw_lock_count_threshold,
+        claw_locked_value=cfg.claw_locked_value,
+    )
+    if cfg.disable_claw_lock:
+        logger.info("[MAIN] Claw lock mechanism: DISABLED")
+    else:
+        logger.info(f"[MAIN] Claw lock mechanism: threshold={cfg.claw_lock_threshold}, "
+                     f"count_threshold={cfg.claw_lock_count_threshold}, locked_value={cfg.claw_locked_value}")
     robot_sdk = RobotSDK()
 
     # 初始化手臂位置

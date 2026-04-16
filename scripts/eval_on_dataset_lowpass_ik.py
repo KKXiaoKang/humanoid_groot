@@ -35,21 +35,31 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.processor.converters import policy_action_to_transition
 
 # 导入配置模块（如果存在）
-try:
-    from configs.config import topic_info, TASK_DATA_MODE, get_camera_observation_key, get_camera_names, CAMERA_COMPONENTS, action_names, CAMERA_KEY_MAPPING
-    CONFIG_AVAILABLE = True
-except ImportError:
-    print("⚠️  Warning: configs.config not available. Using defaults.")
-    CONFIG_AVAILABLE = False
-    topic_info = {}
-    TASK_DATA_MODE = "unknown"
-    CAMERA_COMPONENTS = []
-    action_names = []
-    CAMERA_KEY_MAPPING = {}
-    def get_camera_observation_key(camera_name, use_image_features=False):
-        return f"observation.images.{camera_name}" if use_image_features else f"observation.images.{camera_name}"
-    def get_camera_names(camera_components=None):
-        return []
+from configs.config import topic_info, TASK_DATA_MODE, get_camera_observation_key, get_camera_names, CAMERA_COMPONENTS, action_names, CAMERA_KEY_MAPPING
+CONFIG_AVAILABLE = True
+
+DEFAULT_CAMERA_COMPONENTS = ["cam_head", "cam_left_wrist", "cam_right_wrist"]
+
+
+def _resolve_camera_components() -> list[str]:
+    """优先使用config中的CAMERA_COMPONENTS，未配置时回退到默认三相机。"""
+    if CONFIG_AVAILABLE and CAMERA_COMPONENTS:
+        return list(CAMERA_COMPONENTS)
+    return DEFAULT_CAMERA_COMPONENTS.copy()
+
+
+def _candidate_camera_obs_keys(camera_component: str) -> list[str]:
+    """
+    生成相机观测候选key，优先新格式 observation.images.cam_xxx，
+    同时兼容旧格式 observation.images.image / left_wrist_image / right_wrist_image。
+    """
+    candidate_keys = [f"observation.images.{camera_component}"]
+    if CONFIG_AVAILABLE:
+        camera_name = get_camera_names([camera_component], print_config=False)[0]
+        candidate_keys.append(get_camera_observation_key(camera_name, use_image_features=False))
+        candidate_keys.append(f"observation.images.{camera_name}")
+    return list(dict.fromkeys(candidate_keys))
+
 
 # 插值与低通滤波常量
 MODEL_ACTION_DT = 0.1
@@ -701,11 +711,11 @@ def eval_on_dataset(ckpt_path,
     
     # 打印相机配置信息
     if CONFIG_AVAILABLE:
-        # 使用CAMERA_COMPONENTS来获取相机名称
-        camera_names = get_camera_names(CAMERA_COMPONENTS)
+        camera_components = _resolve_camera_components()
+        camera_names = get_camera_names(camera_components)
         camera_config = {name: info for name, info in topic_info.items() if 'image' in name}
         print(f"\n📷 Camera Configuration (TASK_DATA_MODE: {TASK_DATA_MODE}):")
-        print(f"   CAMERA_COMPONENTS: {CAMERA_COMPONENTS}")
+        print(f"   CAMERA_COMPONENTS: {camera_components}")
         print(f"   Camera names: {camera_names}")
         print(f"   Detected {len(camera_config)} cameras in topic_info: {list(camera_config.keys())}")
     else:
@@ -974,19 +984,20 @@ def eval_on_dataset(ckpt_path,
         # 添加图像观测（根据CAMERA_COMPONENTS配置）
         if CONFIG_AVAILABLE:
             # 使用CAMERA_COMPONENTS来明确指定需要哪些相机
-            camera_names = get_camera_names(CAMERA_COMPONENTS)
-            for camera_name in camera_names:
-                # 使用get_camera_observation_key获取正确的观测键名
-                obs_key = get_camera_observation_key(camera_name, use_image_features=False)
-                if obs_key in batch:
-                    observation[obs_key] = batch[obs_key]
-                else:
-                    # 如果找不到，尝试直接使用相机名称作为键（向后兼容）
-                    fallback_key = f"observation.images.{camera_name}"
-                    if fallback_key in batch:
-                        observation[fallback_key] = batch[fallback_key]
-                    elif data_step == 0:
-                        print(f"⚠️  Warning: Camera observation key '{obs_key}' not found in batch. Available keys: {[k for k in batch.keys() if 'image' in k.lower()]}")
+            camera_components = _resolve_camera_components()
+            for camera_component in camera_components:
+                selected_key = None
+                for obs_key in _candidate_camera_obs_keys(camera_component):
+                    if obs_key in batch:
+                        selected_key = obs_key
+                        observation[obs_key] = batch[obs_key]
+                        break
+                if selected_key is None and data_step == 0:
+                    print(
+                        f"⚠️  Warning: Camera component '{camera_component}' not found in batch. "
+                        f"Tried keys: {_candidate_camera_obs_keys(camera_component)}. "
+                        f"Available image keys: {[k for k in batch.keys() if 'image' in k.lower()]}"
+                    )
         else:
             # 如果没有config，回退到原来的方法：添加所有图像观测
             for key in batch.keys():
@@ -1287,23 +1298,22 @@ def eval_on_dataset(ckpt_path,
         if vizer is not None:
             # 显示图像 - 动态查找可用的相机图像
             if CONFIG_AVAILABLE:
-                camera_names = get_camera_names(CAMERA_COMPONENTS)
-                for camera_name in camera_names:
-                    obs_key = get_camera_observation_key(camera_name, use_image_features=False)
-                    fallback_key = f"observation.images.{camera_name}"
-                    
-                    # 优先使用新格式，如果不存在则使用旧格式
-                    key_to_use = obs_key if obs_key in batch else fallback_key
-                    if key_to_use in batch:
+                camera_components = _resolve_camera_components()
+                for camera_component in camera_components:
+                    key_to_use = None
+                    for candidate_key in _candidate_camera_obs_keys(camera_component):
+                        if candidate_key in batch:
+                            key_to_use = candidate_key
+                            break
+
+                    if key_to_use is not None:
                         img = batch[key_to_use][0]  # (C, H, W)
-                        # 从obs_key中提取组件名（如 observation.images.cam_head -> cam_head）
-                        # 或者从camera_name映射到组件名
-                        if obs_key in batch:
-                            # 使用新格式：从 observation.images.cam_head 提取 cam_head
-                            display_name = obs_key.replace('observation.images.', '')
+                        # 优先保持cam_*命名，保证默认展示 cam_head/cam_left_wrist/cam_right_wrist
+                        if key_to_use.startswith("observation.images.cam_"):
+                            display_name = key_to_use.replace("observation.images.", "")
                         else:
-                            # 使用旧格式：从 camera_name 映射到组件名
-                            display_name = CAMERA_KEY_MAPPING.get(camera_name, camera_name)
+                            camera_name = key_to_use.replace("observation.images.", "")
+                            display_name = CAMERA_KEY_MAPPING.get(camera_name, camera_component)
                         vizer.show_img(
                             name=f"images.{display_name}",
                             image_data=img.to("cpu"),
