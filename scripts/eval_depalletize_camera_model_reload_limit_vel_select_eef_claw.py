@@ -1297,7 +1297,7 @@ import argparse
 # rospy 已在文件开头导入
 from std_msgs.msg import Float64MultiArray
 # from kuavo_humanoid_sdk.kuavo_strategy_pytree.common.robot_sdk import RobotSDK
-from kuavo_msgs.srv import (changeArmCtrlMode, changeArmCtrlModeRequest)
+from kuavo_msgs.srv import (changeArmCtrlMode, changeArmCtrlModeRequest, changeLbQuickModeSrv, changeLbQuickModeSrvRequest )
 from kuavo_msgs.msg import robotHeadMotionData
 
 # Default MODEL_ACTION_DT - can be overridden by command line argument
@@ -2147,6 +2147,24 @@ def load_model_and_env(ckpt_path, model_type, action_chunk_size=50, enable_gui=F
         'fk_getter': fk_getter,
         'eef_visualizer': eef_visualizer,
     }
+def set_arm_quick_mode_s62(enable: int) -> bool:
+    """开关手臂快速模式"""
+    rospy.loginfo(f"call set_arm_quick_mode:{enable}")
+    try:
+        rospy.wait_for_service('/enable_lb_arm_quick_mode', timeout=5.0)
+        cli = rospy.ServiceProxy('/enable_lb_arm_quick_mode', changeLbQuickModeSrv)
+        req = changeLbQuickModeSrvRequest()
+        req.quickMode = enable
+        resp = cli(req)
+        if resp.success:
+            rospy.loginfo(f"Successfully {'enabled' if enable else 'disabled'} arm quick mode")
+            return True
+        else:
+            rospy.logwarn(f"Failed to {'enable' if enable else 'disable'} arm quick mode")
+            return False
+    except rospy.ServiceException as e:
+        rospy.logerr(f"Service call failed: {e}")
+        return False
 
 def set_arm_quick_mode(enable: bool) -> bool:
     """开关手臂快速模式"""
@@ -2171,7 +2189,8 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
                        is_first_inference=True, chunk_start=None, chunk_end=None, model_action_dt=None,
                        sync_mode=False, max_joint_velocity=None, constant_velocity=False, action_stride=1,
                        eef_info=None, ik_model_type='60', pause_before_chunk=False,
-                       use_predicted_as_reference=False, lock_right_arm=False, right_arm_lock_values=None):
+                       use_predicted_as_reference=False, lock_right_arm=False, right_arm_lock_values=None,
+                       lock_left_arm=False, left_arm_lock_values=None):
     """
     运行推理循环（可以多次调用，每次调用开始新的推理会话）
     
@@ -2204,6 +2223,8 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
                                    默认False（使用机器人实际状态作为reference，与训练时一致）。
         lock_right_arm: 是否锁定右手关节。如果True，在执行action时，右手关节（索引7-13）将被设置为固定值。
         right_arm_lock_values: 右手关节锁定值（7个值的numpy数组）。如果为None且lock_right_arm=True，将从JSON文件加载。
+        lock_left_arm: 是否锁定左手关节。如果True，在执行action时，左手关节（索引0-6）将被设置为固定值。
+        left_arm_lock_values: 左手关节锁定值（7个值的numpy数组）。如果为None且lock_left_arm=True，将从JSON文件加载。
     
     Returns:
         bool: True表示正常退出（按q），False表示被中断（Ctrl+C）
@@ -2251,6 +2272,11 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
             print(f"🔒 Right arm lock: ENABLED (right arm joints will be locked to: {right_arm_lock_values})")
         else:
             print(f"🔒 Right arm lock: ENABLED (but lock values not loaded, will be skipped)")
+    if lock_left_arm:
+        if left_arm_lock_values is not None:
+            print(f"🔒 Left arm lock: ENABLED (left arm joints will be locked to: {left_arm_lock_values})")
+        else:
+            print(f"🔒 Left arm lock: ENABLED (but lock values not loaded, will be skipped)")
     print(f"📝 Task description: '{task_description}'")
     print("="*80 + "\n")
     
@@ -2306,7 +2332,7 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
             cur_dir = os.path.dirname(os.path.abspath(__file__))
             final_reset_arm(
                 # json_path=os.path.join(cur_dir, 'utils/real_pick_claw_s62_init_joint_q.json'), 
-                json_path=os.path.join(cur_dir, 'utils/start_arm_traj_claw.json'), 
+                json_path=os.path.join(cur_dir, 'utils/start_arm_traj_0417_s62.json'), 
                 env=env,
                 control_arm=control_arm,
                 control_claw=control_claw
@@ -2328,8 +2354,9 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
         direct_to_wbc(1)
         function_key = "direct_to_wbc"
     elif ROBOT_VERSION == "5_wheel":
-        set_arm_quick_mode(True)
-        function_key = "set_arm_quick_mode"  
+        # set_arm_quick_mode(True)
+        set_arm_quick_mode_s62(2)
+        function_key = "set_arm_quick_mode_s62"  
 
     time.sleep(1)
     input(f"当前机器人模式为: {ROBOT_VERSION} | 控制模式 {function_key} 结束, 按回车继续 ==== 切换手臂到wbc轨迹控制模式成功 ==== \n")
@@ -3186,6 +3213,13 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
                                 action_to_execute[7:14] = right_arm_lock_values
                             else:
                                 rospy.logwarn_throttle(5.0, f"[LOCK_RIGHT_ARM] Expected 7 values, got {len(right_arm_lock_values)}. Skipping lock.")
+                    if lock_left_arm and left_arm_lock_values is not None:
+                        if len(action_to_execute) >= 14:
+                            # 确保left_arm_lock_values是7个值
+                            if len(left_arm_lock_values) == 7:
+                                action_to_execute[0:7] = left_arm_lock_values
+                            else:
+                                rospy.logwarn_throttle(5.0, f"[LOCK_LEFT_ARM] Expected 7 values, got {len(left_arm_lock_values)}. Skipping lock.")
                     
                     if control_claw and len(action_to_execute) >= 16:
                         rospy.loginfo_throttle(
@@ -3428,7 +3462,7 @@ def final_reset_arm(json_path, env, control_arm=True, control_claw=True):
     rospy.loginfo("Arm reset completed!")
 
 
-def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chunk_size=50, enable_gui=False, rotate_head_camera=False, state_zero=False, task_description=None, chunk_start=None, chunk_end=None, model_action_dt=None, sync_mode=False, max_joint_velocity=None, constant_velocity=False, action_stride=1, claw_lock_threshold=50.0, claw_lock_count_threshold=5, claw_locked_value=90.0, ik_model_type='60', pause_before_chunk=False, use_predicted_as_reference=False, enable_eef_visualization=False, clear_visualization_on_reset=False, lock_right_arm=False, right_arm_lock_json_path=None):
+def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chunk_size=50, enable_gui=False, rotate_head_camera=False, state_zero=False, task_description=None, chunk_start=None, chunk_end=None, model_action_dt=None, sync_mode=False, max_joint_velocity=None, constant_velocity=False, action_stride=1, claw_lock_threshold=50.0, claw_lock_count_threshold=5, claw_locked_value=90.0, ik_model_type='60', pause_before_chunk=False, use_predicted_as_reference=False, enable_eef_visualization=False, clear_visualization_on_reset=False, lock_right_arm=False, right_arm_lock_json_path=None, lock_left_arm=False, left_arm_lock_json_path=None):
     """
     在这里和实机/仿真交互，做网络推理（depalletize任务）
     支持多次推理：按'q'退出当前推理，可以快速重新开始下一次推理而无需重新加载模型
@@ -3458,6 +3492,9 @@ def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chun
         lock_right_arm: 是否锁定右手关节。如果True，在执行action时，右手关节（索引7-13）将被设置为从JSON文件加载的固定值。
         right_arm_lock_json_path: JSON文件路径，包含右手关节锁定值。如果为None，使用默认路径：scripts/utils/start_arm_traj_claw.json。
                                   将从arm_action[0][7:14]提取右手关节值（7个值）。
+        lock_left_arm: 是否锁定左手关节。如果True，在执行action时，左手关节（索引0-6）将被设置为从JSON文件加载的固定值。
+        left_arm_lock_json_path: JSON文件路径，包含左手关节锁定值。如果为None，使用默认路径：scripts/utils/start_arm_traj_claw.json。
+                                 将从arm_action[0][0:7]提取左手关节值（7个值）。
     """
     
     # 加载模型和环境（只执行一次）
@@ -3506,6 +3543,38 @@ def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chun
         else:
             rospy.logerr(f"❌ Right arm lock JSON file not found: {right_arm_lock_json_path}. Cannot lock right arm.")
             lock_right_arm = False
+
+    # 如果启用了锁定左手关节，加载JSON文件并提取左手关节值
+    left_arm_lock_values = None
+    if lock_left_arm:
+        if left_arm_lock_json_path is None:
+            # 使用默认路径
+            cur_dir = os.path.dirname(os.path.abspath(__file__))
+            left_arm_lock_json_path = os.path.join(cur_dir, 'utils/start_arm_traj_0417_s62.json')
+        
+        if os.path.exists(left_arm_lock_json_path):
+            try:
+                with open(left_arm_lock_json_path, 'r') as f:
+                    lock_data = json.load(f)
+                    if 'arm_action' in lock_data and len(lock_data['arm_action']) > 0:
+                        # 提取左手关节值（索引0-6，即第1-7个关节）
+                        arm_action = lock_data['arm_action'][0]
+                        if len(arm_action) >= 14:
+                            left_arm_lock_values = np.array(arm_action[0:7], dtype=np.float32)
+                            rospy.loginfo(f"✅ Loaded left arm lock values from {left_arm_lock_json_path}")
+                            rospy.loginfo(f"   Left arm joints (7 values): {left_arm_lock_values}")
+                        else:
+                            rospy.logerr(f"❌ JSON file has insufficient arm_action values ({len(arm_action)} < 14). Cannot lock left arm.")
+                            lock_left_arm = False
+                    else:
+                        rospy.logerr(f"❌ JSON file does not contain 'arm_action' or it is empty. Cannot lock left arm.")
+                        lock_left_arm = False
+            except Exception as e:
+                rospy.logerr(f"❌ Failed to load left arm lock values from {left_arm_lock_json_path}: {e}")
+                lock_left_arm = False
+        else:
+            rospy.logerr(f"❌ Left arm lock JSON file not found: {left_arm_lock_json_path}. Cannot lock left arm.")
+            lock_left_arm = False
     
     # 主循环：支持多次推理
     inference_count = 0
@@ -3558,7 +3627,9 @@ def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chun
                 pause_before_chunk=pause_before_chunk,
                 use_predicted_as_reference=use_predicted_as_reference,
                 lock_right_arm=lock_right_arm,
-                right_arm_lock_values=right_arm_lock_values
+                right_arm_lock_values=right_arm_lock_values,
+                lock_left_arm=lock_left_arm,
+                left_arm_lock_values=left_arm_lock_values
             )
             
             if normal_exit:
@@ -3576,7 +3647,7 @@ def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chun
                 # 第一次推理开始时使用bag文件，后续推理开始时跳过bag文件（在run_inference_loop中处理）
                 rospy.loginfo("Resetting arm position using JSON file...")
                 final_reset_arm(
-                    json_path=os.path.join(cur_dir, 'utils/start_arm_traj_claw.json'), 
+                    json_path=os.path.join(cur_dir, 'utils/start_arm_traj_0417_s62.json'), 
                     env=env,
                     control_arm=control_arm,
                     control_claw=control_claw
@@ -3732,6 +3803,12 @@ if __name__ == '__main__':
     parser.add_argument('--right-arm-lock-json-path', type=str, default=None,
                         help='Path to JSON file containing right arm lock values. If not provided, uses default: '
                              'scripts/utils/start_arm_traj_claw.json. The right arm joints (indices 7-13) will be extracted from arm_action[0][7:14].')
+    parser.add_argument('--lock-left-arm', action='store_true',
+                        help='Lock left arm joints to fixed values from JSON file. If set, left arm joints (indices 0-6) '
+                             'will be set to values from start_arm_traj_claw.json (indices 0-6) during execution.')
+    parser.add_argument('--left-arm-lock-json-path', type=str, default=None,
+                        help='Path to JSON file containing left arm lock values. If not provided, uses default: '
+                             'scripts/utils/start_arm_traj_0417_s62.json. The left arm joints (indices 0-6) will be extracted from arm_action[0][0:7].')
     
     args = parser.parse_args()
     
@@ -3819,6 +3896,9 @@ if __name__ == '__main__':
     if args.lock_right_arm:
         json_path_display = args.right_arm_lock_json_path if args.right_arm_lock_json_path else "scripts/utils/start_arm_traj_claw.json (default)"
         print(f"🔒 Right arm lock: ENABLED (right arm joints will be locked to values from {json_path_display})")
+    if args.lock_left_arm:
+        json_path_display = args.left_arm_lock_json_path if args.left_arm_lock_json_path else "scripts/utils/start_arm_traj_0417_s62.json (default)"
+        print(f"🔒 Left arm lock: ENABLED (left arm joints will be locked to values from {json_path_display})")
     print("="*80 + "\n")
 
     # 如果禁用claw lock，将threshold设置为一个非常大的值
@@ -3855,7 +3935,9 @@ if __name__ == '__main__':
              enable_eef_visualization=args.enable_eef_visualization,
              clear_visualization_on_reset=args.clear_visualization_on_reset,
              lock_right_arm=args.lock_right_arm,
-             right_arm_lock_json_path=args.right_arm_lock_json_path)
+             right_arm_lock_json_path=args.right_arm_lock_json_path,
+             lock_left_arm=args.lock_left_arm,
+             left_arm_lock_json_path=args.left_arm_lock_json_path)
     elif args.replay:
         print("Replaying dataset trajectories")
         # 使用用户指定的数据集路径，如果没有指定则使用默认路径

@@ -22,6 +22,12 @@ pip3 install scipy
 cd /home/lab/kuavo-ros-control-rewACT/src/kuavo_humanoid_sdk && ./install.sh
 pip3 install websockets 
 pip3 install deprecated
+pip3 install pycryptodomex 
+pip3 install gnupg
+
+# IK 安装 [高精度IK 安装]
+cd kuavo-manip/
+pip3 install -r requirements.txt 
 
 # eef action space
 # 注意：如果使用 miniconda（而非 miniforge3），需要先添加 conda-forge 频道
@@ -333,6 +339,11 @@ python eval/eval_merged_groot.py \
     * ![对比结果](./eval/IK_eef_eval/ik_fk_verification_results/3d_trajectory_demo.jpg)
 
 ### EEF eval验证
+* 数据集转换【请注意必须包含pinocchio库】
+```bash
+python3 lerobot_datasets/cvt_bag2lerobot_depalletizer_task_eef_pinocchio.py  --source-dir /home/lab/kuavo-manip/lerobot_datasets/raw_data/0207_pick_desk_crossX_demo --target-dir /home/lab/kuavo-manip/lerobot_data/0207_pick_desp_crossX_demo
+```
+
 * 数据集验证
 ```bash
 # absolute eef action model - 带发布rostopic话题

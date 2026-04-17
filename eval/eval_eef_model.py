@@ -40,6 +40,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import logging
 import math
+import json
 
 import time
 import traceback
@@ -66,11 +67,12 @@ from std_srvs.srv import Trigger, TriggerRequest, SetBool, SetBoolRequest
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 from robot_envs.kuavo_depalletize_env import GrabBoxMpcEnv
 from kuavo_humanoid_sdk.kuavo_strategy_pytree.common.robot_sdk import RobotSDK
-from kuavo_msgs.srv import (changeArmCtrlMode, changeArmCtrlModeRequest)
+from kuavo_msgs.srv import (changeArmCtrlMode, changeArmCtrlModeRequest, changeLbQuickModeSrv, changeLbQuickModeSrvRequest )
 
 import rospy
 import numpy as np
@@ -463,6 +465,74 @@ class RTCDemoConfig:
         default=90.0,
         metadata={"help": "Claw value when locked (fully closed). Default: 90.0."},
     )
+
+    # Arm lock configuration
+    lock_left_arm: bool = field(
+        default=False,
+        metadata={"help": "Lock left arm joints (indices 0-6) to fixed values loaded from JSON."},
+    )
+    left_arm_lock_json_path: str = field(
+        default=str(REPO_ROOT / "scripts" / "utils" / "start_arm_traj_0417_s62.json"),
+        metadata={"help": "JSON path for left arm lock values; uses arm_action[0][0:7]."},
+    )
+    lock_right_arm: bool = field(
+        default=False,
+        metadata={"help": "Lock right arm joints (indices 7-13) to fixed values loaded from JSON."},
+    )
+    right_arm_lock_json_path: str = field(
+        default=str(REPO_ROOT / "scripts" / "utils" / "start_arm_traj_claw.json"),
+        metadata={"help": "JSON path for right arm lock values; uses arm_action[0][7:14]."},
+    )
+
+
+def _load_arm_lock_values(json_path: str, arm_side: str) -> Optional[np.ndarray]:
+    """Load and validate 7D lock values for left/right arm from JSON."""
+    arm_side = arm_side.lower()
+    if arm_side not in {"left", "right"}:
+        raise ValueError(f"Unsupported arm_side={arm_side}, expected 'left' or 'right'")
+
+    if not json_path:
+        logger.error("[LOCK] Empty JSON path for %s arm lock", arm_side)
+        return None
+
+    path_obj = Path(json_path)
+    if not path_obj.exists():
+        logger.error("[LOCK] %s arm lock JSON not found: %s", arm_side, json_path)
+        return None
+
+    try:
+        with path_obj.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as exc:
+        logger.error("[LOCK] Failed to parse %s arm lock JSON (%s): %s", arm_side, json_path, exc)
+        return None
+
+    arm_action = data.get("arm_action")
+    if not isinstance(arm_action, list) or len(arm_action) == 0:
+        logger.error("[LOCK] %s arm lock JSON missing non-empty 'arm_action': %s", arm_side, json_path)
+        return None
+
+    first_action = arm_action[0]
+    if not isinstance(first_action, list) or len(first_action) < 14:
+        logger.error(
+            "[LOCK] %s arm lock JSON first arm_action must contain >=14 values, got %s in %s",
+            arm_side,
+            len(first_action) if isinstance(first_action, list) else type(first_action).__name__,
+            json_path,
+        )
+        return None
+
+    if arm_side == "left":
+        lock_values = np.array(first_action[0:7], dtype=np.float32)
+    else:
+        lock_values = np.array(first_action[7:14], dtype=np.float32)
+
+    if lock_values.shape != (7,):
+        logger.error("[LOCK] %s arm lock values shape invalid: %s", arm_side, lock_values.shape)
+        return None
+
+    logger.info("[LOCK] %s arm lock values loaded from %s: %s", arm_side, json_path, lock_values.tolist())
+    return lock_values
 
 
 def is_image_key(k: str) -> bool:
@@ -1042,6 +1112,8 @@ def actor_control(
     action_queue: ActionQueue,
     shutdown_event: Event,
     cfg: RTCDemoConfig,
+    left_arm_lock_values: Optional[np.ndarray] = None,
+    right_arm_lock_values: Optional[np.ndarray] = None,
 ):
     """Thread function to execute actions on the robot.
 
@@ -1067,6 +1139,13 @@ def actor_control(
 
             if action is not None:
                 action = action.cpu()
+                if action.numel() >= 14:
+                    action_np = action.numpy().copy()
+                    if left_arm_lock_values is not None:
+                        action_np[0:7] = left_arm_lock_values
+                    if right_arm_lock_values is not None:
+                        action_np[7:14] = right_arm_lock_values
+                    action = torch.from_numpy(action_np)
                 control_cmd_pose = ("Cmd_pose_z" in ACTION_COMPONENTS or "Cmd_pose_pitch" in ACTION_COMPONENTS)
                 env.exec_actions(
                     actions=action,
@@ -1144,6 +1223,24 @@ def set_arm_quick_mode(enable: bool) -> bool:
         rospy.logerr(f"Service call failed: {e}")
         return False
 
+def set_arm_quick_mode_s62(enable: int) -> bool:
+    """开关手臂快速模式"""
+    rospy.loginfo(f"call set_arm_quick_mode:{enable}")
+    try:
+        rospy.wait_for_service('/enable_lb_arm_quick_mode', timeout=5.0)
+        cli = rospy.ServiceProxy('/enable_lb_arm_quick_mode', changeLbQuickModeSrv)
+        req = changeLbQuickModeSrvRequest()
+        req.quickMode = enable
+        resp = cli(req)
+        if resp.success:
+            rospy.loginfo(f"Successfully {'enabled' if enable else 'disabled'} arm quick mode")
+            return True
+        else:
+            rospy.logwarn(f"Failed to {'enable' if enable else 'disable'} arm quick mode")
+            return False
+    except rospy.ServiceException as e:
+        rospy.logerr(f"Service call failed: {e}")
+        return False
 
 def load_model_bundle(
     model_path: str,
@@ -1307,21 +1404,44 @@ def demo_cli(cfg: RTCDemoConfig):
     else:
         logger.info(f"[MAIN] Claw lock mechanism: threshold={cfg.claw_lock_threshold}, "
                      f"count_threshold={cfg.claw_lock_count_threshold}, locked_value={cfg.claw_locked_value}")
+
+    left_arm_lock_values = None
+    right_arm_lock_values = None
+    if cfg.lock_left_arm:
+        left_arm_lock_values = _load_arm_lock_values(cfg.left_arm_lock_json_path, arm_side="left")
+        if left_arm_lock_values is None:
+            logger.warning("[MAIN] Left arm lock requested but disabled due to invalid lock JSON.")
+        else:
+            logger.info("[MAIN] Left arm lock ENABLED.")
+    else:
+        logger.info("[MAIN] Left arm lock DISABLED.")
+
+    if cfg.lock_right_arm:
+        right_arm_lock_values = _load_arm_lock_values(cfg.right_arm_lock_json_path, arm_side="right")
+        if right_arm_lock_values is None:
+            logger.warning("[MAIN] Right arm lock requested but disabled due to invalid lock JSON.")
+        else:
+            logger.info("[MAIN] Right arm lock ENABLED.")
+    else:
+        logger.info("[MAIN] Right arm lock DISABLED.")
+
     robot_sdk = RobotSDK()
 
     # 初始化手臂位置
     robot_sdk.control.set_external_control_arm_mode()
-    robot_sdk.control.control_head(0, np.deg2rad(20))
+    robot_sdk.control.control_head(0, np.deg2rad(-20))
     cur_dir = os.path.dirname(os.path.abspath(__file__))
     final_reset_arm(
-        json_path=os.path.join(cur_dir, 'utils/initial_arm_traj.json'), 
+        json_path=os.path.join(cur_dir, 'utils/start_arm_traj_0417_s62.json'), 
+        # json_path=os.path.join(cur_dir, 'utils/start_arm_traj_claw.json'),
         env=env,
         control_arm=True,
         control_claw=True
     )
     # FIXME
     # direct_to_wbc(1)
-    set_arm_quick_mode(True)
+    # set_arm_quick_mode(True)
+    set_arm_quick_mode_s62(2)
     
     # ========== 加载单模型 ==========
     logger.info(f"[MAIN] Loading model from {cfg.model_path}")
@@ -1367,7 +1487,7 @@ def demo_cli(cfg: RTCDemoConfig):
         )
         actor_thread = Thread(
             target=actor_control, 
-            args=(env, action_queue, shutdown_event, cfg), 
+            args=(env, action_queue, shutdown_event, cfg, left_arm_lock_values, right_arm_lock_values), 
             daemon=True, 
             name="Actor"
         )
@@ -1401,7 +1521,8 @@ def demo_cli(cfg: RTCDemoConfig):
         shutdown_event.set()
         env.reset_claw_lock()
         final_reset_arm(
-            json_path=os.path.join(cur_dir, 'utils/initial_arm_traj.json'), 
+            json_path=os.path.join(cur_dir, 'utils/start_arm_traj_0417_s62.json'), 
+            # json_path=os.path.join(cur_dir, 'utils/start_arm_traj_claw.json'),
             env=env,
             control_arm=True,
             control_claw=True
