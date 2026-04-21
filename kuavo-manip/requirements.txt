@@ -1,8 +1,8 @@
 # local dependencies
--e ./kuavo_msgs --config-settings editable_mode=compat
--e ./kuavo_humanoid_sdk --config-settings editable_mode=compat
--e ./kuavo_ik --config-settings editable_mode=compat
--e ./recorder --config-settings editable_mode=compat
+-e ./kuavo_msgs # --config-settings editable_mode=compat
+-e ./kuavo_humanoid_sdk # --config-settings editable_mode=compat
+-e ./kuavo_ik # --config-settings editable_mode=compat
+-e ./recorder # --config-settings editable_mode=compat
 
 # if set editable_mode=compat, you may encounter 'pip3 error: no such option: --config-settings'
 # try to remove the --config-settings option or upgrade pip3 to version 21.x or higher

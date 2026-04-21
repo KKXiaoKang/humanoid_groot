@@ -822,6 +822,13 @@ class FlowmatchingActionHead(nn.Module):
         sample = self.beta_dist.sample([batch_size]).to(device, dtype=dtype)
         return (self.config.noise_s - sample) / self.config.noise_s
 
+    @staticmethod
+    def _per_sample_mean_masked(weighted_err: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """Mean over (T, D) per batch item; mask is 0/1 (or weights) matching weighted_err."""
+        num = weighted_err.sum(dim=(1, 2))
+        den = mask.sum(dim=(1, 2)).clamp(min=1e-8)
+        return num / den
+
     def prepare_input(self, batch: dict) -> BatchFeature:
         return BatchFeature(data=batch)
 
@@ -846,7 +853,14 @@ class FlowmatchingActionHead(nn.Module):
         backbone_output["backbone_features"] = backbone_features
         return backbone_output
 
-    def forward(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
+    def forward(
+        self,
+        backbone_output: BatchFeature,
+        action_input: BatchFeature,
+        reduction: str = "mean",
+    ) -> BatchFeature:
+        if reduction not in ("mean", "none"):
+            raise ValueError(f"reduction must be 'mean' or 'none', got {reduction!r}")
         # Set frozen modules to eval
         self.set_frozen_modules_to_eval_mode()
 
@@ -1009,14 +1023,18 @@ class FlowmatchingActionHead(nn.Module):
                         if self.config.use_learnable_loss_weights and self.task_log_sigma is not None:
                             loss_arm_mean = loss_arm.sum() / action_mask_arm.sum()
                             loss_claw_mean = loss_claw.sum() / action_mask_claw.sum()
-                            
+
                             s_arm = self.task_log_sigma["left_arm"]
                             s_claw = self.task_log_sigma["claw"]
                             precision_arm = torch.exp(-2.0 * s_arm)
                             precision_claw = torch.exp(-2.0 * s_claw)
-                            
-                            loss = precision_arm * loss_arm_mean + precision_claw * loss_claw_mean + s_arm + s_claw
-                            
+
+                            ps_arm = self._per_sample_mean_masked(loss_arm, action_mask_arm)
+                            ps_claw = self._per_sample_mean_masked(loss_claw, action_mask_claw)
+                            data_ps = precision_arm * ps_arm + precision_claw * ps_claw
+                            aux_loss = s_arm + s_claw
+                            loss = data_ps.mean() + aux_loss if reduction == "mean" else data_ps
+
                             output_dict = {
                                 "loss": loss,
                                 "left_arm_loss": loss_arm_mean.item(),
@@ -1026,11 +1044,19 @@ class FlowmatchingActionHead(nn.Module):
                                 "weight_left_arm": precision_arm.item(),
                                 "weight_claw": precision_claw.item(),
                             }
+                            if reduction != "mean":
+                                output_dict["rabc_aux_loss"] = aux_loss
                         else:
                             loss_arm_mean = loss_arm.sum() / action_mask_arm.sum()
                             loss_claw_mean = loss_claw.sum() / action_mask_claw.sum()
-                            loss = self.config.left_arm_loss_weight * loss_arm_mean + self.config.claw_loss_weight * loss_claw_mean
-                            
+                            ps_arm = self._per_sample_mean_masked(loss_arm, action_mask_arm)
+                            ps_claw = self._per_sample_mean_masked(loss_claw, action_mask_claw)
+                            data_ps = (
+                                self.config.left_arm_loss_weight * ps_arm
+                                + self.config.claw_loss_weight * ps_claw
+                            )
+                            loss = data_ps.mean() if reduction == "mean" else data_ps
+
                             output_dict = {
                                 "loss": loss,
                                 "left_arm_loss": loss_arm_mean.item(),
@@ -1057,14 +1083,18 @@ class FlowmatchingActionHead(nn.Module):
                         if self.config.use_learnable_loss_weights and self.task_log_sigma is not None:
                             loss_arm_mean = loss_arm.sum() / action_mask_arm.sum()
                             loss_claw_mean = loss_claw.sum() / action_mask_claw.sum()
-                            
+
                             s_arm = self.task_log_sigma["right_arm"]
                             s_claw = self.task_log_sigma["claw"]
                             precision_arm = torch.exp(-2.0 * s_arm)
                             precision_claw = torch.exp(-2.0 * s_claw)
-                            
-                            loss = precision_arm * loss_arm_mean + precision_claw * loss_claw_mean + s_arm + s_claw
-                            
+
+                            ps_arm = self._per_sample_mean_masked(loss_arm, action_mask_arm)
+                            ps_claw = self._per_sample_mean_masked(loss_claw, action_mask_claw)
+                            data_ps = precision_arm * ps_arm + precision_claw * ps_claw
+                            aux_loss = s_arm + s_claw
+                            loss = data_ps.mean() + aux_loss if reduction == "mean" else data_ps
+
                             output_dict = {
                                 "loss": loss,
                                 "right_arm_loss": loss_arm_mean.item(),
@@ -1074,11 +1104,19 @@ class FlowmatchingActionHead(nn.Module):
                                 "weight_right_arm": precision_arm.item(),
                                 "weight_claw": precision_claw.item(),
                             }
+                            if reduction != "mean":
+                                output_dict["rabc_aux_loss"] = aux_loss
                         else:
                             loss_arm_mean = loss_arm.sum() / action_mask_arm.sum()
                             loss_claw_mean = loss_claw.sum() / action_mask_claw.sum()
-                            loss = self.config.right_arm_loss_weight * loss_arm_mean + self.config.claw_loss_weight * loss_claw_mean
-                            
+                            ps_arm = self._per_sample_mean_masked(loss_arm, action_mask_arm)
+                            ps_claw = self._per_sample_mean_masked(loss_claw, action_mask_claw)
+                            data_ps = (
+                                self.config.right_arm_loss_weight * ps_arm
+                                + self.config.claw_loss_weight * ps_claw
+                            )
+                            loss = data_ps.mean() if reduction == "mean" else data_ps
+
                             output_dict = {
                                 "loss": loss,
                                 "right_arm_loss": loss_arm_mean.item(),
@@ -1136,20 +1174,27 @@ class FlowmatchingActionHead(nn.Module):
                         loss_left_arm_mean = loss_left_arm.sum() / action_mask_left_arm.sum()
                         loss_right_arm_mean = loss_right_arm.sum() / action_mask_right_arm.sum()
                         loss_claw_mean = loss_claw.sum() / action_mask_claw.sum()
-                        
+
                         s_left_arm = self.task_log_sigma["left_arm"]
                         s_right_arm = self.task_log_sigma["right_arm"]
                         s_claw = self.task_log_sigma["claw"]
                         precision_left_arm = torch.exp(-2.0 * s_left_arm)
                         precision_right_arm = torch.exp(-2.0 * s_right_arm)
                         precision_claw = torch.exp(-2.0 * s_claw)
-                        
-                        loss = precision_left_arm * loss_left_arm_mean + precision_right_arm * loss_right_arm_mean + precision_claw * loss_claw_mean + s_left_arm + s_right_arm + s_claw
-                        
-                        # 添加协调性损失
+
+                        ps_la = self._per_sample_mean_masked(loss_left_arm, action_mask_left_arm)
+                        ps_ra = self._per_sample_mean_masked(loss_right_arm, action_mask_right_arm)
+                        ps_c = self._per_sample_mean_masked(loss_claw, action_mask_claw)
+                        data_ps = (
+                            precision_left_arm * ps_la
+                            + precision_right_arm * ps_ra
+                            + precision_claw * ps_c
+                        )
+                        aux_loss = s_left_arm + s_right_arm + s_claw
                         if coordination_loss is not None:
-                            loss = loss + self.config.arm_coordination_loss_weight * coordination_loss
-                        
+                            aux_loss = aux_loss + self.config.arm_coordination_loss_weight * coordination_loss
+                        loss = data_ps.mean() + aux_loss if reduction == "mean" else data_ps
+
                         output_dict = {
                             "loss": loss,
                             "left_arm_loss": loss_left_arm_mean.item(),
@@ -1164,17 +1209,29 @@ class FlowmatchingActionHead(nn.Module):
                         }
                         if coordination_loss is not None:
                             output_dict["arm_coordination_loss"] = coordination_loss.item()
+                        if reduction != "mean":
+                            output_dict["rabc_aux_loss"] = aux_loss
                     else:
                         # Use fixed weights
                         loss_left_arm_mean = loss_left_arm.sum() / action_mask_left_arm.sum()
                         loss_right_arm_mean = loss_right_arm.sum() / action_mask_right_arm.sum()
                         loss_claw_mean = loss_claw.sum() / action_mask_claw.sum()
-                        loss = self.config.left_arm_loss_weight * loss_left_arm_mean + self.config.right_arm_loss_weight * loss_right_arm_mean + self.config.claw_loss_weight * loss_claw_mean
-                        
-                        # 添加协调性损失
+                        ps_la = self._per_sample_mean_masked(loss_left_arm, action_mask_left_arm)
+                        ps_ra = self._per_sample_mean_masked(loss_right_arm, action_mask_right_arm)
+                        ps_c = self._per_sample_mean_masked(loss_claw, action_mask_claw)
+                        data_ps = (
+                            self.config.left_arm_loss_weight * ps_la
+                            + self.config.right_arm_loss_weight * ps_ra
+                            + self.config.claw_loss_weight * ps_c
+                        )
+                        aux_loss = None
                         if coordination_loss is not None:
-                            loss = loss + self.config.arm_coordination_loss_weight * coordination_loss
-                        
+                            aux_loss = self.config.arm_coordination_loss_weight * coordination_loss
+                        if reduction == "mean":
+                            loss = data_ps.mean() + (aux_loss if aux_loss is not None else 0)
+                        else:
+                            loss = data_ps
+
                         output_dict = {
                             "loss": loss,
                             "left_arm_loss": loss_left_arm_mean.item(),
@@ -1183,6 +1240,8 @@ class FlowmatchingActionHead(nn.Module):
                         }
                         if coordination_loss is not None:
                             output_dict["arm_coordination_loss"] = coordination_loss.item()
+                        if reduction != "mean" and aux_loss is not None:
+                            output_dict["rabc_aux_loss"] = aux_loss
             else:
                 # Single arm head (original behavior)
                 pred_arm = self.action_arm_decoder(model_output_actions, embodiment_id)
@@ -1206,14 +1265,18 @@ class FlowmatchingActionHead(nn.Module):
                 if self.config.use_learnable_loss_weights and self.task_log_sigma is not None:
                     loss_arm_mean = loss_arm.sum() / action_mask_arm.sum()
                     loss_claw_mean = loss_claw.sum() / action_mask_claw.sum()
-                    
+
                     s_arm = self.task_log_sigma["arm"]
                     s_claw = self.task_log_sigma["claw"]
                     precision_arm = torch.exp(-2.0 * s_arm)  # 1 / σ²
                     precision_claw = torch.exp(-2.0 * s_claw)
-                    
-                    loss = precision_arm * loss_arm_mean + precision_claw * loss_claw_mean + s_arm + s_claw
-                    
+
+                    ps_arm = self._per_sample_mean_masked(loss_arm, action_mask_arm)
+                    ps_claw = self._per_sample_mean_masked(loss_claw, action_mask_claw)
+                    data_ps = precision_arm * ps_arm + precision_claw * ps_claw
+                    aux_loss = s_arm + s_claw
+                    loss = data_ps.mean() + aux_loss if reduction == "mean" else data_ps
+
                     output_dict = {
                         "loss": loss,
                         "arm_loss": loss_arm_mean.item(),
@@ -1223,12 +1286,17 @@ class FlowmatchingActionHead(nn.Module):
                         "weight_arm": precision_arm.item(),
                         "weight_claw": precision_claw.item(),
                     }
+                    if reduction != "mean":
+                        output_dict["rabc_aux_loss"] = aux_loss
                 else:
                     # Use fixed weights
                     loss_arm_mean = loss_arm.sum() / action_mask_arm.sum()
                     loss_claw_mean = loss_claw.sum() / action_mask_claw.sum()
-                    loss = self.config.arm_loss_weight * loss_arm_mean + self.config.claw_loss_weight * loss_claw_mean
-                    
+                    ps_arm = self._per_sample_mean_masked(loss_arm, action_mask_arm)
+                    ps_claw = self._per_sample_mean_masked(loss_claw, action_mask_claw)
+                    data_ps = self.config.arm_loss_weight * ps_arm + self.config.claw_loss_weight * ps_claw
+                    loss = data_ps.mean() if reduction == "mean" else data_ps
+
                     output_dict = {
                         "loss": loss,
                         "arm_loss": loss_arm_mean.item(),
@@ -1238,11 +1306,14 @@ class FlowmatchingActionHead(nn.Module):
             # Single head (original behavior)
             pred = self.action_decoder(model_output_actions, embodiment_id)
             pred_actions = pred
-            
+
             # Slice out only the action portion of pred and target.
             action_mask = action_input.action_mask
-            loss = F.mse_loss(pred_actions, velocity, reduction="none") * action_mask
-            loss = loss.sum() / action_mask.sum()
+            loss_elem = F.mse_loss(pred_actions, velocity, reduction="none") * action_mask
+            if reduction == "mean":
+                loss = loss_elem.sum() / action_mask.sum()
+            else:
+                loss = self._per_sample_mean_masked(loss_elem, action_mask)
             output_dict = {
                 "loss": loss,
             }

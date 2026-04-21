@@ -68,6 +68,13 @@ class TrainPipelineConfig(HubMixin):
     # Rename map for the observation to override the image and state keys
     rename_map: dict[str, str] = field(default_factory=dict)
 
+    # RA-BC (Reward-Aligned Behavior Cloning): weight BC loss using precomputed SARM progress
+    use_rabc: bool = False
+    rabc_progress_path: str | None = None
+    rabc_kappa: float = 0.01
+    rabc_epsilon: float = 1e-6
+    rabc_head_mode: str | None = "sparse"
+
     def validate(self) -> None:
         # HACK: We parse again the cli args here to get the pretrained paths if there was some.
         policy_path = parser.get_path_arg("policy")
@@ -130,6 +137,13 @@ class TrainPipelineConfig(HubMixin):
             raise ValueError(
                 "'policy.repo_id' argument missing. Please specify it to push the model to the hub."
             )
+
+        if self.use_rabc and not self.rabc_progress_path:
+            repo_id = self.dataset.repo_id
+            if self.dataset.root:
+                self.rabc_progress_path = str(Path(self.dataset.root) / "sarm_progress.parquet")
+            else:
+                self.rabc_progress_path = f"hf://datasets/{repo_id}/sarm_progress.parquet"
 
     @classmethod
     def __get_path_fields__(cls) -> list[str]:

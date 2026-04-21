@@ -430,13 +430,10 @@ class GR00TN15(PreTrainedModel):
                 error_msg += f"\n{self.action_head.actual_action_dim=} (actual from action_head)"
             raise ValueError(error_msg)
 
-    def forward(
-        self,
-        inputs: dict,
-    ) -> BatchFeature:
+    def forward(self, inputs: dict, reduction: str = "mean") -> BatchFeature:
         backbone_inputs, action_inputs = self.prepare_input(inputs)
         backbone_outputs = self.backbone(backbone_inputs)
-        action_head_outputs = self.action_head(backbone_outputs, action_inputs)
+        action_head_outputs = self.action_head(backbone_outputs, action_inputs, reduction=reduction)
         self.validate_data(action_head_outputs, backbone_outputs, is_training=True)
         return action_head_outputs
 

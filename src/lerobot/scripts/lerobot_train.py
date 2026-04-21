@@ -13,6 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import inspect
 import logging
 import time
 from contextlib import nullcontext
@@ -61,6 +62,7 @@ def update_policy(
     accelerator: Accelerator,
     lr_scheduler=None,
     lock=None,
+    rabc_weights_provider=None,
 ) -> tuple[MetricsTracker, dict]:
     """
     Performs a single training step to update the policy's weights.
@@ -77,6 +79,7 @@ def update_policy(
         accelerator: The Accelerator instance for distributed training and mixed precision.
         lr_scheduler: An optional learning rate scheduler.
         lock: An optional lock for thread-safe optimizer updates.
+        rabc_weights_provider: Optional RABCWeights instance for RA-BC sample weighting.
 
     Returns:
         A tuple containing:
@@ -86,9 +89,31 @@ def update_policy(
     start_time = time.perf_counter()
     policy.train()
 
+    rabc_batch_weights = None
+    rabc_batch_stats = None
+    if rabc_weights_provider is not None:
+        rabc_batch_weights, rabc_batch_stats = rabc_weights_provider.compute_batch_weights(batch)
+        rabc_batch_weights = rabc_batch_weights.to(accelerator.device, non_blocking=True)
+
     # Let accelerator handle mixed precision
     with accelerator.autocast():
-        loss, output_dict = policy.forward(batch)
+        if rabc_batch_weights is not None:
+            per_sample_loss, output_dict = policy.forward(batch, reduction="none")
+            aux = output_dict.pop("rabc_aux_loss", None)
+            epsilon = 1e-6
+            w = rabc_batch_weights.to(device=per_sample_loss.device, dtype=per_sample_loss.dtype)
+            loss = (per_sample_loss * w).sum() / (w.sum() + epsilon)
+            if aux is not None:
+                if not isinstance(aux, torch.Tensor):
+                    aux = torch.tensor(aux, device=loss.device, dtype=loss.dtype)
+                else:
+                    aux = aux.to(device=loss.device, dtype=loss.dtype)
+                loss = loss + aux
+            output_dict["rabc_mean_weight"] = rabc_batch_stats["raw_mean_weight"]
+            output_dict["rabc_num_zero_weight"] = rabc_batch_stats["num_zero_weight"]
+            output_dict["rabc_num_full_weight"] = rabc_batch_stats["num_full_weight"]
+        else:
+            loss, output_dict = policy.forward(batch)
         # TODO(rcadene): policy.unnormalize_outputs(out_dict)
 
     # Use accelerator's backward method
@@ -250,6 +275,34 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         logging.info("Creating optimizer and scheduler")
     optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, policy)
 
+    rabc_weights = None
+    if cfg.use_rabc:
+        from lerobot.utils.rabc import RABCWeights
+
+        if "reduction" not in inspect.signature(policy.forward).parameters:
+            raise TypeError(
+                'RA-BC requires policy.forward(..., reduction="mean"|"none"). '
+                f"{type(policy).__name__} does not support `reduction` (e.g. train Groot with this fork)."
+            )
+        chunk_size = getattr(policy.config, "chunk_size", None)
+        if chunk_size is None:
+            raise ValueError("RA-BC requires policy.config.chunk_size (SARM progress lookahead Δ).")
+        if is_main_process:
+            logging.info("Loading SARM progress for RA-BC from %s", cfg.rabc_progress_path)
+            logging.info(
+                "RA-BC: chunk_size=%s from policy config, head_mode=%s",
+                chunk_size,
+                getattr(cfg, "rabc_head_mode", "sparse"),
+            )
+        rabc_weights = RABCWeights(
+            progress_path=cfg.rabc_progress_path,
+            chunk_size=chunk_size,
+            head_mode=getattr(cfg, "rabc_head_mode", "sparse"),
+            kappa=getattr(cfg, "rabc_kappa", 0.01),
+            epsilon=getattr(cfg, "rabc_epsilon", 1e-6),
+            device=device,
+        )
+
     step = 0  # number of policy updates (forward + backward + optim)
 
     if cfg.resume:
@@ -340,6 +393,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             cfg.optimizer.grad_clip_norm,
             accelerator=accelerator,
             lr_scheduler=lr_scheduler,
+            rabc_weights_provider=rabc_weights,
         )
 
         # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
@@ -356,6 +410,15 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                 wandb_log_dict = train_tracker.to_dict()
                 if output_dict:
                     wandb_log_dict.update(output_dict)
+                if rabc_weights is not None:
+                    rabc_stats = rabc_weights.get_stats()
+                    wandb_log_dict.update(
+                        {
+                            "rabc_delta_mean": rabc_stats["delta_mean"],
+                            "rabc_delta_std": rabc_stats["delta_std"],
+                            "rabc_num_frames": rabc_stats["num_frames"],
+                        }
+                    )
                 wandb_logger.log_dict(wandb_log_dict, step)
             train_tracker.reset_averages()
 

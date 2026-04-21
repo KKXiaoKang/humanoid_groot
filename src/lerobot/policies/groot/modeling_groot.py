@@ -120,10 +120,18 @@ class GrootPolicy(PreTrainedPolicy):
     def get_optim_params(self) -> dict:
         return self.parameters()
 
-    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
+    def forward(
+        self,
+        batch: dict[str, Tensor],
+        reduction: str = "mean",
+    ) -> tuple[Tensor, dict]:
         """Training forward pass.
 
         Delegates to Isaac-GR00T model.forward when inputs are compatible.
+
+        Args:
+            reduction: ``"mean"`` (default) returns scalar loss; ``"none"`` returns per-sample loss
+                of shape ``(batch_size,)`` for RA-BC weighting.
         """
         # Build a clean input dict for GR00T: keep only tensors GR00T consumes
         allowed_base = {"state", "state_mask", "action", "action_mask", "embodiment_id"}
@@ -139,16 +147,19 @@ class GrootPolicy(PreTrainedPolicy):
         # Run GR00T forward under bf16 autocast when enabled to reduce activation memory
         # Rationale: Matches original GR00T finetuning (bf16 compute, fp32 params) and avoids fp32 upcasts.
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=self.config.use_bf16):
-            outputs = self._groot_model.forward(groot_inputs)
+            outputs = self._groot_model.forward(groot_inputs, reduction=reduction)
 
         # Isaac-GR00T returns a BatchFeature; loss key is typically 'loss'
         loss = outputs.get("loss")
 
         # Extract all metrics from outputs for logging (e.g., arm_loss, claw_loss, sigma_arm, etc.)
         loss_dict = {}
+        output_data = None
         if isinstance(outputs, dict) or hasattr(outputs, "data"):
             output_data = outputs.data if hasattr(outputs, "data") else outputs
             for key, value in output_data.items():
+                if key == "rabc_aux_loss":
+                    continue
                 if isinstance(value, torch.Tensor):
                     if value.numel() == 1:  # Scalar tensor
                         loss_dict[key] = value.item()
@@ -158,10 +169,19 @@ class GrootPolicy(PreTrainedPolicy):
                 elif isinstance(value, (int, float)):
                     loss_dict[key] = value
                 # Skip other types (e.g., None, complex types)
-        
-        # Ensure loss is always in loss_dict
+
+        # Ensure loss is always in loss_dict (scalar for logging)
         if "loss" not in loss_dict:
-            loss_dict["loss"] = loss.item() if isinstance(loss, torch.Tensor) else loss
+            if isinstance(loss, torch.Tensor) and loss.ndim == 1:
+                loss_dict["loss"] = loss.mean().item()
+            elif isinstance(loss, torch.Tensor):
+                loss_dict["loss"] = loss.item()
+            else:
+                loss_dict["loss"] = loss
+
+        aux_raw = output_data.get("rabc_aux_loss") if output_data is not None else None
+        if isinstance(aux_raw, torch.Tensor):
+            loss_dict["rabc_aux_loss"] = aux_raw
 
         return loss, loss_dict
 
