@@ -1882,7 +1882,7 @@ def reset_inference_state(policy, env, eef_visualizer=None, clear_visualization=
     rospy.loginfo("✅ Inference state reset complete")
 
 
-def load_model_and_env(ckpt_path, model_type, action_chunk_size=50, enable_gui=False, rotate_head_camera=False, state_zero=False, task_description=None, claw_lock_threshold=50.0, claw_lock_count_threshold=5, claw_locked_value=90.0, enable_eef_visualization=False):
+def load_model_and_env(ckpt_path, model_type, action_chunk_size=50, enable_gui=False, rotate_head_camera=False, state_zero=False, task_description=None, claw_lock_threshold=50.0, claw_lock_count_threshold=5, claw_locked_value=90.0, enable_eef_visualization=False, ik_model_type='60'):
     """
     加载模型和环境（只执行一次，避免重复加载）
     
@@ -1894,6 +1894,7 @@ def load_model_and_env(ckpt_path, model_type, action_chunk_size=50, enable_gui=F
         rotate_head_camera: 是否旋转头部相机
         state_zero: 是否将状态置零
         task_description: 任务描述字符串，如果为None则使用默认值
+        ik_model_type: IK/FK使用的机器人型号 ('45', '46', '60', '62')
     
     Returns:
         tuple: (policy, preprocessor, postprocessor, env, task_description, device)
@@ -2077,10 +2078,19 @@ def load_model_and_env(ckpt_path, model_type, action_chunk_size=50, enable_gui=F
     if is_eef_mode:
         print(f"[LOAD] EEF mode detected: action_space_type={action_space_type}, action_dim={action_dim}")
         if PINOCCHIO_AVAILABLE:
-            # URDF路径（需要根据实际情况调整）
-            urdf_path = "/home/lab/kuavo-manip/lerobot_datasets/utils/biped_s60_only_arm.urdf"
-            # # FIXME
-            # urdf_path = "/home/lab/kuavo-manip/lerobot_datasets/utils/biped_s45_only_arm.urdf"
+            # 根据 ik_model_type 选择对应URDF，避免硬编码
+            urdf_map = {
+                '45': "/home/lab/kuavo-manip/lerobot_datasets/utils/biped_s45_only_arm.urdf",
+                '46': "/home/lab/kuavo-manip/lerobot_datasets/utils/biped_s46_only_arm.urdf",
+                '60': "/home/lab/kuavo-manip/lerobot_datasets/utils/biped_s60_only_arm.urdf",
+                '62': "/home/lab/kuavo-manip/lerobot_datasets/utils/biped_s62_only_arm.urdf",
+            }
+            urdf_path = urdf_map.get(str(ik_model_type), urdf_map['60'])
+            if not os.path.exists(urdf_path):
+                fallback_urdf = urdf_map['60']
+                print(f"[LOAD] ⚠️  URDF for ik_model_type={ik_model_type} not found: {urdf_path}")
+                print(f"[LOAD]    Fallback to: {fallback_urdf}")
+                urdf_path = fallback_urdf
             if os.path.exists(urdf_path):
                 try:
                     fk_getter = PinocchioFK(
@@ -2092,6 +2102,7 @@ def load_model_and_env(ckpt_path, model_type, action_chunk_size=50, enable_gui=F
                         shared_reference_frame='base_link'
                     )
                     print(f"[LOAD] ✅ Forward kinematics initialized for EEF mode")
+                    print(f"[LOAD]   IK model type: {ik_model_type} -> URDF: {urdf_path}")
                     print(f"[LOAD]   Will convert joint positions (16D) to EEF pose (20D) for state")
                     if is_relative_action_mode:
                         print(f"[LOAD]   Will also use FK to compute reference pose for relative action conversion")
@@ -3509,7 +3520,8 @@ def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chun
         claw_lock_threshold=claw_lock_threshold,
         claw_lock_count_threshold=claw_lock_count_threshold,
         claw_locked_value=claw_locked_value,
-        enable_eef_visualization=enable_eef_visualization
+        enable_eef_visualization=enable_eef_visualization,
+        ik_model_type=ik_model_type,
     )
     
     # 如果启用了锁定右手关节，加载JSON文件并提取右手关节值
