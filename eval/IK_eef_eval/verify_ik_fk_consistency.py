@@ -15,6 +15,7 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 from scipy.spatial.transform import Rotation as R
 import argparse
+import time
 from tqdm import tqdm
 
 # 添加路径
@@ -625,6 +626,203 @@ def visualize_euler_comparison(
             print("⚠️  Using non-interactive backend. Use --interactive flag to enable interactive display.")
 
 
+def _se3_to_viser_pose(se3_obj):
+    """将Pinocchio SE3转换为viser使用的(position, wxyz)。"""
+    translation = se3_obj.translation.astype(np.float32)
+    quat_xyzw = R.from_matrix(se3_obj.rotation).as_quat().astype(np.float32)
+    quat_wxyz = np.array([quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]], dtype=np.float32)
+    return translation, quat_wxyz
+
+
+def visualize_with_viser(
+    urdf_path: str,
+    mesh_dir: str,
+    model_type: str,
+    state_left: np.ndarray,
+    state_right: np.ndarray,
+    action_left: np.ndarray,
+    action_right: np.ndarray,
+    fk_left: np.ndarray,
+    fk_right: np.ndarray,
+    ik_joint_traj: np.ndarray,
+    host: str = "0.0.0.0",
+    port: int = 8080,
+    loop: bool = False,
+    fps: float = 20.0,
+):
+    """
+    使用viser进行3D可视化，并显示URDF网格模型。
+    说明：
+    - 轨迹全部显示（state/action/IK->FK）
+    - URDF模型按 IK 关节轨迹播放
+    """
+    try:
+        import viser
+        import trimesh
+    except ImportError as e:
+        print("❌ viser/trimesh 未安装，无法使用 --viser 可视化")
+        print(f"   详细错误: {e}")
+        print("   安装命令: pip install viser trimesh")
+        return
+
+    pin_model = pin.buildModelFromUrdf(urdf_path)
+    pin_data = pin_model.createData()
+    package_dirs = [mesh_dir, str(Path(urdf_path).parent)]
+    geom_model = pin.buildGeomFromUrdf(pin_model, urdf_path, pin.GeometryType.VISUAL, package_dirs)
+    geom_data = pin.GeometryData(geom_model)
+
+    server = viser.ViserServer(host=host, port=port)
+    print(f"✅ Viser started at: http://{host}:{port}")
+    print(f"   Model type: {model_type}")
+    print(f"   URDF: {urdf_path}")
+    print(f"   Mesh dir: {mesh_dir}")
+
+    # 绘制轨迹（左右手都放在一个场景内）
+    server.scene.add_spline_catmull_rom(
+        "/traj/left/state",
+        positions=state_left[:, :3],
+        color=(50, 120, 255),
+        line_width=2.0,
+    )
+    server.scene.add_spline_catmull_rom(
+        "/traj/left/action",
+        positions=action_left[:, :3],
+        color=(50, 200, 50),
+        line_width=2.0,
+    )
+    server.scene.add_spline_catmull_rom(
+        "/traj/left/ik_fk",
+        positions=fk_left[:, :3],
+        color=(255, 50, 50),
+        line_width=2.0,
+    )
+    server.scene.add_spline_catmull_rom(
+        "/traj/right/state",
+        positions=state_right[:, :3],
+        color=(100, 180, 255),
+        line_width=2.0,
+    )
+    server.scene.add_spline_catmull_rom(
+        "/traj/right/action",
+        positions=action_right[:, :3],
+        color=(100, 255, 100),
+        line_width=2.0,
+    )
+    server.scene.add_spline_catmull_rom(
+        "/traj/right/ik_fk",
+        positions=fk_right[:, :3],
+        color=(255, 120, 120),
+        line_width=2.0,
+    )
+
+    # 标注起点终点
+    server.scene.add_point_cloud(
+        "/markers/start",
+        points=np.array([state_left[0, :3], state_right[0, :3]], dtype=np.float32),
+        colors=np.array([[0, 0, 255], [0, 0, 255]], dtype=np.uint8),
+        point_size=0.015,
+    )
+    server.scene.add_point_cloud(
+        "/markers/end",
+        points=np.array([state_left[-1, :3], state_right[-1, :3]], dtype=np.float32),
+        colors=np.array([[255, 0, 0], [255, 0, 0]], dtype=np.uint8),
+        point_size=0.015,
+    )
+
+    # 预加载URDF可视mesh
+    mesh_handles = []
+    mesh_cache = {}
+    for geom_idx, geom_obj in enumerate(geom_model.geometryObjects):
+        mesh_path = getattr(geom_obj, "meshPath", "")
+        if not mesh_path:
+            continue
+        mesh_path = str(mesh_path)
+        if not Path(mesh_path).exists():
+            candidate = Path(mesh_dir) / Path(mesh_path).name
+            if candidate.exists():
+                mesh_path = str(candidate)
+            else:
+                continue
+        if mesh_path not in mesh_cache:
+            try:
+                mesh_cache[mesh_path] = trimesh.load(mesh_path, force="mesh")
+            except Exception:
+                continue
+        trimesh_mesh = mesh_cache[mesh_path].copy()
+        mesh_scale = np.asarray(getattr(geom_obj, "meshScale", np.ones(3)), dtype=np.float32)
+        trimesh_mesh.vertices = trimesh_mesh.vertices * mesh_scale.reshape(1, 3)
+        handle = server.scene.add_mesh_trimesh(f"/robot/visual_{geom_idx}", trimesh_mesh)
+        mesh_handles.append((geom_idx, handle))
+
+    if not mesh_handles:
+        print("⚠️ 未加载到任何URDF mesh，请检查 --urdf-path 与 --mesh-dir")
+    else:
+        print(f"✅ 已加载 {len(mesh_handles)} 个URDF visual mesh")
+
+    # 关节映射：将14维输入映射到pin模型前14个可动关节
+    q0 = pin.neutral(pin_model)
+    non_fixed_joint_ids = []
+    for joint_id in range(1, pin_model.njoints):
+        if pin_model.joints[joint_id].nq > 0:
+            non_fixed_joint_ids.append(joint_id)
+    if len(non_fixed_joint_ids) < 14:
+        print(f"⚠️ URDF可动关节数量不足14（实际={len(non_fixed_joint_ids)}），将尽量映射")
+
+    q_indices = [pin_model.idx_qs[jid] for jid in non_fixed_joint_ids[:14]]
+    for q_idx in q_indices:
+        q0[q_idx] = 0.0
+
+    def render_frame(frame_id: int):
+        frame_id = int(np.clip(frame_id, 0, ik_joint_traj.shape[0] - 1))
+        q = q0.copy()
+        joints14 = ik_joint_traj[frame_id]
+        for i, q_idx in enumerate(q_indices):
+            if i < len(joints14):
+                q[q_idx] = float(joints14[i])
+        pin.forwardKinematics(pin_model, pin_data, q)
+        pin.updateFramePlacements(pin_model, pin_data)
+        pin.updateGeometryPlacements(pin_model, pin_data, geom_model, geom_data)
+
+        for geom_idx, handle in mesh_handles:
+            T_world_geom = geom_data.oMg[geom_idx]
+            pos, wxyz = _se3_to_viser_pose(T_world_geom)
+            handle.position = pos
+            handle.wxyz = wxyz
+
+    # GUI控制
+    frame_slider = server.gui.add_slider(
+        "Frame",
+        min=0,
+        max=int(ik_joint_traj.shape[0] - 1),
+        step=1,
+        initial_value=0,
+    )
+    play_toggle = server.gui.add_checkbox("Play", initial_value=False)
+    loop_toggle = server.gui.add_checkbox("Loop", initial_value=loop)
+    fps_slider = server.gui.add_slider("FPS", min=1, max=60, step=1, initial_value=int(fps))
+
+    @frame_slider.on_update
+    def _(_event):
+        render_frame(frame_slider.value)
+
+    render_frame(0)
+    print("💡 打开网页后可拖动 Frame，或勾选 Play 自动播放。Ctrl+C 退出。")
+    try:
+        while True:
+            if play_toggle.value:
+                nxt = frame_slider.value + 1
+                if nxt > frame_slider.max:
+                    if loop_toggle.value:
+                        nxt = frame_slider.min
+                    else:
+                        nxt = frame_slider.max
+                        play_toggle.value = False
+                frame_slider.value = int(nxt)
+            time.sleep(1.0 / max(1, int(fps_slider.value)))
+    except KeyboardInterrupt:
+        print("\n🛑 Viser visualization stopped.")
+
+
 def main():
     parser = argparse.ArgumentParser(description='验证IK和FK一致性')
     parser.add_argument('--dataset-path', type=str, required=True,
@@ -648,6 +846,15 @@ def main():
                        help='显示交互式图表（默认：保存静态图片后自动关闭）')
     parser.add_argument('--no-save', action='store_true',
                        help='不保存图片文件，只显示交互式图表')
+    parser.add_argument('--viser', action='store_true',
+                       help='启用viser 3D网页可视化（含URDF+mesh）')
+    parser.add_argument('--viser-host', type=str, default='0.0.0.0',
+                       help='viser服务监听地址（默认0.0.0.0）')
+    parser.add_argument('--viser-port', type=int, default=8080,
+                       help='viser服务端口（默认8080）')
+    parser.add_argument('--mesh-dir', type=str,
+                       default='/home/lab/kuavo-manip/lerobot_datasets/utils/biped_s62_meshes',
+                       help='URDF mesh目录（用于viser加载visual mesh）')
     
     args = parser.parse_args()
     
@@ -726,6 +933,7 @@ def main():
     action_right_list = []
     fk_left_list = []
     fk_right_list = []
+    ik_joint_list = []
     
     print(f"\n🔄 Processing {len(episode_frames)} frames...")
     for frame_idx in tqdm(episode_frames):
@@ -754,6 +962,7 @@ def main():
         action_right_list.append(eef_data['action_right_eef'])
         fk_left_list.append(ik_fk_result['fk_left_eef'])
         fk_right_list.append(ik_fk_result['fk_right_eef'])
+        ik_joint_list.append(np.concatenate([ik_fk_result['ik_left_joints'], ik_fk_result['ik_right_joints']]))
     
     # 转换为numpy数组
     state_left = np.array(state_left_list)
@@ -762,6 +971,7 @@ def main():
     action_right = np.array(action_right_list)
     fk_left = np.array(fk_left_list)
     fk_right = np.array(fk_right_list)
+    ik_joint_traj = np.array(ik_joint_list)
     
     print(f"\n✅ Data processing completed!")
     print(f"   State left shape: {state_left.shape}")
@@ -830,6 +1040,23 @@ def main():
     
     if not args.no_save:
         print(f"\n✅ All visualizations saved to {output_dir}")
+
+    if args.viser:
+        print("\n🌐 Launching viser visualization...")
+        visualize_with_viser(
+            urdf_path=args.urdf_path,
+            mesh_dir=args.mesh_dir,
+            model_type=args.model_type,
+            state_left=state_left,
+            state_right=state_right,
+            action_left=action_left,
+            action_right=action_right,
+            fk_left=fk_left,
+            fk_right=fk_right,
+            ik_joint_traj=ik_joint_traj,
+            host=args.viser_host,
+            port=args.viser_port,
+        )
     
     # 检查后端是否支持交互式显示
     backend = matplotlib.get_backend()
