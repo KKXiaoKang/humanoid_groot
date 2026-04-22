@@ -3255,7 +3255,7 @@ if __name__ == '__main__':
     parser.add_argument('--claw-locked-value', type=float, default=80.0,
                         help='Claw value to use when locked (fully closed). Default: 80.0')
     parser.add_argument('--ik-model-type', type=str, default='60',
-                        choices=['45', '46', '60'],
+                        choices=['45', '46', '60', '62'],
                         help='Robot model type for IK solving (default: 60). Used when action space is EEF (20D).')
     parser.add_argument('--pause-before-chunk', action='store_true',
                         help='If set, pause before executing each chunk to allow inspection. '

@@ -633,7 +633,7 @@ def main():
                        default='/home/lab/kuavo-manip/lerobot_datasets/utils/biped_s60_only_arm.urdf',
                        help='URDF文件路径')
     parser.add_argument('--model-type', type=str, default='45',
-                       choices=['45', '46', '60'],
+                       choices=['45', '46', '60', '62'],
                        help='机器人型号')
     parser.add_argument('--episode-idx', type=int, default=0,
                        help='要分析的episode索引')

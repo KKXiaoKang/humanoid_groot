@@ -1715,7 +1715,7 @@ if __name__ == "__main__":
     parser.add_argument('--publish-arm-commands', action='store_true',
                        help='Publish arm joint commands to ROS topic /kuavo_arm_traj. Requires 20D EEF action space and ROS available.')
     parser.add_argument('--ik-model-type', type=str, default='60',
-                       choices=['45', '46', '60'],
+                       choices=['45', '46', '60', '62'],
                        help='Robot model type for IK solving (default: 60). Used when --publish-arm-commands is enabled.')
 
     args = parser.parse_args()
