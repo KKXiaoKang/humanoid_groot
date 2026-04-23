@@ -25,6 +25,25 @@ from termcolor import colored
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.utils.constants import PRETRAINED_MODEL_DIR
 
+WANDB_TAG_MAX_LEN = 64
+
+
+def sanitize_wandb_tags(tags: list[str]) -> list[str]:
+    """Return tags that satisfy wandb's per-tag length constraint."""
+    sanitized_tags: list[str] = []
+    for tag in tags:
+        if len(tag) <= WANDB_TAG_MAX_LEN:
+            sanitized_tags.append(tag)
+            continue
+
+        # Keep the run alive by dropping invalid tags instead of failing at wandb.init.
+        logging.warning(
+            "Dropping wandb tag longer than %d chars: %s",
+            WANDB_TAG_MAX_LEN,
+            tag,
+        )
+    return sanitized_tags
+
 
 def cfg_to_group(cfg: TrainPipelineConfig, return_list: bool = False) -> list[str] | str:
     """Return a group name for logging. Optionally returns group name as list."""
@@ -77,13 +96,14 @@ class WandBLogger:
             if cfg.resume
             else None
         )
+        tags = sanitize_wandb_tags(cfg_to_group(cfg, return_list=True))
         wandb.init(
             id=wandb_run_id,
             project=self.cfg.project,
             entity=self.cfg.entity,
             name=self.job_name,
             notes=self.cfg.notes,
-            tags=cfg_to_group(cfg, return_list=True),
+            tags=tags,
             dir=self.log_dir,
             config=cfg.to_dict(),
             # TODO(rcadene): try set to True
