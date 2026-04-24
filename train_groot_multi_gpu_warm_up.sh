@@ -1,0 +1,318 @@
+#!/bin/bash
+
+# ============================================================================
+# Groot模型多卡训练脚本
+# ============================================================================
+# 使用 accelerate launch 启动多卡分布式训练
+# 
+# 使用方法:
+#   bash train_groot_multi_gpu.sh                    # 使用所有可用GPU
+#   bash train_groot_multi_gpu.sh --gpu 0,1,2        # 使用指定的GPU
+#   bash train_groot_multi_gpu.sh -g 0,1             # 使用GPU 0和1
+#
+# 重要提示 - 学习率缩放:
+#   LeRobot不会自动缩放学习率，多卡训练时需要手动缩放
+#   - 8卡训练时，有效batch size = batch_size × 8
+#   - 学习率应该相应缩放: lr = base_lr × num_gpus (线性缩放)
+#   - 脚本会自动根据GPU数量计算并应用缩放后的学习率
+#   - 如果效果不理想，可以尝试平方根缩放 (修改 LR_SCALING_MODE="sqrt")
+# ============================================================================
+
+# 设置输出目录
+# OUTPUT_DIR="./outputs/0113_h100x4_groot_cross_attention_narrower_very_conservative_mix_dense"
+OUTPUT_DIR="./outputs/0423_BEIJING_ABS_JOINT_groot_depalletize_wider_box"
+JOB_NAME="0423_BEIJING_ABS_JOINT_groot_depalletize_wider_box"
+
+# ============================================================================
+# 初始化权重配置（Warm Start）
+# ============================================================================
+# 方式A: 使用官方基础模型（默认）
+#   留空 INIT_POLICY_PATH，使用 BASE_MODEL_PATH
+# 方式B: 使用本地checkpoint作为初始化权重（推荐用于继续微调新数据）
+#   设置 INIT_POLICY_PATH 为 checkpoint 下的 pretrained_model 目录
+#   注意：这是“加载权重继续训练”，不是 resume（不会恢复旧optimizer/step）
+# ============================================================================
+BASE_MODEL_PATH="nvidia/GR00T-N1.5-3B"
+INIT_POLICY_PATH="/home/zhangtianchu/humanoid_groot/outputs/0423_BEIJING_ABS_JOINT_groot_depalletize_narrower_box/checkpoints/020000/pretrained_model"
+
+# 数据集配置
+# ============================================================================
+# 单数据集配置（原方式）:
+#   - root 应该直接指向数据集目录（包含 meta/ 和 data/ 的目录）
+#   - repo_id 为单个数据集名称
+# 
+# 多数据集配置（新方式）:
+#   - root 应该指向包含所有数据集目录的父目录
+#   - repo_id 为逗号分隔的多个数据集名称
+#   例如: DATASET_REPO_ID="dataset1,dataset2,dataset3"
+#   数据集路径: ${DATASET_ROOT}/dataset1/, ${DATASET_ROOT}/dataset2/, ...
+# ============================================================================
+
+# 单数据集配置（当前使用）
+# DATASET_ROOT="/home/zhicheng/KangKK/humanoid_groot/lerobot_data/1125_groot_train_data_with_task_filtered"
+# DATASET_REPO_ID="1125_groot_train_data_with_task_filtered"
+
+# 多数据集配置（使用两个数据集）
+# DATASET_ROOT="/home/kangkk/humanoid_groot/lerobot_data/split_dataset/narrower"
+# DATASET_ROOT="/home/zhangtianchu/humanoid_groot/lerobot_data/narrower"
+DATASET_ROOT="/home/zhangtianchu/humanoid_groot/lerobot_data/wider"
+
+# DATASET_REPO_ID="dense,mix,4322,four,random,4622_fail_rc"
+# DATASET_REPO_ID="dense,mix,four,random,4322_2X2,4322_3X2,4322_mix_fail"
+# DATASET_REPO_ID="2X2,3X2,4322_mix_fail,4322_short_dense,BEIJING_01,dense,mix,random,unpack_4322_long_dense,four,BEIJING_02"
+DATASET_REPO_ID="4611_mix_fail,4622_rc,BEIJING_01,BEIJING_02,dense,four,mix,random"
+
+# GPU选择配置
+# 方式1: 通过命令行参数指定 (推荐)
+#   用法: bash train_groot_multi_gpu.sh --gpu 0,1,2
+#   或:    bash train_groot_multi_gpu.sh -g 0,1
+# 方式2: 在脚本中直接设置下面的 GPU_IDS_DEFAULT 变量作为默认值
+GPU_IDS_DEFAULT=""
+
+# 解析命令行参数
+GPU_IDS="$GPU_IDS_DEFAULT"
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --gpu|-g)
+            GPU_IDS="$2"
+            shift 2
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
+
+# 环境变量设置
+export TOKENIZERS_PARALLELISM=false
+
+# 设置CUDA可见设备并计算GPU数量
+if [ -n "$GPU_IDS" ]; then
+    export CUDA_VISIBLE_DEVICES=$GPU_IDS
+    # 计算GPU数量（通过逗号分隔的ID数量）
+    NUM_GPUS=$(echo "$GPU_IDS" | tr ',' '\n' | wc -l)
+    echo "=========================================="
+    echo "指定使用GPU: $GPU_IDS"
+    echo "GPU数量: $NUM_GPUS"
+    echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+    echo "=========================================="
+else
+    # 如果没有指定，使用所有GPU
+    # 使用Python来准确检测可见的GPU数量（考虑CUDA_VISIBLE_DEVICES）
+    NUM_GPUS=$(python3 -c "import torch; print(torch.cuda.device_count())" 2>/dev/null || nvidia-smi --list-gpus | wc -l)
+    echo "=========================================="
+    echo "使用所有可用GPU"
+    echo "检测到GPU数量: $NUM_GPUS"
+    echo "=========================================="
+fi
+
+# 验证GPU数量
+if [ "$NUM_GPUS" -lt 1 ]; then
+    echo "错误: 未检测到可用的GPU！"
+    exit 1
+fi
+
+# 训练参数 (可根据GPU内存调整)
+# 注意: batch_size 是每个GPU的batch size，总的有效batch size = batch_size * num_gpus
+BATCH_SIZE=21          # 每个GPU的batch size
+NUM_STEPS=20000        # 训练步数
+SAVE_FREQ=2000         # 每8000步保存一次checkpoint
+LOG_FREQ=100           # 每100步打印一次日志
+EVAL_FREQ=0            # 设置为0禁用评估
+NUM_WORKERS=8          # 数据加载器工作进程数（每个GPU）
+
+# ============================================================================
+# Delta EEF模式下的Reference Pose来源配置
+# ============================================================================
+# 当 action_space_type="Delta eef" 时，relative action是这样计算的：
+#   relative_action = absolute_action - reference_pose
+#
+# 这个参数控制 reference_pose 的来源：
+#   - "state": 使用 observation.state 作为 reference（推荐！）
+#             训练: state来自数据集（机器人录制时的实际状态）
+#             推理: state来自FK（机器人当前的实际状态）
+#             ✅ 训练和推理使用一致的reference来源！
+#
+#   - "action": 使用 action[0] 作为 reference（旧方式）
+#             训练: action[0]是指令位姿
+#             推理: state来自FK（实际位姿）
+#             ⚠️  训练和推理的reference来源不一致，可能导致跟踪误差累积！
+# ============================================================================
+RELATIVE_ACTION_REF_MODE="state"  # "state" (推荐) 或 "action" (旧方式)
+
+# ============================================================================
+# 操作模式配置（单手/双手）
+# ============================================================================
+# manipulation_mode 控制机器人的操作模式：
+#   - "bimanual": 双手操作（默认）
+#                 EEF模式: 20D (9D左手 + 9D右手 + 2D夹爪)
+#                 Joint模式: 16D (7D左臂 + 7D右臂 + 2D夹爪)
+#
+#   - "single_left_arm": 仅左手操作
+#                 EEF模式: 10D (9D左手 + 1D夹爪)
+#                 Joint模式: 8D (7D左臂 + 1D夹爪)
+#
+#   - "single_right_arm": 仅右手操作
+#                 EEF模式: 10D (9D右手 + 1D夹爪)
+#                 Joint模式: 8D (7D右臂 + 1D夹爪)
+# ============================================================================
+MANIPULATION_MODE="bimanual"  # "bimanual", "single_left_arm", 或 "single_right_arm"
+
+# 学习率配置
+# ============================================================================
+# 重要: LeRobot不会自动缩放学习率，需要手动根据GPU数量缩放
+# 
+# 学习率缩放策略:
+#   - linear: BASE_LR × NUM_GPUS (线性缩放，适用于大batch size)
+#   - sqrt: BASE_LR × √NUM_GPUS (平方根缩放，适用于中等batch size)
+#   - conservative: BASE_LR × NUM_GPUS^0.4 (更保守，比sqrt更小)
+#   - very_conservative: BASE_LR × NUM_GPUS^0.3 (非常保守，适合训练不稳定时)
+#   - fixed_scale: BASE_LR × FIXED_SCALE_FACTOR (固定缩放因子，手动控制)
+# 
+# 对于3卡训练，有效batch size = 16 × 3 = 48
+# 如果出现loss震荡，建议使用 conservative 或 very_conservative
+# ============================================================================
+BASE_LR=1e-4           # 单卡时的基础学习率
+LR_SCALING_MODE="very_conservative"  # "linear", "sqrt", "conservative", "very_conservative", "fixed_scale"
+FIXED_SCALE_FACTOR=1.3  # 仅在 LR_SCALING_MODE="fixed_scale" 时使用
+
+# 根据GPU数量自动计算缩放后的学习率
+if [ "$LR_SCALING_MODE" = "linear" ]; then
+    # 线性缩放: lr = base_lr × num_gpus
+    SCALED_LR=$(python3 -c "print('{:.6f}'.format($BASE_LR * $NUM_GPUS))")
+    echo "使用线性缩放: lr = ${BASE_LR} × ${NUM_GPUS} = ${SCALED_LR}"
+elif [ "$LR_SCALING_MODE" = "sqrt" ]; then
+    # 平方根缩放: lr = base_lr × √num_gpus
+    SCALED_LR=$(python3 -c "import math; print('{:.6f}'.format($BASE_LR * math.sqrt($NUM_GPUS)))")
+    echo "使用平方根缩放: lr = ${BASE_LR} × √${NUM_GPUS} = ${SCALED_LR}"
+elif [ "$LR_SCALING_MODE" = "conservative" ]; then
+    # 保守缩放: lr = base_lr × num_gpus^0.4 (比sqrt更保守)
+    SCALED_LR=$(python3 -c "import math; print('{:.6f}'.format($BASE_LR * math.pow($NUM_GPUS, 0.4)))")
+    echo "使用保守缩放: lr = ${BASE_LR} × ${NUM_GPUS}^0.4 = ${SCALED_LR}"
+elif [ "$LR_SCALING_MODE" = "very_conservative" ]; then
+    # 非常保守缩放: lr = base_lr × num_gpus^0.3 (非常保守，适合训练不稳定时)
+    SCALED_LR=$(python3 -c "import math; print('{:.6f}'.format($BASE_LR * math.pow($NUM_GPUS, 0.3)))")
+    echo "使用非常保守缩放: lr = ${BASE_LR} × ${NUM_GPUS}^0.3 = ${SCALED_LR}"
+elif [ "$LR_SCALING_MODE" = "fixed_scale" ]; then
+    # 固定缩放: lr = base_lr × fixed_scale_factor
+    SCALED_LR=$(python3 -c "print('{:.6f}'.format($BASE_LR * $FIXED_SCALE_FACTOR))")
+    echo "使用固定缩放: lr = ${BASE_LR} × ${FIXED_SCALE_FACTOR} = ${SCALED_LR}"
+else
+    echo "错误: 未知的学习率缩放模式: ${LR_SCALING_MODE}"
+    echo "支持的模式: linear, sqrt, conservative, very_conservative, fixed_scale"
+    exit 1
+fi
+
+# 是否从checkpoint继续训练
+RESUME=false
+
+# 图像增强配置文件路径（可选）
+# 如果设置了此变量且文件存在，将使用配置文件中的图像增强设置
+# 配置文件应包含完整的 image_transforms 配置，包括 tfs 字典
+# 如果未设置或文件不存在，将使用命令行参数中的基本配置
+# 注意：命令行参数会覆盖配置文件中的对应设置
+IMAGE_TRANSFORMS_CONFIG_PATH="config/image_transforms.json"
+
+# 使用 accelerate launch 启动多卡训练
+# --multi_gpu: 启用多GPU训练（必需）
+# --num_processes: 进程数量（等于GPU数量）
+# --mixed_precision=bf16: 使用bf16混合精度训练（匹配policy.use_bf16=true）
+# 注意: 使用 $(which lerobot-train) 确保使用正确的命令路径
+# 
+# 关于图像增强配置:
+# - 如果设置了 IMAGE_TRANSFORMS_CONFIG_PATH 且文件存在，将使用配置文件
+# - 配置文件中的设置会被命令行参数覆盖（如果同时提供）
+# - random_order 参数说明:
+#   * False: 按照变换的默认顺序应用（brightness -> contrast -> saturation -> ...）
+#   * True: 随机打乱变换的应用顺序，增加数据增强的多样性
+
+# 'Absolute joint', 'Absolute eef', or 'Delta eef'
+# 打印配置信息
+echo ""
+echo "=========================================="
+echo "🔄 动作空间配置:"
+echo "   action_space_type: Absolute joint"
+echo "   manipulation_mode: ${MANIPULATION_MODE}"
+if [ "$MANIPULATION_MODE" = "bimanual" ]; then
+    echo "   🤲 双手操作模式 (20D: 9+9+2)"
+elif [ "$MANIPULATION_MODE" = "single_left_arm" ]; then
+    echo "   🦾 单手操作模式 - 仅左手 (10D: 9+1)"
+elif [ "$MANIPULATION_MODE" = "single_right_arm" ]; then
+    echo "   🦾 单手操作模式 - 仅右手 (10D: 9+1)"
+fi
+echo ""
+echo "   relative_action_reference_mode: ${RELATIVE_ACTION_REF_MODE}"
+if [ "$RELATIVE_ACTION_REF_MODE" = "state" ]; then
+    echo "   ✅ 使用 observation.state 作为 reference pose (推荐)"
+    echo "   ✅ 训练和推理使用一致的 reference 来源"
+else
+    echo "   ⚠️  使用 action[0] 作为 reference pose (旧方式)"
+    echo "   ⚠️  注意: 可能存在训练-推理不一致问题"
+fi
+echo "=========================================="
+echo ""
+
+# 初始化权重信息
+if [ -n "$INIT_POLICY_PATH" ] && [ -d "$INIT_POLICY_PATH" ]; then
+    echo "✅ 初始化方式: 本地checkpoint warm-start"
+    echo "   policy.path: ${INIT_POLICY_PATH}"
+else
+    echo "✅ 初始化方式: 官方基础模型"
+    echo "   base_model_path: ${BASE_MODEL_PATH}"
+fi
+echo ""
+
+# 'Absolute joint', 'Absolute eef', or 'Delta eef'
+accelerate launch \
+  --multi_gpu \
+  --num_processes=${NUM_GPUS} \
+  --mixed_precision=bf16 \
+  $(which lerobot-train) \
+  $(if [ -n "$IMAGE_TRANSFORMS_CONFIG_PATH" ] && [ -f "$IMAGE_TRANSFORMS_CONFIG_PATH" ]; then echo "--config_path=${IMAGE_TRANSFORMS_CONFIG_PATH}"; fi) \
+  --output_dir=${OUTPUT_DIR} \
+  --job_name=${JOB_NAME} \
+  --resume=${RESUME} \
+  --save_checkpoint=true \
+  --batch_size=${BATCH_SIZE} \
+  --steps=${NUM_STEPS} \
+  --save_freq=${SAVE_FREQ} \
+  --log_freq=${LOG_FREQ} \
+  --eval_freq=${EVAL_FREQ} \
+  --num_workers=${NUM_WORKERS} \
+  --seed=42 \
+  \
+  --policy.type=groot \
+  $(if [ -n "$INIT_POLICY_PATH" ] && [ -d "$INIT_POLICY_PATH" ]; then echo "--policy.path=${INIT_POLICY_PATH}"; else echo "--policy.base_model_path=${BASE_MODEL_PATH}"; fi) \
+  --policy.push_to_hub=false \
+  --policy.tune_llm=true \
+  --policy.tune_visual=true \
+  --policy.tune_projector=true \
+  --policy.tune_diffusion_model=true \
+  --policy.use_bf16=true \
+  --policy.max_state_dim=64 \
+  --policy.max_action_dim=32 \
+  --policy.action_space_type="Absolute joint" \
+  --policy.manipulation_mode="${MANIPULATION_MODE}" \
+  --policy.relative_action_reference_mode="${RELATIVE_ACTION_REF_MODE}" \
+  --policy.optimizer_lr=${SCALED_LR} \
+  --policy.warmup_ratio=0.10 \
+  --policy.chunk_size=32 \
+  --policy.n_action_steps=32 \
+  \
+  --dataset.repo_id=${DATASET_REPO_ID} \
+  --dataset.root=${DATASET_ROOT} \
+  --dataset.video_backend="decord" \
+  $(if [ -z "$IMAGE_TRANSFORMS_CONFIG_PATH" ] || [ ! -f "$IMAGE_TRANSFORMS_CONFIG_PATH" ]; then echo "--dataset.image_transforms.enable=True --dataset.image_transforms.max_num_transforms=2 --dataset.image_transforms.random_order=False"; fi) \
+  --wandb.enable=true \
+  --wandb.disable_artifact=true \
+  --wandb.project="groot-depalletize"
+
+echo ""
+echo "=========================================="
+echo "训练完成！"
+echo "模型保存在: ${OUTPUT_DIR}"
+echo "Checkpoints保存在: ${OUTPUT_DIR}/checkpoints/"
+echo "有效batch size: ${BATCH_SIZE} x ${NUM_GPUS} = $((BATCH_SIZE * NUM_GPUS))"
+echo "学习率配置: 基础LR=${BASE_LR}, 缩放后LR=${SCALED_LR} (${LR_SCALING_MODE}缩放)"
+echo "=========================================="
+
