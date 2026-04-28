@@ -210,6 +210,10 @@ except ImportError:
     pin = None
     print("⚠️  Pinocchio not available. Forward kinematics will be disabled.")
 
+
+# DAgger导入
+from scripts.utils.DAgger import DAgger
+
 # ========== EEF Space 工具函数 ==========
 
 class PinocchioFK:
@@ -2201,7 +2205,7 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
                        sync_mode=False, max_joint_velocity=None, constant_velocity=False, action_stride=1,
                        eef_info=None, ik_model_type='60', pause_before_chunk=False,
                        use_predicted_as_reference=False, lock_right_arm=False, right_arm_lock_values=None,
-                       lock_left_arm=False, left_arm_lock_values=None):
+                       lock_left_arm=False, left_arm_lock_values=None, dagger=None):
     """
     运行推理循环（可以多次调用，每次调用开始新的推理会话）
     
@@ -2236,6 +2240,7 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
         right_arm_lock_values: 右手关节锁定值（7个值的numpy数组）。如果为None且lock_right_arm=True，将从JSON文件加载。
         lock_left_arm: 是否锁定左手关节。如果True，在执行action时，左手关节（索引0-6）将被设置为固定值。
         left_arm_lock_values: 左手关节锁定值（7个值的numpy数组）。如果为None且lock_left_arm=True，将从JSON文件加载。
+        dagger: DAgger实例（可选）。若扳机按下，会暂停策略对 env.exec_actions 的发布。
     
     Returns:
         bool: True表示正常退出（按q），False表示被中断（Ctrl+C）
@@ -2408,6 +2413,7 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
     
     # 同步模式：执行完整个chunk后再推理下一个
     if sync_mode:
+        prev_dagger_relay_active = dagger.is_relay_active() if dagger is not None else False
         while True:
             try:
                 # 重置 reference pose（根据 use_predicted_as_reference 决定是否使用上一个预测的绝对位姿）
@@ -3063,6 +3069,7 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
                 
                 # 执行整个chunk
                 rospy.loginfo(f"Executing chunk of size {action_chunk.shape[0]} in sync mode")
+                need_repredict_after_dagger_release = False
                 
                 # 默认执行双手
                 arm_execution_mode = 'both'
@@ -3207,6 +3214,8 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
                 for action_idx, action_step in enumerate(action_chunk):
                     # 根据arm_execution_mode修改action
                     action_to_execute = action_step.copy()
+                    did_exec_action = False
+                    relay_active_now = dagger.is_relay_active() if dagger is not None else False
                     
                     if arm_execution_mode == 'left' and current_arm_state_for_hold is not None:
                         # 只执行左手，右手保持不动
@@ -3238,19 +3247,46 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
                             "[CLAW_CMD] left=%.4f right=%.4f (传入 env.exec_actions；若未 --disable-claw-lock，实发可能经 _apply_claw_lock 调整)"
                             % (float(action_to_execute[14]), float(action_to_execute[15])),
                         )
-                    env.exec_actions(actions=action_to_execute,
-                                     control_arm=control_arm,
-                                     control_claw=control_claw,
-                                     control_cmd_pose=control_cmd_pose)
-                    step_counter += 1
-                    last_executed_action = action_to_execute.copy()  # 记录实际执行的action
+                    if relay_active_now:
+                        rospy.loginfo_throttle(
+                            1.0,
+                            "[DAgger] 检测到扳机按下，暂停策略 env.exec_actions 发布（由人工轨迹接管）。"
+                        )
+                        # 保持循环节奏，避免同步模式下空转占满CPU
+                        time.sleep(env.control_dt)
+                    else:
+                        if prev_dagger_relay_active:
+                            # 从 DAgger 接管切回策略：丢弃旧动作，基于最新状态重新推理
+                            pending_actions = len(resampled_action_queue)
+                            resampled_action_queue.clear()
+                            last_executed_action = None
+                            last_executed_absolute_action = None
+                            # 关键：切回策略后，强制使用一次 first_chunk 过渡，
+                            # 从当前真实状态平滑衔接到新预测动作，避免动作跳变
+                            FIRST_MODEL_INFERENCE = True
+                            rospy.loginfo(
+                                "[DAgger] 检测到从遥操切回策略，已清空待执行动作队列(%d)并重置桥接状态；"
+                                "将基于当前 state 重新预测 action，并启用首帧平滑过渡。"
+                                % pending_actions
+                            )
+                            need_repredict_after_dagger_release = True
+                            prev_dagger_relay_active = relay_active_now
+                            break
+                        env.exec_actions(actions=action_to_execute,
+                                         control_arm=control_arm,
+                                         control_claw=control_claw,
+                                         control_cmd_pose=control_cmd_pose)
+                        did_exec_action = True
+                        step_counter += 1
+                        last_executed_action = action_to_execute.copy()  # 记录实际执行的action
+                    prev_dagger_relay_active = relay_active_now
                     
                     # ===== 统一发布所有EEF pose话题（使用相同时间戳，确保时间轴连续） =====
                     # 在每次env.exec_actions后，使用相同的时间戳发布所有相关话题：
                     # 1. real_state: 从当前机器人状态FK计算
                     # 2. predicted_absolute: 对应的预测EEF pose
                     # 3. ik_fk_roundtrip: 从执行的joint action FK计算
-                    if eef_visualizer is not None and is_eef_mode and fk_getter is not None:
+                    if did_exec_action and eef_visualizer is not None and is_eef_mode and fk_getter is not None:
                         try:
                             # 获取统一的时间戳（在获取状态之前，确保所有话题使用相同时间戳）
                             unified_timestamp = rospy.Time.now()
@@ -3366,6 +3402,11 @@ def run_inference_loop(policy, preprocessor, postprocessor, env, task_descriptio
                         FIRST_MODEL_INFERENCE = True
                         return True
                 
+                if need_repredict_after_dagger_release:
+                    # 立刻刷新观测并回到 while 顶部重新推理，避免继续消费旧 chunk
+                    obs_data, camera_obs, camera_obs_ts, robot_obs, robot_obs_ts = env.get_obs()
+                    continue
+                
                 # 执行完chunk后，获取新的观测
                 obs_data, camera_obs, camera_obs_ts, robot_obs, robot_obs_ts = env.get_obs()
                 
@@ -3473,7 +3514,7 @@ def final_reset_arm(json_path, env, control_arm=True, control_claw=True):
     rospy.loginfo("Arm reset completed!")
 
 
-def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chunk_size=50, enable_gui=False, rotate_head_camera=False, state_zero=False, task_description=None, chunk_start=None, chunk_end=None, model_action_dt=None, sync_mode=False, max_joint_velocity=None, constant_velocity=False, action_stride=1, claw_lock_threshold=50.0, claw_lock_count_threshold=5, claw_locked_value=90.0, ik_model_type='60', pause_before_chunk=False, use_predicted_as_reference=False, enable_eef_visualization=False, clear_visualization_on_reset=False, lock_right_arm=False, right_arm_lock_json_path=None, lock_left_arm=False, left_arm_lock_json_path=None):
+def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chunk_size=50, enable_gui=False, rotate_head_camera=False, state_zero=False, task_description=None, chunk_start=None, chunk_end=None, model_action_dt=None, sync_mode=False, max_joint_velocity=None, constant_velocity=False, action_stride=1, claw_lock_threshold=50.0, claw_lock_count_threshold=5, claw_locked_value=90.0, ik_model_type='60', pause_before_chunk=False, use_predicted_as_reference=False, enable_eef_visualization=False, clear_visualization_on_reset=False, lock_right_arm=False, right_arm_lock_json_path=None, lock_left_arm=False, left_arm_lock_json_path=None, dagger=None):
     """
     在这里和实机/仿真交互，做网络推理（depalletize任务）
     支持多次推理：按'q'退出当前推理，可以快速重新开始下一次推理而无需重新加载模型
@@ -3506,6 +3547,7 @@ def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chun
         lock_left_arm: 是否锁定左手关节。如果True，在执行action时，左手关节（索引0-6）将被设置为从JSON文件加载的固定值。
         left_arm_lock_json_path: JSON文件路径，包含左手关节锁定值。如果为None，使用默认路径：scripts/utils/start_arm_traj_claw.json。
                                  将从arm_action[0][0:7]提取左手关节值（7个值）。
+        dagger: DAgger实例（可选）。若扳机按下，会暂停策略对 env.exec_actions 的发布。
     """
     
     # 加载模型和环境（只执行一次）
@@ -3641,7 +3683,8 @@ def eval(ckpt_path, model_type, control_arm=True, control_claw=True, action_chun
                 lock_right_arm=lock_right_arm,
                 right_arm_lock_values=right_arm_lock_values,
                 lock_left_arm=lock_left_arm,
-                left_arm_lock_values=left_arm_lock_values
+                left_arm_lock_values=left_arm_lock_values,
+                dagger=dagger
             )
             
             if normal_exit:
@@ -3771,6 +3814,9 @@ if __name__ == '__main__':
     parser.add_argument('--sync-mode', action='store_true',
                         help='Enable synchronous inference mode: inference -> execute chunk -> get_obs -> repeat. '
                              'In this mode, model_action_dt is ignored.')
+    parser.add_argument('--enable-dagger', action='store_true',
+                        help='Enable DAgger takeover mode. When enabled, trigger press switches to teleop relay; '
+                             'trigger release switches back to policy inference.')
     parser.add_argument('--max-joint-velocity', type=float, default=None,
                         help='Maximum joint velocity limit in rad/s. If provided, will apply speed limiting to arm joints. '
                              'Example: 2.0 means max 2.0 rad/s per joint.')
@@ -3845,6 +3891,14 @@ if __name__ == '__main__':
         print(f"⚡ Using custom MODEL_ACTION_DT: {args.model_action_dt:.3f}s (inference frequency: {1.0/args.model_action_dt:.1f} Hz)")
     else:
         print(f"⚡ Using default MODEL_ACTION_DT: {DEFAULT_MODEL_ACTION_DT:.3f}s (inference frequency: {1.0/DEFAULT_MODEL_ACTION_DT:.1f} Hz)")
+
+    # 按需初始化 DAgger（默认关闭）
+    dagger = None
+    if args.enable_dagger:
+        dagger = DAgger()
+        print("🕹️ DAgger mode: ENABLED (trigger can switch between teleop relay and policy inference)")
+    else:
+        print("🕹️ DAgger mode: DISABLED")
     
     # 根据命令行参数和相机配置初始化GUI窗口
     camera_config = {name: info for name, info in topic_info.items() if 'image' in name}
@@ -3881,6 +3935,8 @@ if __name__ == '__main__':
         print(f"🔄 Sync mode: Enabled")
     elif args.model_action_dt is not None:
         print(f"⚡ Model action DT: {args.model_action_dt:.3f}s (inference frequency: {1.0/args.model_action_dt:.1f} Hz)")
+    if args.enable_dagger:
+        print(f"🕹️ DAgger takeover: ENABLED")
     if args.max_joint_velocity is not None:
         print(f"🚦 Max joint velocity limit: {args.max_joint_velocity:.2f} rad/s")
     if args.constant_velocity:
@@ -3949,7 +4005,8 @@ if __name__ == '__main__':
              lock_right_arm=args.lock_right_arm,
              right_arm_lock_json_path=args.right_arm_lock_json_path,
              lock_left_arm=args.lock_left_arm,
-             left_arm_lock_json_path=args.left_arm_lock_json_path)
+             left_arm_lock_json_path=args.left_arm_lock_json_path,
+             dagger=dagger)
     elif args.replay:
         print("Replaying dataset trajectories")
         # 使用用户指定的数据集路径，如果没有指定则使用默认路径
