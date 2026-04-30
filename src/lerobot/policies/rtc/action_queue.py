@@ -216,7 +216,7 @@ class ActionQueue:
         if action_index_before_inference is None:
             return
 
-        indexes_diff = self.last_index - action_index_before_inference
+        indexes_diff = (self.last_index - action_index_before_inference) // 100
         print(f"[ACTION_QUEUE] indexes_diff: {indexes_diff}, real_delay: {real_delay}")
         if indexes_diff != real_delay:
             # Let's check that action index difference (real delay calculated based on action queue)

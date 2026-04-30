@@ -9,7 +9,7 @@ import rospy
 
 from sensor_msgs.msg import Image
 # from kuavo_humanoid_sdk.ocs2_msgs.msg import mpc_observation
-from ocs2_msgs.msg import mpc_observation
+# from ocs2_msgs.msg import mpc_observation
 from sensor_msgs.msg import JointState
 from geometry_msgs.msg import Twist, Pose, PoseStamped
 from std_msgs.msg import Float64MultiArray

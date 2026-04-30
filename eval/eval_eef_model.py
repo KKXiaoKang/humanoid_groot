@@ -286,7 +286,7 @@ def rot6d_to_quaternion_xyzw(rot_6d: np.ndarray) -> np.ndarray:
     return quat
 
 
-def convert_eef_action_to_joint_action(eef_action: np.ndarray, model_type: str = '60') -> np.ndarray:
+def convert_eef_action_to_joint_action(eef_action: np.ndarray, model_type: str = '62') -> np.ndarray:
     """
     将20D EEF action转换为16D joint action（用于MuJoCo执行）
     
@@ -407,20 +407,21 @@ class RTCDemoConfig:
 
     # Get new actions horizon. The amount of executed steps after which will be requested new actions.
     # It should be higher than inference delay + execution horizon.
-    action_queue_size_to_get_new_actions: int = 90
+    action_queue_size_to_get_new_actions: int = 140
     
     # Task to execute
     task: str = field(default="Depalletize the box", metadata={"help": "Task to execute"})
 
     # IK configuration
     ik_model_type: str = field(
-        default="60",
+        default="62",
         metadata={"help": "Robot model type for IK solving ('45', '46', '60')"}
     )
     
     # URDF path for forward kinematics (used to convert joint positions to EEF pose for state)
     urdf_path: str = field(
-        default="/home/lab/kuavo-manip/lerobot_datasets/utils/biped_s60_only_arm.urdf",
+        # default="/home/lab/kuavo-manip/lerobot_datasets/utils/biped_s60_only_arm.urdf",
+        default="/mnt/ssd/CodeBase/kuavo-ros-control/src/kuavo_assets/models/biped_s62/urdf/drake/biped_v3_arm.urdf",
         metadata={"help": "URDF file path for forward kinematics (used to convert joint positions to EEF pose for state)"}
     )
 
@@ -450,7 +451,7 @@ class RTCDemoConfig:
 
     # Claw lock configuration
     disable_claw_lock: bool = field(
-        default=False,
+        default=True,
         metadata={"help": "Disable claw lock mechanism completely. If set, claw will never be locked."},
     )
     claw_lock_threshold: float = field(
@@ -468,7 +469,7 @@ class RTCDemoConfig:
 
     # Arm lock configuration
     lock_left_arm: bool = field(
-        default=False,
+        default=True,
         metadata={"help": "Lock left arm joints (indices 0-6) to fixed values loaded from JSON."},
     )
     left_arm_lock_json_path: str = field(
@@ -624,7 +625,7 @@ def resample_chunk_with_claw_hold(action_chunk: np.ndarray,
     return torch.from_numpy(resampled).to(device)
 
 
-def apply_first_chunk_smooth(action_chunk: torch.Tensor, obs_data: dict, env: GrabBoxMpcEnv, action_dim: int, ik_model_type: str = '60'):
+def apply_first_chunk_smooth(action_chunk: torch.Tensor, obs_data: dict, env: GrabBoxMpcEnv, action_dim: int, ik_model_type: str = '62'):
     """
     Apply smooth to the first chunk of actions.
     For EEF space (20D), we need to convert to joint space first for smooth interpolation.
