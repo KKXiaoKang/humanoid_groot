@@ -91,6 +91,9 @@ def update_policy(
 
     rabc_batch_weights = None
     rabc_batch_stats = None
+    rabc_mode = (
+        getattr(rabc_weights_provider, "mode", "rabc") if rabc_weights_provider is not None else None
+    )
     if rabc_weights_provider is not None:
         rabc_batch_weights, rabc_batch_stats = rabc_weights_provider.compute_batch_weights(batch)
         rabc_batch_weights = rabc_batch_weights.to(accelerator.device, non_blocking=True)
@@ -102,16 +105,35 @@ def update_policy(
             aux = output_dict.pop("rabc_aux_loss", None)
             epsilon = 1e-6
             w = rabc_batch_weights.to(device=per_sample_loss.device, dtype=per_sample_loss.dtype)
-            loss = (per_sample_loss * w).sum() / (w.sum() + epsilon)
+
+            # SARM paper (Eq. 7):  L = Σ w_i l_i / (Σ w_i + ε)
+            # ARM  paper:          L = E[ w_i l_i ]  ≈  mean(w_i * l_i)
+            if rabc_mode == "awbc":
+                loss = (per_sample_loss * w).mean()
+            else:
+                loss = (per_sample_loss * w).sum() / (w.sum() + epsilon)
+
             if aux is not None:
                 if not isinstance(aux, torch.Tensor):
                     aux = torch.tensor(aux, device=loss.device, dtype=loss.dtype)
                 else:
                     aux = aux.to(device=loss.device, dtype=loss.dtype)
                 loss = loss + aux
+
             output_dict["rabc_mean_weight"] = rabc_batch_stats["raw_mean_weight"]
             output_dict["rabc_num_zero_weight"] = rabc_batch_stats["num_zero_weight"]
             output_dict["rabc_num_full_weight"] = rabc_batch_stats["num_full_weight"]
+            for opt_key in (
+                "num_nan_delta",
+                "delta_batch_mean",
+                "delta_batch_std",
+                "gain_batch_mean",
+                "gain_batch_std",
+                "gain_b_lower",
+                "gain_b_upper",
+            ):
+                if opt_key in rabc_batch_stats:
+                    output_dict[f"rabc_{opt_key}"] = rabc_batch_stats[opt_key]
         else:
             loss, output_dict = policy.forward(batch)
         # TODO(rcadene): policy.unnormalize_outputs(out_dict)
@@ -287,19 +309,30 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         chunk_size = getattr(policy.config, "chunk_size", None)
         if chunk_size is None:
             raise ValueError("RA-BC requires policy.config.chunk_size (SARM progress lookahead Δ).")
+        rabc_mode_cfg = getattr(cfg, "rabc_mode", "rabc")
+        if rabc_mode_cfg not in ("rabc", "awbc"):
+            raise ValueError(f"rabc_mode must be 'rabc' or 'awbc', got {rabc_mode_cfg!r}")
         if is_main_process:
-            logging.info("Loading SARM progress for RA-BC from %s", cfg.rabc_progress_path)
             logging.info(
-                "RA-BC: chunk_size=%s from policy config, head_mode=%s",
+                "Loading progress for %s from %s",
+                rabc_mode_cfg.upper(),
+                cfg.rabc_progress_path,
+            )
+            logging.info(
+                "%s: chunk_size=%s from policy config, head_mode=%s, fallback_weight=%s",
+                rabc_mode_cfg.upper(),
                 chunk_size,
                 getattr(cfg, "rabc_head_mode", "sparse"),
+                getattr(cfg, "rabc_fallback_weight", 1.0),
             )
         rabc_weights = RABCWeights(
             progress_path=cfg.rabc_progress_path,
             chunk_size=chunk_size,
             head_mode=getattr(cfg, "rabc_head_mode", "sparse"),
+            mode=rabc_mode_cfg,
             kappa=getattr(cfg, "rabc_kappa", 0.01),
             epsilon=getattr(cfg, "rabc_epsilon", 1e-6),
+            fallback_weight=getattr(cfg, "rabc_fallback_weight", 1.0),
             device=device,
         )
 
@@ -412,13 +445,14 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                     wandb_log_dict.update(output_dict)
                 if rabc_weights is not None:
                     rabc_stats = rabc_weights.get_stats()
-                    wandb_log_dict.update(
-                        {
-                            "rabc_delta_mean": rabc_stats["delta_mean"],
-                            "rabc_delta_std": rabc_stats["delta_std"],
-                            "rabc_num_frames": rabc_stats["num_frames"],
-                        }
-                    )
+                    wandb_log_dict["rabc_num_frames"] = rabc_stats["num_frames"]
+                    wandb_log_dict["rabc_num_episodes"] = rabc_stats["num_episodes"]
+                    wandb_log_dict["rabc_mean_episode_length"] = rabc_stats[
+                        "mean_episode_length"
+                    ]
+                    if rabc_stats["mode"] == "rabc":
+                        wandb_log_dict["rabc_delta_mean"] = rabc_stats["delta_mean"]
+                        wandb_log_dict["rabc_delta_std"] = rabc_stats["delta_std"]
                 wandb_logger.log_dict(wandb_log_dict, step)
             train_tracker.reset_averages()
 

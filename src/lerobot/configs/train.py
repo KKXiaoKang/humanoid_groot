@@ -68,12 +68,24 @@ class TrainPipelineConfig(HubMixin):
     # Rename map for the observation to override the image and state keys
     rename_map: dict[str, str] = field(default_factory=dict)
 
-    # RA-BC (Reward-Aligned Behavior Cloning): weight BC loss using precomputed SARM progress
+    # RA-BC (Reward-Aligned Behavior Cloning) / AW-BC (Advantage-Weighted Behavior
+    # Cloning) — weight per-sample BC loss using precomputed SARM/ARM progress.
+    #
+    # rabc_mode controls which formulation is used:
+    #   - "rabc": SARM paper (Eq. 7-9). Offline global (μ,σ), kappa-based prior
+    #             override, loss = (l*w).sum() / (w.sum()+ε).
+    #   - "awbc": ARM paper. Length-adaptive gain ΔG = (P[t+H]-P[t]) * L_seq/L_bar,
+    #             per-batch (μ,σ), no kappa, loss = mean(l*w).
     use_rabc: bool = False
+    rabc_mode: str = "rabc"  # "rabc" | "awbc"
     rabc_progress_path: str | None = None
-    rabc_kappa: float = 0.01
+    rabc_kappa: float = 0.01  # only used in rabc mode
     rabc_epsilon: float = 1e-6
     rabc_head_mode: str | None = "sparse"
+    # Weight applied to samples whose progress delta is NaN (e.g. last frames in
+    # an episode). Default 1.0 keeps RA-BC behaviour; for paper-strict AW-BC
+    # behaviour set this to 0.0.
+    rabc_fallback_weight: float = 1.0
 
     def validate(self) -> None:
         # HACK: We parse again the cli args here to get the pretrained paths if there was some.
