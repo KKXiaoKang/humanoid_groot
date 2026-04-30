@@ -420,8 +420,8 @@ class RTCDemoConfig:
     
     # URDF path for forward kinematics (used to convert joint positions to EEF pose for state)
     urdf_path: str = field(
-        # default="/home/lab/kuavo-manip/lerobot_datasets/utils/biped_s60_only_arm.urdf",
-        default="/mnt/ssd/CodeBase/kuavo-ros-control/src/kuavo_assets/models/biped_s62/urdf/drake/biped_v3_arm.urdf",
+        default="/home/lab/kuavo-manip/lerobot_datasets/utils/biped_s62_only_arm.urdf",
+        # default="/mnt/ssd/CodeBase/kuavo-ros-control/src/kuavo_assets/models/biped_s62/urdf/drake/biped_v3_arm.urdf",
         metadata={"help": "URDF file path for forward kinematics (used to convert joint positions to EEF pose for state)"}
     )
 
@@ -483,6 +483,16 @@ class RTCDemoConfig:
     right_arm_lock_json_path: str = field(
         default=str(REPO_ROOT / "scripts" / "utils" / "start_arm_traj_claw.json"),
         metadata={"help": "JSON path for right arm lock values; uses arm_action[0][7:14]."},
+    )
+
+    # Non-RTC mode tuning (only used when rtc.enabled=false; aligned with eval_offline_eef_model.py)
+    non_rtc_replace_queue_on_new_chunk: bool = field(
+        default=True,
+        metadata={"help": "When rtc.enabled=false, replace queue with new chunk instead of append/merge."},
+    )
+    non_rtc_trigger_threshold: int = field(
+        default=140,
+        metadata={"help": "When rtc.enabled=false, trigger inference if queue size <= this threshold (was hardcoded 0)."},
     )
 
 
@@ -784,7 +794,7 @@ def get_actions(
         get_actions_threshold = cfg.action_queue_size_to_get_new_actions
 
         if not cfg.rtc.enabled:
-            get_actions_threshold = 0
+            get_actions_threshold = cfg.non_rtc_trigger_threshold
 
         while not shutdown_event.is_set():
             if action_queue.qsize() <= get_actions_threshold:
@@ -1092,9 +1102,16 @@ def get_actions(
 
                 bridge_idx = max(len(postprocessed_resampled) - get_actions_threshold, 0) if get_actions_threshold > 0 else len(postprocessed_resampled) - 1
                 episode_state.last_executed_action = postprocessed_resampled[bridge_idx].clone()
-                action_queue.merge(
-                    original_actions, postprocessed_resampled, new_delay, action_index_before_inference
-                )
+                if (not cfg.rtc.enabled) and cfg.non_rtc_replace_queue_on_new_chunk:
+                    with action_queue.lock:
+                        action_queue.original_queue = original_actions.clone()
+                        action_queue.queue = postprocessed_resampled.clone()
+                        action_queue.last_index = 0
+                        action_queue.original_last_index = 0
+                else:
+                    action_queue.merge(
+                        original_actions, postprocessed_resampled, new_delay, action_index_before_inference
+                    )
             else:
                 time.sleep(0.01)
 
@@ -1278,14 +1295,42 @@ def load_model_bundle(
     if cfg.use_torch_compile:
         policy = _apply_torch_compile(policy, cfg)
     
+    # 预读 relative_action_stats（与 scripts/eval_depalletize_camera_model_reload_limit_vel_select_eef_claw.py 对齐）
+    # 原因：Delta eef 模式下 postprocessor 反归一化需要 relative_action_stats，否则会 fallback 到
+    # adjusted absolute range（1.5x 绝对动作区间），导致 delta 解出来幅度过大。
+    ckpt_path_obj = Path(model_path) if not isinstance(model_path, Path) else model_path
+    preprocessor_json_path = ckpt_path_obj / "policy_preprocessor.json"
+    relative_action_stats_json = None
+    if preprocessor_json_path.exists():
+        try:
+            with open(preprocessor_json_path, 'r') as f:
+                preprocessor_config = json.load(f)
+            if "steps" in preprocessor_config:
+                for step_config in preprocessor_config["steps"]:
+                    if (step_config.get("registry_name") == "groot_pack_inputs_v3" and
+                            "config" in step_config and
+                            "relative_action_stats" in step_config["config"]):
+                        relative_action_stats_json = step_config["config"]["relative_action_stats"]
+                        break
+        except Exception as e:
+            logger.warning(f"[LOAD] Failed to pre-read relative_action_stats: {e}")
+
     # 加载preprocessor和postprocessor
+    preprocessor_overrides = {
+        "device_processor": {"device": device},
+    }
+    if relative_action_stats_json is not None:
+        # 设为 None，groot_pack_inputs_v3 的 __post_init__ 会忽略，实际 stats 通过下面的注入恢复
+        preprocessor_overrides["groot_pack_inputs_v3"] = {
+            "relative_action_stats": None,
+        }
+        logger.info("[LOAD] Pre-read relative_action_stats from policy_preprocessor.json, will inject into postprocessor")
+
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=config,
         pretrained_path=model_path,
         dataset_stats=None,
-        preprocessor_overrides={
-            "device_processor": {"device": device},
-        },
+        preprocessor_overrides=preprocessor_overrides,
     )
     
     # 检测action维度
@@ -1358,7 +1403,34 @@ def load_model_bundle(
                     logger.info(f"[LOAD]   - Will convert relative actions to absolute poses during inference")
                     logger.info(f"[LOAD]   - Reference pose will be computed from current robot joint state using FK")
                     break
-    
+
+    # 将预先读取的 relative_action_stats 注入 postprocessor step
+    # 不注入会让 postprocessor 在反归一化 *_pos 时 fallback 到 1.5x absolute range，导致 delta 解出来幅度过大
+    if is_relative_action_mode and postprocessor_step is not None and relative_action_stats_json:
+        try:
+            relative_action_stats_tensors = {}
+            for comp_name, stats in relative_action_stats_json.items():
+                relative_action_stats_tensors[comp_name] = {
+                    "min": torch.tensor(stats["min"], dtype=torch.float32),
+                    "max": torch.tensor(stats["max"], dtype=torch.float32),
+                    "count": torch.tensor(stats["count"], dtype=torch.long),
+                }
+            postprocessor_step.relative_action_stats = relative_action_stats_tensors
+            logger.info("[LOAD] ✅ Injected relative_action_stats into postprocessor:")
+            for comp_name, stats in relative_action_stats_tensors.items():
+                count = stats["count"].item()
+                min_vals = stats["min"].tolist()
+                max_vals = stats["max"].tolist()
+                logger.info(f"[LOAD]   - {comp_name}: count={count}, min={min_vals}, max={max_vals}")
+        except Exception as e:
+            import traceback
+            logger.warning(f"[LOAD] Failed to set relative_action_stats to postprocessor: {e}")
+            logger.warning(f"[LOAD]   Traceback: {traceback.format_exc()}")
+            logger.warning(f"[LOAD]   Will use fallback normalization (adjusted absolute range)")
+    elif is_relative_action_mode and postprocessor_step is not None and not relative_action_stats_json:
+        logger.warning("[LOAD] relative_action_stats not found in policy_preprocessor.json")
+        logger.warning("[LOAD]   Will use fallback normalization (adjusted absolute range)")
+
     print(f"[LOAD] Model loaded successfully")
     print(f"[LOAD] Action dimension: {action_dim}D")
     if action_space_type:
